@@ -1,0 +1,40 @@
+# Catppuccin Frappe
+
+name = "frappe"
+
+[colors]
+background   = "#303446"
+surface      = "#414559"
+overlay      = "#51576d"
+muted        = "#626880"
+subtle       = "#737994"
+text         = "#c6d0f5"
+subtext      = "#a5adce"
+
+red          = "#e78284"
+orange       = "#ef9f76"
+yellow       = "#e5c890"
+green        = "#a6d189"
+teal         = "#81c8be"
+sky          = "#99d1db"
+blue         = "#8caaee"
+lavender     = "#babbf1"
+mauve        = "#ca9ee6"
+pink         = "#f4b8e4"
+flamingo     = "#eebebe"
+rosewater    = "#f2d5cf"
+
+[semantic]
+health_ok      = "green"
+health_warn    = "yellow"
+health_alert   = "orange"
+health_crit    = "red"
+span_active    = "sky"
+span_complete  = "subtext"
+span_error     = "red"
+span_llm       = "mauve"
+span_tool      = "teal"
+border_focused = "blue"
+border_idle    = "overlay"
+highlight      = "mauve"
+cursor         = "rosewater"

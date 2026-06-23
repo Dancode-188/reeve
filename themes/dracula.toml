@@ -1,0 +1,41 @@
+# Dracula
+# https://draculatheme.com
+
+name = "dracula"
+
+[colors]
+background   = "#282a36"
+surface      = "#313442"
+overlay      = "#44475a"
+muted        = "#6272a4"
+subtle       = "#6272a4"
+text         = "#f8f8f2"
+subtext      = "#bfbfbf"
+
+red          = "#ff5555"
+orange       = "#ffb86c"
+yellow       = "#f1fa8c"
+green        = "#50fa7b"
+teal         = "#8be9fd"
+sky          = "#8be9fd"
+blue         = "#6272a4"
+lavender     = "#bd93f9"
+mauve        = "#bd93f9"
+pink         = "#ff79c6"
+flamingo     = "#ff79c6"
+rosewater    = "#ff79c6"
+
+[semantic]
+health_ok      = "green"
+health_warn    = "yellow"
+health_alert   = "orange"
+health_crit    = "red"
+span_active    = "sky"
+span_complete  = "subtext"
+span_error     = "red"
+span_llm       = "mauve"
+span_tool      = "teal"
+border_focused = "mauve"
+border_idle    = "overlay"
+highlight      = "pink"
+cursor         = "yellow"

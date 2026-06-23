@@ -1,0 +1,41 @@
+# Gruvbox Dark
+# https://github.com/morhetz/gruvbox
+
+name = "gruvbox"
+
+[colors]
+background   = "#282828"
+surface      = "#3c3836"
+overlay      = "#504945"
+muted        = "#665c54"
+subtle       = "#7c6f64"
+text         = "#ebdbb2"
+subtext      = "#d5c4a1"
+
+red          = "#fb4934"
+orange       = "#fe8019"
+yellow       = "#fabd2f"
+green        = "#b8bb26"
+teal         = "#8ec07c"
+sky          = "#83a598"
+blue         = "#458588"
+lavender     = "#d3869b"
+mauve        = "#d3869b"
+pink         = "#d3869b"
+flamingo     = "#fb4934"
+rosewater    = "#ebdbb2"
+
+[semantic]
+health_ok      = "green"
+health_warn    = "yellow"
+health_alert   = "orange"
+health_crit    = "red"
+span_active    = "sky"
+span_complete  = "subtext"
+span_error     = "red"
+span_llm       = "mauve"
+span_tool      = "teal"
+border_focused = "yellow"
+border_idle    = "overlay"
+highlight      = "orange"
+cursor         = "yellow"

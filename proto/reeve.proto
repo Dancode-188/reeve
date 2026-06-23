@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package reeve;
+
+// Reeve intervention channel — bidirectional streaming control protocol.
+// Agents connect here (port 4316) to receive commands and send acknowledgments.
+// Observation data goes through the OTel channel (ports 4317/4318), not here.
+
+service ReeveControl {
+  // Bidirectional stream: server sends commands, client sends acks.
+  rpc Connect(stream CommandAck) returns (stream InterventionCommand);
+}
+
+message InterventionCommand {
+  string command_id = 1;
+  string trace_id   = 2;
+  string span_id    = 3;
+  CommandType type  = 4;
+  string payload    = 5; // JSON — instruction for Redirect, context for InjectContext
+}
+
+message CommandAck {
+  string command_id = 1;
+  AckStatus status  = 2;
+  string message    = 3; // optional detail
+}
+
+enum CommandType {
+  COMMAND_TYPE_UNSPECIFIED = 0;
+  PAUSE                    = 1;
+  RESUME                   = 2;
+  KILL                     = 3;
+  REDIRECT                 = 4;
+  INJECT_CONTEXT           = 5;
+}
+
+enum AckStatus {
+  ACK_STATUS_UNSPECIFIED = 0;
+  ACCEPTED               = 1;
+  REJECTED               = 2;
+  COMPLETED              = 3;
+}

@@ -1,0 +1,41 @@
+# Tokyo Night
+# https://github.com/tokyo-night/tokyo-night-vscode-theme
+
+name = "tokyo-night"
+
+[colors]
+background   = "#1a1b26"
+surface      = "#24283b"
+overlay      = "#292e42"
+muted        = "#3b4261"
+subtle       = "#545c7e"
+text         = "#c0caf5"
+subtext      = "#9aa5ce"
+
+red          = "#f7768e"
+orange       = "#ff9e64"
+yellow       = "#e0af68"
+green        = "#9ece6a"
+teal         = "#73daca"
+sky          = "#7dcfff"
+blue         = "#7aa2f7"
+lavender     = "#bb9af7"
+mauve        = "#bb9af7"
+pink         = "#ff007c"
+flamingo     = "#f7768e"
+rosewater    = "#db4b4b"
+
+[semantic]
+health_ok      = "green"
+health_warn    = "yellow"
+health_alert   = "orange"
+health_crit    = "red"
+span_active    = "sky"
+span_complete  = "subtext"
+span_error     = "red"
+span_llm       = "mauve"
+span_tool      = "teal"
+border_focused = "blue"
+border_idle    = "overlay"
+highlight      = "lavender"
+cursor         = "sky"

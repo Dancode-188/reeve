@@ -1,0 +1,40 @@
+# Catppuccin Macchiato
+
+name = "macchiato"
+
+[colors]
+background   = "#24273a"
+surface      = "#363a4f"
+overlay      = "#494d64"
+muted        = "#5b6078"
+subtle       = "#6e738d"
+text         = "#cad3f5"
+subtext      = "#a5adcb"
+
+red          = "#ed8796"
+orange       = "#f5a97f"
+yellow       = "#eed49f"
+green        = "#a6da95"
+teal         = "#8bd5ca"
+sky          = "#91d7e3"
+blue         = "#8aadf4"
+lavender     = "#b7bdf8"
+mauve        = "#c6a0f6"
+pink         = "#f5bde6"
+flamingo     = "#f0c6c6"
+rosewater    = "#f4dbd6"
+
+[semantic]
+health_ok      = "green"
+health_warn    = "yellow"
+health_alert   = "orange"
+health_crit    = "red"
+span_active    = "sky"
+span_complete  = "subtext"
+span_error     = "red"
+span_llm       = "mauve"
+span_tool      = "teal"
+border_focused = "blue"
+border_idle    = "overlay"
+highlight      = "mauve"
+cursor         = "rosewater"

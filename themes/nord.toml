@@ -1,0 +1,41 @@
+# Nord
+# https://www.nordtheme.com
+
+name = "nord"
+
+[colors]
+background   = "#2e3440"
+surface      = "#3b4252"
+overlay      = "#434c5e"
+muted        = "#4c566a"
+subtle       = "#616e88"
+text         = "#eceff4"
+subtext      = "#d8dee9"
+
+red          = "#bf616a"
+orange       = "#d08770"
+yellow       = "#ebcb8b"
+green        = "#a3be8c"
+teal         = "#88c0d0"
+sky          = "#81a1c1"
+blue         = "#5e81ac"
+lavender     = "#81a1c1"
+mauve        = "#b48ead"
+pink         = "#b48ead"
+flamingo     = "#d08770"
+rosewater    = "#e5e9f0"
+
+[semantic]
+health_ok      = "green"
+health_warn    = "yellow"
+health_alert   = "orange"
+health_crit    = "red"
+span_active    = "teal"
+span_complete  = "subtext"
+span_error     = "red"
+span_llm       = "mauve"
+span_tool      = "sky"
+border_focused = "teal"
+border_idle    = "overlay"
+highlight      = "mauve"
+cursor         = "rosewater"

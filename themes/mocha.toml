@@ -1,0 +1,47 @@
+# Catppuccin Mocha — default theme
+# https://github.com/catppuccin/catppuccin
+
+name = "mocha"
+
+[colors]
+background   = "#1e1e2e"
+surface      = "#313244"
+overlay      = "#45475a"
+muted        = "#585b70"
+subtle       = "#6c7086"
+text         = "#cdd6f4"
+subtext      = "#a6adc8"
+
+# Accent palette
+red          = "#f38ba8"
+orange       = "#fab387"
+yellow       = "#f9e2af"
+green        = "#a6e3a1"
+teal         = "#94e2d5"
+sky          = "#89dceb"
+blue         = "#89b4fa"
+lavender     = "#b4befe"
+mauve        = "#cba6f7"
+pink         = "#f5c2e7"
+flamingo     = "#f2cdcd"
+rosewater    = "#f5e0dc"
+
+[semantic]
+# Health score states
+health_ok      = "green"
+health_warn    = "yellow"
+health_alert   = "orange"
+health_crit    = "red"
+
+# Trace tree
+span_active    = "sky"
+span_complete  = "subtext"
+span_error     = "red"
+span_llm       = "mauve"
+span_tool      = "teal"
+
+# UI chrome
+border_focused = "blue"
+border_idle    = "overlay"
+highlight      = "mauve"
+cursor         = "rosewater"

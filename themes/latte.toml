@@ -1,0 +1,40 @@
+# Catppuccin Latte — light variant
+
+name = "latte"
+
+[colors]
+background   = "#eff1f5"
+surface      = "#ccd0da"
+overlay      = "#bcc0cc"
+muted        = "#acb0be"
+subtle       = "#9ca0b0"
+text         = "#4c4f69"
+subtext      = "#5c5f77"
+
+red          = "#d20f39"
+orange       = "#fe640b"
+yellow       = "#df8e1d"
+green        = "#40a02b"
+teal         = "#179299"
+sky          = "#04a5e5"
+blue         = "#1e66f5"
+lavender     = "#7287fd"
+mauve        = "#8839ef"
+pink         = "#ea76cb"
+flamingo     = "#dd7878"
+rosewater    = "#dc8a78"
+
+[semantic]
+health_ok      = "green"
+health_warn    = "yellow"
+health_alert   = "orange"
+health_crit    = "red"
+span_active    = "blue"
+span_complete  = "subtext"
+span_error     = "red"
+span_llm       = "mauve"
+span_tool      = "teal"
+border_focused = "blue"
+border_idle    = "overlay"
+highlight      = "mauve"
+cursor         = "rosewater"
