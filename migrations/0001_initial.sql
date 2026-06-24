@@ -1,5 +1,5 @@
 -- Initial schema for Reeve's SQLite warm tier.
--- Applied automatically on startup via sqlx migrations.
+-- Applied automatically on startup by reeve-storage's migration runner.
 -- Columns mirror the reeve-model entities exactly. See docs/adr/ for the
 -- design decisions behind the less obvious shapes (7-state trace machine,
 -- polymorphic cost_ledger/evaluation_results, replay reconstruction).
