@@ -9,3 +9,15 @@ pub mod span;
 pub mod span_event;
 pub mod span_note;
 pub mod trace;
+
+pub use agent::{Agent, AgentStatus, IntegrationPath};
+pub use cost::{CostEntityType, CostLedger};
+pub use evaluation::{EvaluationResult, EvaluatorType, TargetType};
+pub use intervention::{AckStatus, CommandStatus, CommandType, InterventionCommand};
+pub use outcome::InterventionOutcome;
+pub use policy::{PolicyRule, RuleScope};
+pub use replay::ReplayRecord;
+pub use span::{InternalSpan, SpanStatus};
+pub use span_event::{EventType, SpanEvent};
+pub use span_note::SpanNote;
+pub use trace::{InvalidTraceTransition, Trace, TraceStatus};
