@@ -9,6 +9,8 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0002](./0002-local-first-llm-judge.md) | Local-First LLM Judge | Accepted | 2026-06-23 |
 | [0003](./0003-apache-2-license.md) | Apache 2.0 License | Accepted | 2026-06-23 |
 | [0004](./0004-clock-offset-estimation.md) | Connection-Time Clock Offset Estimation | Accepted | 2026-06-25 |
+| [0005](./0005-versioned-attribute-translator.md) | Versioned AttributeTranslator Pattern | Accepted | 2026-06-26 |
+| [0006](./0006-privacy-tier-1-default.md) | Privacy Tier 1 as the Default | Accepted | 2026-06-26 |
 
 ## Format
 
