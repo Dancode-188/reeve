@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic", "trace"] }
+tonic = { workspace = true }
+tonic-health = "0.14.6"
+tokio = { workspace = true }
+tracing = { workspace = true }
