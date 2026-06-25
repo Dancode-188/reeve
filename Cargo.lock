@@ -758,6 +758,8 @@ name = "reeve-ingestion"
 version = "0.1.0"
 dependencies = [
  "opentelemetry-proto",
+ "reeve-model",
+ "serde_json",
  "tokio",
  "tonic",
  "tonic-health",

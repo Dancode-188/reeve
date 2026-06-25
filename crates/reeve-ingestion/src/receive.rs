@@ -1,18 +1,18 @@
+use crate::normalize::PipelineSpan;
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse, trace_service_server::TraceService,
 };
+use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value::Value as OtlpValue};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 const DEDUP_MAX: usize = 10_000;
 const CLOCK_SAMPLES_NEEDED: usize = 10;
 
-/// Sliding-window deduplicator keyed by raw span_id bytes. Cleared entirely
-/// once it hits DEDUP_MAX rather than using LRU, which is enough for
-/// OTel retry dedup without the overhead of a true eviction policy.
 struct Deduplicator {
     seen: HashSet<Vec<u8>>,
 }
@@ -32,11 +32,6 @@ impl Deduplicator {
     }
 }
 
-/// Per-peer clock offset estimate. Takes the minimum of the first
-/// CLOCK_SAMPLES_NEEDED samples of (arrived_at_ms - span_end_time_ms).
-/// Minimum rather than mean: the sample with the least observed delay
-/// has the least queueing noise mixed in with the skew signal.
-/// See ADR-0004 for why this is an approximation and what replaces it at v0.3.0.
 struct AgentClockState {
     samples: Vec<i64>,
     offset_ms: Option<i64>,
@@ -68,20 +63,16 @@ impl AgentClockState {
 pub struct OtlpReceiver {
     dedup: Arc<Mutex<Deduplicator>>,
     clocks: Arc<Mutex<std::collections::HashMap<String, AgentClockState>>>,
+    pipeline_tx: mpsc::Sender<PipelineSpan>,
 }
 
 impl OtlpReceiver {
-    pub fn new() -> Self {
+    pub fn new(pipeline_tx: mpsc::Sender<PipelineSpan>) -> Self {
         Self {
             dedup: Arc::new(Mutex::new(Deduplicator::new())),
             clocks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            pipeline_tx,
         }
-    }
-}
-
-impl Default for OtlpReceiver {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -112,28 +103,52 @@ impl TraceService for OtlpReceiver {
         let mut duplicates = 0u32;
         let mut invalid = 0u32;
 
-        for resource_spans in &payload.resource_spans {
-            for scope_spans in &resource_spans.scope_spans {
-                for span in &scope_spans.spans {
+        for resource_spans in payload.resource_spans {
+            let (service_name, service_instance_id, framework) =
+                extract_resource_meta(resource_spans.resource.as_ref());
+
+            for scope_spans in resource_spans.scope_spans {
+                for span in scope_spans.spans {
                     if span.span_id.is_empty() || span.trace_id.is_empty() {
                         invalid += 1;
                         continue;
                     }
 
-                    let mut dedup = self.dedup.lock().expect("dedup mutex poisoned");
-                    if dedup.is_duplicate(&span.span_id) {
+                    let is_dup = {
+                        let mut dedup = self.dedup.lock().expect("dedup mutex poisoned");
+                        dedup.is_duplicate(&span.span_id)
+                    };
+                    if is_dup {
                         duplicates += 1;
                         continue;
                     }
-                    drop(dedup);
 
-                    let span_end_ms = (span.end_time_unix_nano / 1_000_000) as i64;
-                    if span_end_ms > 0 {
+                    let clock_offset_ms = {
                         let mut clocks = self.clocks.lock().expect("clocks mutex poisoned");
-                        clocks
+                        let state = clocks
                             .entry(peer_ip.clone())
-                            .or_insert_with(AgentClockState::new)
-                            .record_sample(arrived_at_ms, span_end_ms);
+                            .or_insert_with(AgentClockState::new);
+                        let span_end_ms = (span.end_time_unix_nano / 1_000_000) as i64;
+                        if span_end_ms > 0 {
+                            state.record_sample(arrived_at_ms, span_end_ms);
+                        }
+                        state.offset_ms()
+                    };
+
+                    let ps = PipelineSpan {
+                        span,
+                        service_name: service_name.clone(),
+                        service_instance_id: service_instance_id.clone(),
+                        framework: framework.clone(),
+                        arrived_at: arrived_at_ms,
+                        clock_offset_ms,
+                    };
+
+                    if self.pipeline_tx.send(ps).await.is_err() {
+                        tracing::warn!(
+                            peer = %peer_ip,
+                            "normalize stage unavailable, span discarded"
+                        );
                     }
 
                     accepted += 1;
@@ -141,21 +156,12 @@ impl TraceService for OtlpReceiver {
             }
         }
 
-        let offset_ms = self
-            .clocks
-            .lock()
-            .expect("clocks mutex poisoned")
-            .get(&peer_ip)
-            .map(|s| s.offset_ms())
-            .unwrap_or(0);
-
         if accepted > 0 || duplicates > 0 || invalid > 0 {
             tracing::debug!(
                 peer = %peer_ip,
                 accepted,
                 duplicates,
                 invalid,
-                clock_offset_ms = offset_ms,
                 "received span batch",
             );
         }
@@ -171,6 +177,42 @@ impl TraceService for OtlpReceiver {
             partial_success: None,
         }))
     }
+}
+
+fn extract_resource_meta(
+    resource: Option<&opentelemetry_proto::tonic::resource::v1::Resource>,
+) -> (String, String, String) {
+    let mut service_name = String::from("unknown");
+    let mut service_instance_id = String::new();
+    let mut framework = String::from("unknown");
+
+    if let Some(r) = resource {
+        for kv in &r.attributes {
+            match kv.key.as_str() {
+                "service.name" => service_name = get_string_value(&kv.value),
+                "service.instance.id" => service_instance_id = get_string_value(&kv.value),
+                "telemetry.sdk.name" => framework = get_string_value(&kv.value),
+                _ => {}
+            }
+        }
+    }
+
+    (service_name, service_instance_id, framework)
+}
+
+fn get_string_value(value: &Option<AnyValue>) -> String {
+    value
+        .as_ref()
+        .and_then(|av| av.value.as_ref())
+        .and_then(|v| {
+            if let OtlpValue::StringValue(s) = v {
+                Some(s.as_str())
+            } else {
+                None
+            }
+        })
+        .unwrap_or("")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -193,7 +235,6 @@ mod tests {
             assert!(!d.is_duplicate(&id));
         }
         assert_eq!(d.seen.len(), DEDUP_MAX);
-        // next insert triggers clear, so this should NOT be a duplicate
         assert!(!d.is_duplicate(b"after-clear"));
         assert_eq!(d.seen.len(), 1);
     }
@@ -201,9 +242,8 @@ mod tests {
     #[test]
     fn clock_state_uses_minimum_over_samples() {
         let mut state = AgentClockState::new();
-        // feed 10 samples: 9 large (noisy), 1 small (the real skew)
         for i in 0..9 {
-            state.record_sample(1000 + i * 50, 0); // offsets: 1000, 1050, ..., 1400
+            state.record_sample(1000 + i * 50, 0);
         }
         assert!(
             state.offset_ms.is_none(),
@@ -217,10 +257,10 @@ mod tests {
     fn clock_state_ignores_samples_after_lock_in() {
         let mut state = AgentClockState::new();
         for _ in 0..10 {
-            state.record_sample(200, 0); // all 200
+            state.record_sample(200, 0);
         }
         assert_eq!(state.offset_ms(), 200);
-        state.record_sample(5, 0); // should be ignored
+        state.record_sample(5, 0);
         assert_eq!(
             state.offset_ms(),
             200,

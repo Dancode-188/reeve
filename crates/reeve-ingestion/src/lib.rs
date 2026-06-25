@@ -10,6 +10,10 @@ use tonic::transport::Server;
 use tonic_health::{ServingStatus, server::health_reporter};
 
 pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    let (pipeline_tx, pipeline_rx) = tokio::sync::mpsc::channel(1024);
+
+    tokio::spawn(normalize::run(pipeline_rx, false));
+
     let (health_reporter, health_service) = health_reporter();
     health_reporter
         .set_service_status("", ServingStatus::Serving)
@@ -19,7 +23,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
 
     Server::builder()
         .add_service(health_service)
-        .add_service(TraceServiceServer::new(OtlpReceiver::new()))
+        .add_service(TraceServiceServer::new(OtlpReceiver::new(pipeline_tx)))
         .serve(addr)
         .await?;
 
