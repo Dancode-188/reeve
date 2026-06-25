@@ -8,6 +8,7 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0001](./0001-two-channel-architecture.md) | Two-Channel Architecture | Accepted | 2026-06-23 |
 | [0002](./0002-local-first-llm-judge.md) | Local-First LLM Judge | Accepted | 2026-06-23 |
 | [0003](./0003-apache-2-license.md) | Apache 2.0 License | Accepted | 2026-06-23 |
+| [0004](./0004-clock-offset-estimation.md) | Connection-Time Clock Offset Estimation | Accepted | 2026-06-25 |
 
 ## Format
 
