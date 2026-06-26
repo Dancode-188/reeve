@@ -759,6 +759,7 @@ version = "0.1.0"
 dependencies = [
  "opentelemetry-proto",
  "reeve-model",
+ "reeve-storage",
  "serde_json",
  "tokio",
  "tonic",
