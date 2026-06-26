@@ -221,7 +221,15 @@ pub async fn run(
             events = events.len(),
             "normalized span",
         );
-        if tx.send(NormalizedSpan { span, events, agent }).await.is_err() {
+        if tx
+            .send(NormalizedSpan {
+                span,
+                events,
+                agent,
+            })
+            .await
+            .is_err()
+        {
             tracing::warn!("assemble stage receiver dropped, normalize stage shutting down");
             return;
         }

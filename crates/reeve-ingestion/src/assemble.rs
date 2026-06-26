@@ -112,7 +112,10 @@ impl InFlightTrace {
             for id in adoptable {
                 if let Some(span) = self.pending_attachment.remove(&id) {
                     if let Some(pid) = &span.parent_id {
-                        self.children.entry(pid.clone()).or_default().push(id.clone());
+                        self.children
+                            .entry(pid.clone())
+                            .or_default()
+                            .push(id.clone());
                     }
                     self.spans.insert(id, span);
                 }
@@ -254,7 +257,11 @@ mod tests {
         trace.receive_span(make_span("child-1", "trace-1", Some("parent-1")));
 
         assert_eq!(trace.spans.len(), 0, "child should not be in spans yet");
-        assert_eq!(trace.pending_count(), 1, "child should be waiting in pending_attachment");
+        assert_eq!(
+            trace.pending_count(),
+            1,
+            "child should be waiting in pending_attachment"
+        );
     }
 
     #[test]
@@ -262,11 +269,19 @@ mod tests {
         let mut trace = InFlightTrace::new("trace-1".to_string(), "agent-1".to_string());
 
         trace.receive_span(make_span("child-1", "trace-1", Some("root-1")));
-        assert_eq!(trace.pending_count(), 1, "child must be pending before root arrives");
+        assert_eq!(
+            trace.pending_count(),
+            1,
+            "child must be pending before root arrives"
+        );
 
         trace.receive_span(make_span("root-1", "trace-1", None));
 
-        assert_eq!(trace.pending_count(), 0, "orphan should be adopted after parent arrives");
+        assert_eq!(
+            trace.pending_count(),
+            0,
+            "orphan should be adopted after parent arrives"
+        );
         assert_eq!(trace.spans.len(), 2);
         assert!(
             trace
@@ -280,11 +295,17 @@ mod tests {
     #[test]
     fn root_span_sets_completion_timer() {
         let mut trace = InFlightTrace::new("trace-1".to_string(), "agent-1".to_string());
-        assert!(trace.completion_timer.is_none(), "no timer before root arrives");
+        assert!(
+            trace.completion_timer.is_none(),
+            "no timer before root arrives"
+        );
 
         trace.receive_span(make_span("root-1", "trace-1", None));
 
-        assert!(trace.completion_timer.is_some(), "timer must be set after root arrives");
+        assert!(
+            trace.completion_timer.is_some(),
+            "timer must be set after root arrives"
+        );
         assert_eq!(trace.root_span_id, Some("root-1".to_string()));
         assert_eq!(
             trace.check_completion(),
@@ -302,7 +323,11 @@ mod tests {
         trace.receive_span(make_span("span-b", "trace-1", Some("span-a")));
 
         assert_eq!(trace.spans.len(), 0, "neither span can be adopted");
-        assert_eq!(trace.pending_count(), 2, "both must remain in pending_attachment");
+        assert_eq!(
+            trace.pending_count(),
+            2,
+            "both must remain in pending_attachment"
+        );
     }
 
     #[test]
@@ -334,7 +359,11 @@ mod tests {
             first_timer,
             "completion timer must not be reset by duplicate root"
         );
-        assert_eq!(trace.spans.len(), 2, "duplicate root span must still be kept in spans");
+        assert_eq!(
+            trace.spans.len(),
+            2,
+            "duplicate root span must still be kept in spans"
+        );
     }
 
     #[test]
