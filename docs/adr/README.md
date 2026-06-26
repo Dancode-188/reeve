@@ -11,6 +11,8 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0004](./0004-clock-offset-estimation.md) | Connection-Time Clock Offset Estimation | Accepted | 2026-06-25 |
 | [0005](./0005-versioned-attribute-translator.md) | Versioned AttributeTranslator Pattern | Accepted | 2026-06-26 |
 | [0006](./0006-privacy-tier-1-default.md) | Privacy Tier 1 as the Default | Accepted | 2026-06-26 |
+| [0008](./0008-root-triggered-straggler-window.md) | Root-Triggered Straggler Window for Trace Completion | Accepted | 2026-06-26 |
+| [0009](./0009-orphan-adoption-for-span-assembly.md) | Orphan Adoption for Out-of-Order Span Assembly | Accepted | 2026-06-26 |
 
 ## Format
 

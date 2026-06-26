@@ -11,8 +11,10 @@ use tonic_health::{ServingStatus, server::health_reporter};
 
 pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let (pipeline_tx, pipeline_rx) = tokio::sync::mpsc::channel(1024);
+    let (assemble_tx, assemble_rx) = tokio::sync::mpsc::channel(1024);
 
-    tokio::spawn(normalize::run(pipeline_rx, false));
+    tokio::spawn(normalize::run(pipeline_rx, false, assemble_tx));
+    tokio::spawn(assemble::run(assemble_rx, 500));
 
     let (health_reporter, health_service) = health_reporter();
     health_reporter
