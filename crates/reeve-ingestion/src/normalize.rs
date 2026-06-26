@@ -198,7 +198,18 @@ fn anyvalue_to_json(value: Option<AnyValue>) -> Option<serde_json::Value> {
     })
 }
 
-pub async fn run(mut rx: mpsc::Receiver<PipelineSpan>, capture_content: bool) {
+/// Typed output from the normalize stage, consumed by the assemble stage.
+pub struct NormalizedSpan {
+    pub span: InternalSpan,
+    pub events: Vec<SpanEvent>,
+    pub agent: Agent,
+}
+
+pub async fn run(
+    mut rx: mpsc::Receiver<PipelineSpan>,
+    capture_content: bool,
+    tx: mpsc::Sender<NormalizedSpan>,
+) {
     let translator = V1AttributeTranslator::new(capture_content);
     while let Some(ps) = rx.recv().await {
         let (span, events, agent) = translator.translate(ps);
@@ -210,6 +221,10 @@ pub async fn run(mut rx: mpsc::Receiver<PipelineSpan>, capture_content: bool) {
             events = events.len(),
             "normalized span",
         );
+        if tx.send(NormalizedSpan { span, events, agent }).await.is_err() {
+            tracing::warn!("assemble stage receiver dropped, normalize stage shutting down");
+            return;
+        }
     }
     tracing::info!("normalize stage shut down");
 }
