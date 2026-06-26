@@ -1,6 +1,6 @@
 use reeve_model::entity::{
-    CommandStatus, EvaluationResult, EvaluatorType, EventType, InternalSpan, InterventionCommand,
-    SpanEvent, SpanStatus, TargetType, Trace, TraceStatus,
+    Agent, CommandStatus, EvaluationResult, EvaluatorType, EventType, InternalSpan,
+    InterventionCommand, SpanEvent, SpanStatus, TargetType, Trace, TraceStatus,
 };
 use reeve_model::ids::{AgentId, CommandId, EvalId, SpanId, TraceId};
 use rusqlite::{Connection, Row, params};
@@ -189,6 +189,31 @@ impl WarmStore {
         })
         .await?;
         Ok(result?)
+    }
+
+    pub async fn upsert_agent(&self, agent: Agent) -> Result<(), StorageError> {
+        let integration = enum_to_text(&agent.integration)?;
+        let status = enum_to_text(&agent.status)?;
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, framework, integration, status, first_seen_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                    status = excluded.status,
+                    last_seen_at = excluded.last_seen_at",
+                params![
+                    agent.id,
+                    agent.name,
+                    agent.framework,
+                    integration,
+                    status,
+                    agent.first_seen_at,
+                    agent.last_seen_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn save_trace(&self, trace: Trace) -> Result<(), StorageError> {

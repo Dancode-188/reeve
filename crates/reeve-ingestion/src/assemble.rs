@@ -1,6 +1,8 @@
 use crate::normalize::NormalizedSpan;
+use reeve_model::entity::agent::Agent;
 use reeve_model::entity::span::InternalSpan;
-use reeve_model::ids::{AgentId, SpanId, TraceId};
+use reeve_model::entity::span_event::SpanEvent;
+use reeve_model::ids::{SpanId, TraceId};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -19,9 +21,10 @@ pub enum CompletionState {
 
 pub struct InFlightTrace {
     pub trace_id: TraceId,
-    pub agent_id: AgentId,
+    pub agent: Agent,
     pub spans: HashMap<SpanId, InternalSpan>,
     pub children: HashMap<SpanId, Vec<SpanId>>,
+    pub span_events: HashMap<SpanId, Vec<SpanEvent>>,
     pending_attachment: HashMap<SpanId, InternalSpan>,
     pub root_span_id: Option<SpanId>,
     last_updated: Instant,
@@ -30,12 +33,13 @@ pub struct InFlightTrace {
 }
 
 impl InFlightTrace {
-    pub fn new(trace_id: TraceId, agent_id: AgentId) -> Self {
+    pub fn new(trace_id: TraceId, agent: Agent) -> Self {
         Self {
             trace_id,
-            agent_id,
+            agent,
             spans: HashMap::new(),
             children: HashMap::new(),
+            span_events: HashMap::new(),
             pending_attachment: HashMap::new(),
             root_span_id: None,
             last_updated: Instant::now(),
@@ -44,8 +48,9 @@ impl InFlightTrace {
         }
     }
 
-    pub fn receive_span(&mut self, span: InternalSpan) {
+    pub fn receive_span(&mut self, span: InternalSpan, events: Vec<SpanEvent>) {
         self.last_updated = Instant::now();
+        self.span_events.insert(span.id.clone(), events);
 
         if let Some(cost) = span
             .attributes
@@ -150,13 +155,13 @@ impl Assembler {
         }
     }
 
-    pub fn receive(&mut self, span: InternalSpan, agent_id: AgentId) {
+    pub fn receive(&mut self, span: InternalSpan, events: Vec<SpanEvent>, agent: Agent) {
         let trace_id = span.trace_id.clone();
         let trace = self
             .traces
             .entry(trace_id.clone())
-            .or_insert_with(|| InFlightTrace::new(trace_id, agent_id));
-        trace.receive_span(span);
+            .or_insert_with(|| InFlightTrace::new(trace_id, agent));
+        trace.receive_span(span, events);
     }
 
     /// Returns all traces that have completed or been interrupted, removing
@@ -191,7 +196,11 @@ impl Default for Assembler {
     }
 }
 
-pub async fn run(mut rx: mpsc::Receiver<NormalizedSpan>, tick_ms: u64) {
+pub async fn run(
+    mut rx: mpsc::Receiver<NormalizedSpan>,
+    tick_ms: u64,
+    tx: mpsc::Sender<(InFlightTrace, CompletionState)>,
+) {
     let mut assembler = Assembler::new();
     let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
 
@@ -200,13 +209,12 @@ pub async fn run(mut rx: mpsc::Receiver<NormalizedSpan>, tick_ms: u64) {
             result = rx.recv() => {
                 match result {
                     Some(ns) => {
-                        let agent_id = ns.agent.id.clone();
                         tracing::debug!(
                             span_id = %ns.span.id,
                             trace_id = %ns.span.trace_id,
                             "assembling span",
                         );
-                        assembler.receive(ns.span, agent_id);
+                        assembler.receive(ns.span, ns.events, ns.agent);
                     }
                     None => {
                         tracing::info!("assemble stage shut down");
@@ -218,13 +226,17 @@ pub async fn run(mut rx: mpsc::Receiver<NormalizedSpan>, tick_ms: u64) {
                 for (trace, state) in assembler.tick() {
                     tracing::debug!(
                         trace_id = %trace.trace_id,
-                        agent_id = %trace.agent_id,
+                        agent_id = %trace.agent.id,
                         spans = trace.spans.len(),
                         pending = trace.pending_count(),
                         cost = trace.cost_accumulator,
                         state = ?state,
                         "trace finalized",
                     );
+                    if tx.send((trace, state)).await.is_err() {
+                        tracing::warn!("route stage receiver dropped, assemble stage shutting down");
+                        return;
+                    }
                 }
             }
         }
@@ -234,7 +246,20 @@ pub async fn run(mut rx: mpsc::Receiver<NormalizedSpan>, tick_ms: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reeve_model::entity::agent::{AgentStatus, IntegrationPath};
     use reeve_model::entity::span::{InternalSpan, SpanStatus};
+
+    fn make_agent() -> Agent {
+        Agent {
+            id: "agent-1".to_string(),
+            name: "test-service".to_string(),
+            framework: "custom".to_string(),
+            integration: IntegrationPath::Sdk,
+            status: AgentStatus::Running,
+            first_seen_at: 0,
+            last_seen_at: 0,
+        }
+    }
 
     fn make_span(id: &str, trace_id: &str, parent_id: Option<&str>) -> InternalSpan {
         InternalSpan {
@@ -253,8 +278,8 @@ mod tests {
 
     #[test]
     fn orphan_lands_in_pending_when_parent_absent() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), "agent-1".to_string());
-        trace.receive_span(make_span("child-1", "trace-1", Some("parent-1")));
+        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
+        trace.receive_span(make_span("child-1", "trace-1", Some("parent-1")), vec![]);
 
         assert_eq!(trace.spans.len(), 0, "child should not be in spans yet");
         assert_eq!(
@@ -266,16 +291,16 @@ mod tests {
 
     #[test]
     fn orphan_adopted_when_parent_arrives_later() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), "agent-1".to_string());
+        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
 
-        trace.receive_span(make_span("child-1", "trace-1", Some("root-1")));
+        trace.receive_span(make_span("child-1", "trace-1", Some("root-1")), vec![]);
         assert_eq!(
             trace.pending_count(),
             1,
             "child must be pending before root arrives"
         );
 
-        trace.receive_span(make_span("root-1", "trace-1", None));
+        trace.receive_span(make_span("root-1", "trace-1", None), vec![]);
 
         assert_eq!(
             trace.pending_count(),
@@ -294,13 +319,13 @@ mod tests {
 
     #[test]
     fn root_span_sets_completion_timer() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), "agent-1".to_string());
+        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
         assert!(
             trace.completion_timer.is_none(),
             "no timer before root arrives"
         );
 
-        trace.receive_span(make_span("root-1", "trace-1", None));
+        trace.receive_span(make_span("root-1", "trace-1", None), vec![]);
 
         assert!(
             trace.completion_timer.is_some(),
@@ -316,11 +341,11 @@ mod tests {
 
     #[test]
     fn mutual_orphans_stay_in_pending() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), "agent-1".to_string());
+        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
 
         // A's parent is B, B's parent is A — circular, neither can ever be adopted
-        trace.receive_span(make_span("span-a", "trace-1", Some("span-b")));
-        trace.receive_span(make_span("span-b", "trace-1", Some("span-a")));
+        trace.receive_span(make_span("span-a", "trace-1", Some("span-b")), vec![]);
+        trace.receive_span(make_span("span-b", "trace-1", Some("span-a")), vec![]);
 
         assert_eq!(trace.spans.len(), 0, "neither span can be adopted");
         assert_eq!(
@@ -332,8 +357,8 @@ mod tests {
 
     #[test]
     fn single_span_trace_with_no_parent_is_root() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), "agent-1".to_string());
-        trace.receive_span(make_span("only-span", "trace-1", None));
+        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
+        trace.receive_span(make_span("only-span", "trace-1", None), vec![]);
 
         assert_eq!(trace.spans.len(), 1);
         assert_eq!(trace.root_span_id, Some("only-span".to_string()));
@@ -342,12 +367,12 @@ mod tests {
 
     #[test]
     fn duplicate_root_candidate_does_not_override_first() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), "agent-1".to_string());
+        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
 
-        trace.receive_span(make_span("root-1", "trace-1", None));
+        trace.receive_span(make_span("root-1", "trace-1", None), vec![]);
         let first_timer = trace.completion_timer.unwrap();
 
-        trace.receive_span(make_span("root-2", "trace-1", None));
+        trace.receive_span(make_span("root-2", "trace-1", None), vec![]);
 
         assert_eq!(
             trace.root_span_id,
@@ -368,7 +393,7 @@ mod tests {
 
     #[test]
     fn cost_accumulates_across_spans() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), "agent-1".to_string());
+        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
 
         let mut span1 = make_span("span-1", "trace-1", None);
         span1.attributes = serde_json::json!({"gen_ai.usage.cost": 0.0025});
@@ -376,8 +401,8 @@ mod tests {
         let mut span2 = make_span("span-2", "trace-1", Some("span-1"));
         span2.attributes = serde_json::json!({"gen_ai.usage.cost": 0.0010});
 
-        trace.receive_span(span1);
-        trace.receive_span(span2);
+        trace.receive_span(span1, vec![]);
+        trace.receive_span(span2, vec![]);
 
         assert!(
             (trace.cost_accumulator - 0.0035).abs() < 1e-9,

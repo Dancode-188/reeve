@@ -14,6 +14,8 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0008](./0008-root-triggered-straggler-window.md) | Root-Triggered Straggler Window for Trace Completion | Accepted | 2026-06-26 |
 | [0009](./0009-orphan-adoption-for-span-assembly.md) | Orphan Adoption for Out-of-Order Span Assembly | Accepted | 2026-06-26 |
 | [0010](./0010-rusqlite-over-sqlx-for-warm-tier.md) | rusqlite over sqlx for the Warm Tier | Accepted | 2026-06-26 |
+| [0011](./0011-root-span-determines-trace-failure.md) | Root Span Status Determines Trace-Level Failure | Accepted | 2026-06-26 |
+| [0012](./0012-lazy-agent-registration-at-trace-finalization.md) | Lazy Agent Registration at Trace Finalization | Accepted | 2026-06-26 |
 
 ## Format
 
