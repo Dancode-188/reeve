@@ -69,11 +69,12 @@ impl HotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reeve_model::ids::SpanId;
 
     fn span(id: &str) -> InternalSpan {
         InternalSpan {
-            id: id.to_string(),
-            trace_id: "trace-1".to_string(),
+            id: id.into(),
+            trace_id: "trace-1".into(),
             parent_id: None,
             operation: "test.op".to_string(),
             status: reeve_model::entity::SpanStatus::Completed,
@@ -100,11 +101,15 @@ mod tests {
         assert!(store.push_span(span("b")).is_none());
 
         let evicted = store.push_span(span("c")).expect("should evict");
-        assert_eq!(evicted.id, "a", "oldest span should be evicted first");
+        assert_eq!(
+            evicted.id.as_str(),
+            "a",
+            "oldest span should be evicted first"
+        );
         assert_eq!(store.len(), 2);
-        assert!(store.get_span(&"a".to_string()).is_none());
-        assert!(store.get_span(&"b".to_string()).is_some());
-        assert!(store.get_span(&"c".to_string()).is_some());
+        assert!(store.get_span(&SpanId::from("a")).is_none());
+        assert!(store.get_span(&SpanId::from("b")).is_some());
+        assert!(store.get_span(&SpanId::from("c")).is_some());
     }
 
     #[test]
@@ -114,9 +119,9 @@ mod tests {
         store.push_span(span("b"));
         store.push_span(span("c"));
 
-        assert_eq!(store.evict_oldest().unwrap().id, "a");
-        assert_eq!(store.evict_oldest().unwrap().id, "b");
-        assert_eq!(store.evict_oldest().unwrap().id, "c");
+        assert_eq!(store.evict_oldest().unwrap().id.as_str(), "a");
+        assert_eq!(store.evict_oldest().unwrap().id.as_str(), "b");
+        assert_eq!(store.evict_oldest().unwrap().id.as_str(), "c");
         assert!(store.evict_oldest().is_none());
     }
 }

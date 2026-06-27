@@ -251,7 +251,7 @@ mod tests {
 
     fn make_agent() -> Agent {
         Agent {
-            id: "agent-1".to_string(),
+            id: "agent-1".into(),
             name: "test-service".to_string(),
             framework: "custom".to_string(),
             integration: IntegrationPath::Sdk,
@@ -263,9 +263,9 @@ mod tests {
 
     fn make_span(id: &str, trace_id: &str, parent_id: Option<&str>) -> InternalSpan {
         InternalSpan {
-            id: id.to_string(),
-            trace_id: trace_id.to_string(),
-            parent_id: parent_id.map(|s| s.to_string()),
+            id: id.into(),
+            trace_id: trace_id.into(),
+            parent_id: parent_id.map(Into::into),
             operation: "test.op".to_string(),
             status: SpanStatus::Completed,
             start_time: 1000,
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn orphan_lands_in_pending_when_parent_absent() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
+        let mut trace = InFlightTrace::new("trace-1".into(), make_agent());
         trace.receive_span(make_span("child-1", "trace-1", Some("parent-1")), vec![]);
 
         assert_eq!(trace.spans.len(), 0, "child should not be in spans yet");
@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn orphan_adopted_when_parent_arrives_later() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
+        let mut trace = InFlightTrace::new("trace-1".into(), make_agent());
 
         trace.receive_span(make_span("child-1", "trace-1", Some("root-1")), vec![]);
         assert_eq!(
@@ -312,14 +312,14 @@ mod tests {
             trace
                 .children
                 .get("root-1")
-                .map_or(false, |c| c.contains(&"child-1".to_string())),
+                .map_or(false, |c| c.iter().any(|id| id.as_str() == "child-1")),
             "root-1 must have child-1 in its children list"
         );
     }
 
     #[test]
     fn root_span_sets_completion_timer() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
+        let mut trace = InFlightTrace::new("trace-1".into(), make_agent());
         assert!(
             trace.completion_timer.is_none(),
             "no timer before root arrives"
@@ -331,7 +331,7 @@ mod tests {
             trace.completion_timer.is_some(),
             "timer must be set after root arrives"
         );
-        assert_eq!(trace.root_span_id, Some("root-1".to_string()));
+        assert_eq!(trace.root_span_id.as_deref(), Some("root-1"));
         assert_eq!(
             trace.check_completion(),
             CompletionState::InFlight,
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn mutual_orphans_stay_in_pending() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
+        let mut trace = InFlightTrace::new("trace-1".into(), make_agent());
 
         // A's parent is B, B's parent is A — circular, neither can ever be adopted
         trace.receive_span(make_span("span-a", "trace-1", Some("span-b")), vec![]);
@@ -357,17 +357,17 @@ mod tests {
 
     #[test]
     fn single_span_trace_with_no_parent_is_root() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
+        let mut trace = InFlightTrace::new("trace-1".into(), make_agent());
         trace.receive_span(make_span("only-span", "trace-1", None), vec![]);
 
         assert_eq!(trace.spans.len(), 1);
-        assert_eq!(trace.root_span_id, Some("only-span".to_string()));
+        assert_eq!(trace.root_span_id.as_deref(), Some("only-span"));
         assert_eq!(trace.pending_count(), 0);
     }
 
     #[test]
     fn duplicate_root_candidate_does_not_override_first() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
+        let mut trace = InFlightTrace::new("trace-1".into(), make_agent());
 
         trace.receive_span(make_span("root-1", "trace-1", None), vec![]);
         let first_timer = trace.completion_timer.unwrap();
@@ -375,8 +375,8 @@ mod tests {
         trace.receive_span(make_span("root-2", "trace-1", None), vec![]);
 
         assert_eq!(
-            trace.root_span_id,
-            Some("root-1".to_string()),
+            trace.root_span_id.as_deref(),
+            Some("root-1"),
             "first no-parent span must remain the root"
         );
         assert_eq!(
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn cost_accumulates_across_spans() {
-        let mut trace = InFlightTrace::new("trace-1".to_string(), make_agent());
+        let mut trace = InFlightTrace::new("trace-1".into(), make_agent());
 
         let mut span1 = make_span("span-1", "trace-1", None);
         span1.attributes = serde_json::json!({"gen_ai.usage.cost": 0.0025});

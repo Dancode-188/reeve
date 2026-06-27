@@ -71,12 +71,14 @@ fn text_to_enum<T: DeserializeOwned>(text: &str) -> Result<T, StorageError> {
 fn row_to_trace(row: &Row) -> rusqlite::Result<Trace> {
     let status: String = row.get("status")?;
     Ok(Trace {
-        id: row.get("id")?,
-        agent_id: row.get("agent_id")?,
+        id: row.get::<_, String>("id")?.into(),
+        agent_id: row.get::<_, String>("agent_id")?.into(),
         status: text_to_enum::<TraceStatus>(&status).map_err(rusqlite_serde_err)?,
         start_time: row.get("started_at")?,
         end_time: row.get("completed_at")?,
-        root_span_id: row.get("root_span_id")?,
+        root_span_id: row
+            .get::<_, Option<String>>("root_span_id")?
+            .map(Into::into),
         final_health_score: row.get("final_health_score")?,
     })
 }
@@ -86,9 +88,9 @@ fn row_to_span(row: &Row) -> rusqlite::Result<InternalSpan> {
     let attributes: String = row.get("attributes")?;
     let raw_attributes: String = row.get("raw_attributes")?;
     Ok(InternalSpan {
-        id: row.get("id")?,
-        trace_id: row.get("trace_id")?,
-        parent_id: row.get("parent_id")?,
+        id: row.get::<_, String>("id")?.into(),
+        trace_id: row.get::<_, String>("trace_id")?.into(),
+        parent_id: row.get::<_, Option<String>>("parent_id")?.map(Into::into),
         operation: row.get("operation")?,
         status: text_to_enum::<SpanStatus>(&status).map_err(rusqlite_serde_err)?,
         start_time: row.get("start_time")?,
@@ -102,8 +104,8 @@ fn row_to_span(row: &Row) -> rusqlite::Result<InternalSpan> {
 fn row_to_span_event(row: &Row) -> rusqlite::Result<SpanEvent> {
     let event_type: String = row.get("event_type")?;
     Ok(SpanEvent {
-        id: row.get("id")?,
-        span_id: row.get("span_id")?,
+        id: row.get::<_, String>("id")?.into(),
+        span_id: row.get::<_, String>("span_id")?.into(),
         event_type: text_to_enum::<EventType>(&event_type).map_err(rusqlite_serde_err)?,
         occurred_at: row.get("occurred_at")?,
         content: row.get("content")?,
@@ -114,7 +116,7 @@ fn row_to_evaluation_result(row: &Row) -> rusqlite::Result<EvaluationResult> {
     let target_type: String = row.get("target_type")?;
     let evaluator: String = row.get("evaluator")?;
     Ok(EvaluationResult {
-        id: row.get("id")?,
+        id: row.get::<_, String>("id")?.into(),
         target_id: row.get("target_id")?,
         target_type: text_to_enum::<TargetType>(&target_type).map_err(rusqlite_serde_err)?,
         metric: row.get("metric")?,
@@ -129,10 +131,10 @@ fn row_to_intervention_command(row: &Row) -> rusqlite::Result<InterventionComman
     let command_type: String = row.get("command_type")?;
     let status: String = row.get("status")?;
     Ok(InterventionCommand {
-        id: row.get("id")?,
-        trace_id: row.get("trace_id")?,
-        span_id: row.get("span_id")?,
-        policy_id: row.get("policy_id")?,
+        id: row.get::<_, String>("id")?.into(),
+        trace_id: row.get::<_, String>("trace_id")?.into(),
+        span_id: row.get::<_, Option<String>>("span_id")?.map(Into::into),
+        policy_id: row.get::<_, Option<String>>("policy_id")?.map(Into::into),
         command_type: serde_json::from_str(&command_type).map_err(rusqlite_serde_err)?,
         status: text_to_enum::<CommandStatus>(&status).map_err(rusqlite_serde_err)?,
         requires_confirmation: row.get("requires_confirmation")?,
@@ -202,7 +204,7 @@ impl WarmStore {
                     status = excluded.status,
                     last_seen_at = excluded.last_seen_at",
                 params![
-                    agent.id,
+                    agent.id.as_str(),
                     agent.name,
                     agent.framework,
                     integration,
@@ -229,12 +231,12 @@ impl WarmStore {
                     root_span_id = excluded.root_span_id,
                     final_health_score = excluded.final_health_score",
                 params![
-                    trace.id,
-                    trace.agent_id,
+                    trace.id.as_str(),
+                    trace.agent_id.as_str(),
                     status,
                     trace.start_time,
                     trace.end_time,
-                    trace.root_span_id,
+                    trace.root_span_id.as_deref(),
                     trace.final_health_score,
                 ],
             )?;
@@ -248,7 +250,7 @@ impl WarmStore {
         self.with_conn(move |conn| {
             conn.query_row(
                 "SELECT * FROM traces WHERE id = ?1",
-                params![id],
+                params![id.as_str()],
                 row_to_trace,
             )
             .map(Some)
@@ -267,7 +269,7 @@ impl WarmStore {
         let agent_id = agent_id.clone();
         self.with_conn(move |conn| {
             conn.prepare("SELECT * FROM traces WHERE agent_id = ?1 ORDER BY started_at")?
-                .query_map(params![agent_id], row_to_trace)?
+                .query_map(params![agent_id.as_str()], row_to_trace)?
                 .collect()
         })
         .await
@@ -288,9 +290,9 @@ impl WarmStore {
                     attributes = excluded.attributes,
                     raw_attributes = excluded.raw_attributes",
                 params![
-                    span.id,
-                    span.trace_id,
-                    span.parent_id,
+                    span.id.as_str(),
+                    span.trace_id.as_str(),
+                    span.parent_id.as_deref(),
                     span.operation,
                     status,
                     span.start_time,
@@ -310,7 +312,7 @@ impl WarmStore {
         self.with_conn(move |conn| {
             conn.query_row(
                 "SELECT * FROM spans WHERE id = ?1",
-                params![id],
+                params![id.as_str()],
                 row_to_span,
             )
             .map(Some)
@@ -333,8 +335,8 @@ impl WarmStore {
                     "INSERT INTO span_events (id, span_id, event_type, occurred_at, content)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
-                        event.id,
-                        event.span_id,
+                        event.id.as_str(),
+                        event.span_id.as_str(),
                         event_type,
                         event.occurred_at,
                         event.content
@@ -354,7 +356,7 @@ impl WarmStore {
         let span_id = span_id.clone();
         self.with_conn(move |conn| {
             conn.prepare("SELECT * FROM span_events WHERE span_id = ?1 ORDER BY occurred_at")?
-                .query_map(params![span_id], row_to_span_event)?
+                .query_map(params![span_id.as_str()], row_to_span_event)?
                 .collect()
         })
         .await
@@ -372,7 +374,7 @@ impl WarmStore {
                     (id, target_id, target_type, metric, score, evaluator, judge_model_version, evaluated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
-                    result.id,
+                    result.id.as_str(),
                     result.target_id,
                     target_type,
                     result.metric,
@@ -395,7 +397,7 @@ impl WarmStore {
         self.with_conn(move |conn| {
             conn.query_row(
                 "SELECT * FROM evaluation_results WHERE id = ?1",
-                params![id],
+                params![id.as_str()],
                 row_to_evaluation_result,
             )
             .map(Some)
@@ -426,10 +428,10 @@ impl WarmStore {
                     status = excluded.status,
                     acknowledged_at = excluded.acknowledged_at",
                 params![
-                    command.id,
-                    command.trace_id,
-                    command.span_id,
-                    command.policy_id,
+                    command.id.as_str(),
+                    command.trace_id.as_str(),
+                    command.span_id.as_deref(),
+                    command.policy_id.as_deref(),
                     command_type,
                     status,
                     command.requires_confirmation,
@@ -452,7 +454,7 @@ impl WarmStore {
         self.with_conn(move |conn| {
             conn.query_row(
                 "SELECT * FROM intervention_commands WHERE id = ?1",
-                params![id],
+                params![id.as_str()],
                 row_to_intervention_command,
             )
             .map(Some)
@@ -469,6 +471,7 @@ impl WarmStore {
 mod tests {
     use super::*;
     use reeve_model::entity::{CommandType as CT, EvaluatorType as ET, TargetType as TT};
+    use reeve_model::ids::{AgentId, CommandId, EvalId, SpanId, TraceId};
     use std::collections::HashMap as Map;
 
     /// `save_agent` is deliberately out of scope for this crate's first
@@ -492,8 +495,8 @@ mod tests {
 
     fn trace(id: &str) -> Trace {
         Trace {
-            id: id.to_string(),
-            agent_id: "agent-1".to_string(),
+            id: id.into(),
+            agent_id: "agent-1".into(),
             status: TraceStatus::Running,
             start_time: 0,
             end_time: None,
@@ -504,8 +507,8 @@ mod tests {
 
     fn span(id: &str, trace_id: &str) -> InternalSpan {
         InternalSpan {
-            id: id.to_string(),
-            trace_id: trace_id.to_string(),
+            id: id.into(),
+            trace_id: trace_id.into(),
             parent_id: None,
             operation: "test.op".to_string(),
             status: SpanStatus::Completed,
@@ -523,15 +526,19 @@ mod tests {
         insert_test_agent(&store, "agent-1").await;
         store.save_trace(trace("t1")).await.unwrap();
 
-        let loaded = store.get_trace(&"t1".to_string()).await.unwrap().unwrap();
-        assert_eq!(loaded.id, "t1");
+        let loaded = store
+            .get_trace(&TraceId::from("t1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.id.as_str(), "t1");
         assert_eq!(loaded.status, TraceStatus::Running);
     }
 
     #[tokio::test]
     async fn get_trace_missing_returns_none() {
         let store = WarmStore::open_in_memory().unwrap();
-        let loaded = store.get_trace(&"missing".to_string()).await.unwrap();
+        let loaded = store.get_trace(&TraceId::from("missing")).await.unwrap();
         assert!(loaded.is_none());
     }
 
@@ -542,7 +549,7 @@ mod tests {
         store.save_trace(trace("t1")).await.unwrap();
         store.save_span(span("s1", "t1")).await.unwrap();
 
-        let loaded = store.get_span(&"s1".to_string()).await.unwrap().unwrap();
+        let loaded = store.get_span(&SpanId::from("s1")).await.unwrap().unwrap();
         assert_eq!(loaded.status, SpanStatus::Completed);
         assert_eq!(loaded.attributes, serde_json::json!({"k": "v"}));
     }
@@ -556,15 +563,15 @@ mod tests {
 
         let events = vec![
             SpanEvent {
-                id: "e1".to_string(),
-                span_id: "s1".to_string(),
+                id: "e1".into(),
+                span_id: "s1".into(),
                 event_type: EventType::UserMessage,
                 occurred_at: 1,
                 content: Some("hello".to_string()),
             },
             SpanEvent {
-                id: "e2".to_string(),
-                span_id: "s1".to_string(),
+                id: "e2".into(),
+                span_id: "s1".into(),
                 event_type: EventType::AssistantMessage,
                 occurred_at: 2,
                 content: None,
@@ -573,7 +580,7 @@ mod tests {
         store.save_span_events(events).await.unwrap();
 
         let loaded = store
-            .get_span_events_for_span(&"s1".to_string())
+            .get_span_events_for_span(&SpanId::from("s1"))
             .await
             .unwrap();
         assert_eq!(loaded.len(), 2);
@@ -588,7 +595,7 @@ mod tests {
         store.save_trace(trace("t1")).await.unwrap();
 
         let result = EvaluationResult {
-            id: "ev1".to_string(),
+            id: "ev1".into(),
             target_id: "t1".to_string(),
             target_type: TT::Trace,
             metric: "loop_detection".to_string(),
@@ -600,7 +607,7 @@ mod tests {
         store.save_evaluation_result(result).await.unwrap();
 
         let loaded = store
-            .get_evaluation_result(&"ev1".to_string())
+            .get_evaluation_result(&EvalId::from("ev1"))
             .await
             .unwrap()
             .unwrap();
@@ -616,8 +623,8 @@ mod tests {
         store.save_trace(trace("t1")).await.unwrap();
 
         let command = InterventionCommand {
-            id: "c1".to_string(),
-            trace_id: "t1".to_string(),
+            id: "c1".into(),
+            trace_id: "t1".into(),
             span_id: None,
             policy_id: None,
             command_type: CT::Redirect {
@@ -633,7 +640,7 @@ mod tests {
         store.save_intervention_command(command).await.unwrap();
 
         let loaded = store
-            .get_intervention_command(&"c1".to_string())
+            .get_intervention_command(&CommandId::from("c1"))
             .await
             .unwrap()
             .unwrap();
@@ -650,17 +657,17 @@ mod tests {
         insert_test_agent(&store, "agent-a").await;
         insert_test_agent(&store, "agent-b").await;
         let mut t1 = trace("t1");
-        t1.agent_id = "agent-a".to_string();
+        t1.agent_id = "agent-a".into();
         let mut t2 = trace("t2");
-        t2.agent_id = "agent-a".to_string();
+        t2.agent_id = "agent-a".into();
         let mut t3 = trace("t3");
-        t3.agent_id = "agent-b".to_string();
+        t3.agent_id = "agent-b".into();
         store.save_trace(t1).await.unwrap();
         store.save_trace(t2).await.unwrap();
         store.save_trace(t3).await.unwrap();
 
         let loaded = store
-            .list_traces_for_agent(&"agent-a".to_string())
+            .list_traces_for_agent(&AgentId::from("agent-a"))
             .await
             .unwrap();
         assert_eq!(loaded.len(), 2);
