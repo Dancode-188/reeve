@@ -106,9 +106,9 @@ impl AttributeTranslator for V1AttributeTranslator {
         }
 
         let internal_span = InternalSpan {
-            id: span_id.clone(),
-            trace_id: trace_id.clone(),
-            parent_id,
+            id: span_id.clone().into(),
+            trace_id: trace_id.clone().into(),
+            parent_id: parent_id.clone().map(Into::into),
             operation: ps.span.name,
             status,
             start_time,
@@ -156,8 +156,8 @@ impl AttributeTranslator for V1AttributeTranslator {
                 };
 
                 Some(SpanEvent {
-                    id: format!("{}:event:{}", span_id, idx),
-                    span_id: span_id.clone(),
+                    id: format!("{}:event:{}", span_id, idx).into(),
+                    span_id: span_id.clone().into(),
                     event_type,
                     occurred_at,
                     content,
@@ -168,7 +168,7 @@ impl AttributeTranslator for V1AttributeTranslator {
         // Agent is always produced from resource metadata. The route stage handles
         // "if not exists, insert" when storage is wired up.
         let agent = Agent {
-            id: format!("{}:{}", ps.service_name, ps.service_instance_id),
+            id: format!("{}:{}", ps.service_name, ps.service_instance_id).into(),
             name: ps.service_name,
             framework: ps.framework,
             integration: IntegrationPath::Sdk,

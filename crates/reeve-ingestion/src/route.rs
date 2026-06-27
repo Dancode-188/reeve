@@ -141,12 +141,13 @@ mod tests {
     use reeve_model::entity::Agent;
     use reeve_model::entity::agent::{AgentStatus, IntegrationPath};
     use reeve_model::entity::span::{InternalSpan, SpanStatus};
+    use reeve_model::ids::{SpanId, TraceId};
     use reeve_storage::warm::WarmStore;
     use std::collections::HashMap;
 
     fn make_agent() -> Agent {
         Agent {
-            id: "agent-1".to_string(),
+            id: "agent-1".into(),
             name: "test-service".to_string(),
             framework: "custom".to_string(),
             integration: IntegrationPath::Sdk,
@@ -165,9 +166,9 @@ mod tests {
 
     fn make_span(id: &str, trace_id: &str, parent_id: Option<&str>) -> InternalSpan {
         InternalSpan {
-            id: id.to_string(),
-            trace_id: trace_id.to_string(),
-            parent_id: parent_id.map(|s| s.to_string()),
+            id: id.into(),
+            trace_id: trace_id.into(),
+            parent_id: parent_id.map(Into::into),
             operation: "test.op".to_string(),
             status: SpanStatus::Completed,
             start_time: 1000,
@@ -179,7 +180,7 @@ mod tests {
     }
 
     fn make_trace_with_spans(trace_id: &str, span_ids: &[&str]) -> InFlightTrace {
-        let mut trace = InFlightTrace::new(trace_id.to_string(), make_agent());
+        let mut trace = InFlightTrace::new(trace_id.into(), make_agent());
         for (i, id) in span_ids.iter().enumerate() {
             let parent = if i == 0 { None } else { Some(span_ids[0]) };
             trace.receive_span(make_span(id, trace_id, parent), vec![]);
@@ -194,11 +195,11 @@ mod tests {
 
         router.route(trace, CompletionState::Completed).await;
 
-        let saved = warm.get_trace(&"trace-1".to_string()).await.unwrap();
+        let saved = warm.get_trace(&TraceId::from("trace-1")).await.unwrap();
         assert!(saved.is_some(), "trace must be in warm store after routing");
         assert_eq!(saved.unwrap().status, TraceStatus::Completed);
 
-        let span = warm.get_span(&"root-1".to_string()).await.unwrap();
+        let span = warm.get_span(&SpanId::from("root-1")).await.unwrap();
         assert!(span.is_some(), "spans must be flushed to warm store");
     }
 
@@ -211,8 +212,8 @@ mod tests {
         router.route(trace, CompletionState::Completed).await;
 
         // Both spans end up in warm store: one via eviction, one via normal flush.
-        let root = warm.get_span(&"root-1".to_string()).await.unwrap();
-        let child = warm.get_span(&"child-1".to_string()).await.unwrap();
+        let root = warm.get_span(&SpanId::from("root-1")).await.unwrap();
+        let child = warm.get_span(&SpanId::from("child-1")).await.unwrap();
         assert!(root.is_some(), "evicted span must be in warm store");
         assert!(child.is_some(), "remaining span must be in warm store");
     }
@@ -224,7 +225,7 @@ mod tests {
 
         router.route(trace, CompletionState::Interrupted).await;
 
-        let saved = warm.get_trace(&"trace-1".to_string()).await.unwrap();
+        let saved = warm.get_trace(&TraceId::from("trace-1")).await.unwrap();
         assert!(saved.is_some());
         assert_eq!(
             saved.unwrap().status,
