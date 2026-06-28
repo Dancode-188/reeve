@@ -18,6 +18,10 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0012](./0012-lazy-agent-registration-at-trace-finalization.md) | Lazy Agent Registration at Trace Finalization | Accepted | 2026-06-26 |
 | [0013](./0013-proto-codegen-boundary.md) | Proto Codegen Boundary Between reeve-model and reeve-intervention | Accepted | 2026-06-27 |
 | [0014](./0014-trace-status-seven-state-machine.md) | Seven-State Trace Status Machine | Accepted | 2026-06-27 |
+| [0015](./0015-broadcast-channel-for-pipeline-renderer-signal-bus.md) | `broadcast::channel` for the Pipeline-to-Renderer Signal Bus | Accepted | 2026-06-28 |
+| [0016](./0016-renderer-subscribes-to-route-stage-directly.md) | Renderer Subscribes to the Route Stage Directly | Accepted | 2026-06-28 |
+| [0017](./0017-indexmap-for-agent-registry-in-renderer.md) | `IndexMap` for the Agent Registry in the Renderer | Accepted | 2026-06-28 |
+| [0018](./0018-warmstore-created-in-main-and-shared-via-arc.md) | `WarmStore` Created in `main.rs` and Shared via `Arc` | Accepted | 2026-06-28 |
 
 ## Format
 

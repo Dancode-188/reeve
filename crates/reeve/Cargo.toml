@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+reeve-ingestion = { path = "../reeve-ingestion" }
+reeve-renderer = { path = "../reeve-renderer" }
+reeve-storage = { path = "../reeve-storage" }
+reeve-model = { path = "../reeve-model" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
