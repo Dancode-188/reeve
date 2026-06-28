@@ -4,3 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+reeve-model = { path = "../reeve-model" }
+reeve-storage = { path = "../reeve-storage" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+indexmap = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
