@@ -6,6 +6,12 @@ pub struct Panels {
     pub right: Rect,
 }
 
+pub struct FullLayout {
+    pub header: Rect,
+    pub panels: Panels,
+    pub footer: Rect,
+}
+
 const LEFT_WIDTH: u16 = 22;
 const RIGHT_WIDTH: u16 = 28;
 const COLLAPSE_RIGHT: u16 = 120;
@@ -57,6 +63,29 @@ pub fn compute(area: Rect) -> Panels {
     }
 }
 
+pub fn compute_full(area: Rect) -> FullLayout {
+    if area.height < 3 {
+        return FullLayout {
+            header: Rect { height: 0, ..area },
+            panels: compute(area),
+            footer: Rect { height: 0, ..area },
+        };
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    FullLayout {
+        header: rows[0],
+        panels: compute(rows[1]),
+        footer: rows[2],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +115,22 @@ mod tests {
         assert_eq!(panels.left.width, 0);
         assert_eq!(panels.right.width, 0);
         assert_eq!(panels.center.width, 60);
+    }
+
+    #[test]
+    fn compute_full_reserves_header_and_footer() {
+        let area = Rect::new(0, 0, 160, 40);
+        let layout = compute_full(area);
+        assert_eq!(layout.header.height, 1);
+        assert_eq!(layout.footer.height, 1);
+        assert_eq!(layout.panels.left.height + 2, 40);
+    }
+
+    #[test]
+    fn compute_full_graceful_when_terminal_too_small() {
+        let area = Rect::new(0, 0, 80, 2);
+        let layout = compute_full(area);
+        assert_eq!(layout.header.height, 0);
+        assert_eq!(layout.footer.height, 0);
     }
 }
