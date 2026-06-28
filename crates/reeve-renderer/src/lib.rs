@@ -77,8 +77,10 @@ async fn run_inner(
                     app.state.streaming.cursor_tick.wrapping_add(1);
 
                 terminal.draw(|frame| {
-                    let panels = layout::compute(frame.area());
-                    panels::render(frame, &panels, &app.state, &theme, &ascii);
+                    let full = layout::compute_full(frame.area());
+                    panels::render_header(frame, full.header, &app.state, &theme);
+                    panels::render(frame, &full.panels, &app.state, &theme, &ascii);
+                    panels::render_footer(frame, full.footer, &theme);
                 })?;
 
                 if app.should_quit {
