@@ -86,7 +86,7 @@ async fn run_inner(
                 }
             }
             Some(action) = action_rx.recv() => {
-                app.handle_action(action);
+                app.handle_action(action).await;
                 if app.should_quit {
                     break;
                 }

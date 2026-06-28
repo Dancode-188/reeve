@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 pub struct TraceTree<'a> {
     pub children: &'a HashMap<SpanId, Vec<SpanId>>,
+    pub names: &'a HashMap<SpanId, String>,
     pub root: Option<&'a SpanId>,
     pub selected: Option<&'a SpanId>,
     pub scroll: u16,
@@ -69,7 +70,12 @@ impl<'a> TraceTree<'a> {
         };
 
         let is_selected = self.selected == Some(id);
-        let label = format!("{}{}{}", prefix, connector, id.as_str());
+        let display = self
+            .names
+            .get(id)
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| id.as_str());
+        let label = format!("{}{}{}", prefix, connector, display);
 
         let style = if is_selected {
             Style::default()
@@ -113,9 +119,12 @@ mod tests {
     #[test]
     fn tree_renders_parent_child_with_box_drawing() {
         let mut children: HashMap<SpanId, Vec<SpanId>> = HashMap::new();
+        let mut names: HashMap<SpanId, String> = HashMap::new();
         let root: SpanId = "root-span".into();
         let child: SpanId = "child-span".into();
         children.insert(root.clone(), vec![child.clone()]);
+        names.insert(root.clone(), "root-span".to_string());
+        names.insert(child.clone(), "child-span".to_string());
 
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -126,6 +135,7 @@ mod tests {
                 let ascii = make_ascii();
                 let widget = TraceTree {
                     children: &children,
+                    names: &names,
                     root: Some(&root),
                     selected: None,
                     scroll: 0,
