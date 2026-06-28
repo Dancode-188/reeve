@@ -28,6 +28,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, as
         frame.render_widget(
             TraceTree {
                 children: &tv.children,
+                names: &tv.names,
                 root: tv.root.as_ref(),
                 selected: tv.selected.as_ref(),
                 scroll: tv.scroll,
@@ -40,9 +41,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, as
         );
     } else {
         let empty: HashMap<SpanId, Vec<SpanId>> = HashMap::new();
+        let empty_names: HashMap<SpanId, String> = HashMap::new();
         frame.render_widget(
             TraceTree {
                 children: &empty,
+                names: &empty_names,
                 root: None,
                 selected: None,
                 scroll: 0,

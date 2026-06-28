@@ -35,6 +35,8 @@ pub struct TraceView {
     pub root: Option<SpanId>,
     pub spans: HashMap<SpanId, InternalSpan>,
     pub children: HashMap<SpanId, Vec<SpanId>>,
+    pub names: HashMap<SpanId, String>,
+    pub span_order: Vec<SpanId>,
     pub scroll: u16,
     pub selected: Option<SpanId>,
 }
@@ -87,7 +89,10 @@ impl App {
         let mut agents: IndexMap<AgentId, AgentState> = IndexMap::new();
         match warm.list_agents().await {
             Ok(list) => {
-                for agent in list {
+                for mut agent in list {
+                    // No agent is actively streaming at process startup.
+                    // Warm store status reflects the last session and may be stale.
+                    agent.status = reeve_model::entity::agent::AgentStatus::Idle;
                     let id = agent.id.clone();
                     agents.insert(id, AgentState::new(agent));
                 }
@@ -170,6 +175,7 @@ impl App {
             Ok(spans) => {
                 let mut span_map: HashMap<SpanId, InternalSpan> = HashMap::new();
                 let mut children: HashMap<SpanId, Vec<SpanId>> = HashMap::new();
+                let mut names: HashMap<SpanId, String> = HashMap::new();
                 let mut root: Option<SpanId> = None;
 
                 for span in spans {
@@ -181,14 +187,22 @@ impl App {
                     } else if root.is_none() {
                         root = Some(span.id.clone());
                     }
+                    names.insert(span.id.clone(), span.operation.clone());
                     span_map.insert(span.id.clone(), span);
                 }
+
+                let span_order = root
+                    .as_ref()
+                    .map(|r| flatten_tree(r, &children))
+                    .unwrap_or_default();
 
                 self.state.trace = Some(TraceView {
                     trace_id,
                     root,
                     spans: span_map,
                     children,
+                    names,
+                    span_order,
                     scroll: 0,
                     selected: None,
                 });
@@ -199,11 +213,25 @@ impl App {
         }
     }
 
-    pub fn handle_action(&mut self, action: Action) {
+    pub async fn handle_action(&mut self, action: Action) {
         match action {
             Action::Quit => self.should_quit = true,
-            Action::MoveUp => self.move_selection(-1),
-            Action::MoveDown => self.move_selection(1),
+            Action::MoveUp => match self.state.panel_focus {
+                PanelFocus::Left => {
+                    self.move_selection(-1);
+                    self.load_trace_for_selected().await;
+                }
+                PanelFocus::Center => self.move_center_selection(-1),
+                _ => {}
+            },
+            Action::MoveDown => match self.state.panel_focus {
+                PanelFocus::Left => {
+                    self.move_selection(1);
+                    self.load_trace_for_selected().await;
+                }
+                PanelFocus::Center => self.move_center_selection(1),
+                _ => {}
+            },
             Action::ScrollUp => match self.state.panel_focus {
                 PanelFocus::Center => {
                     if let Some(ref mut tv) = self.state.trace {
@@ -246,6 +274,33 @@ impl App {
         }
     }
 
+    fn move_center_selection(&mut self, delta: i32) {
+        let Some(tv) = self.state.trace.as_mut() else {
+            return;
+        };
+        if tv.span_order.is_empty() {
+            return;
+        }
+        let current = tv
+            .selected
+            .as_ref()
+            .and_then(|id| tv.span_order.iter().position(|s| s == id))
+            .unwrap_or(0);
+        let next = (current as i32 + delta).rem_euclid(tv.span_order.len() as i32) as usize;
+        tv.selected = Some(tv.span_order[next].clone());
+    }
+
+    async fn load_trace_for_selected(&mut self) {
+        let trace_id = self
+            .state
+            .selected_agent
+            .and_then(|i| self.state.agents.get_index(i))
+            .and_then(|(_, s)| s.last_trace_id.clone());
+        if let Some(tid) = trace_id {
+            self.load_trace(tid).await;
+        }
+    }
+
     fn move_selection(&mut self, delta: i32) {
         match self.state.panel_focus {
             PanelFocus::Left => {
@@ -261,4 +316,18 @@ impl App {
             PanelFocus::Right => {}
         }
     }
+}
+
+fn flatten_tree(root: &SpanId, children: &HashMap<SpanId, Vec<SpanId>>) -> Vec<SpanId> {
+    let mut order = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(id) = stack.pop() {
+        order.push(id.clone());
+        if let Some(kids) = children.get(&id) {
+            for kid in kids.iter().rev() {
+                stack.push(kid.clone());
+            }
+        }
+    }
+    order
 }

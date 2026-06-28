@@ -83,9 +83,16 @@ fn render_span_detail(
             Style::default().fg(theme.subtext()),
         )),
         Some(span) => {
+            let inner_w = area.width.saturating_sub(2) as usize;
+            let op_max = inner_w.saturating_sub(9); // " op:     " prefix is 9 chars
+            let op = if span.operation.len() > op_max && op_max > 3 {
+                format!("{}...", &span.operation[..op_max - 3])
+            } else {
+                span.operation.clone()
+            };
             let mut lines = vec![
                 Line::styled(
-                    format!(" op:     {}", span.operation),
+                    format!(" op:     {}", op),
                     Style::default().fg(theme.text()),
                 ),
                 Line::styled(
@@ -93,7 +100,7 @@ fn render_span_detail(
                     Style::default().fg(theme.subtext()),
                 ),
                 Line::styled(
-                    format!(" start:  {}", span.start_time),
+                    format!(" start:  {}", fmt_ts(span.start_time)),
                     Style::default().fg(theme.subtext()),
                 ),
             ];
@@ -118,4 +125,13 @@ fn render_span_detail(
     };
 
     frame.render_widget(Paragraph::new(text).block(block), area);
+}
+
+fn fmt_ts(ms: i64) -> String {
+    let secs = (ms / 1000).unsigned_abs();
+    let ms_part = (ms % 1000).unsigned_abs();
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    format!("{h:02}:{m:02}:{s:02}.{ms_part:03}")
 }
