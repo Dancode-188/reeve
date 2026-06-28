@@ -22,6 +22,7 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0016](./0016-renderer-subscribes-to-route-stage-directly.md) | Renderer Subscribes to the Route Stage Directly | Accepted | 2026-06-28 |
 | [0017](./0017-indexmap-for-agent-registry-in-renderer.md) | `IndexMap` for the Agent Registry in the Renderer | Accepted | 2026-06-28 |
 | [0018](./0018-warmstore-created-in-main-and-shared-via-arc.md) | `WarmStore` Created in `main.rs` and Shared via `Arc` | Accepted | 2026-06-28 |
+| [0019](./0019-separate-ingestion-and-engine-event-channels.md) | Separate IngestionEvent and EngineEvent Channels | Accepted | 2026-06-28 |
 
 ## Format
 
