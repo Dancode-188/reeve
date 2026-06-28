@@ -56,8 +56,7 @@ async fn run_inner(
     });
 
     // 15fps: live enough to feel responsive, low enough to not burn CPU on a monitoring tool.
-    let mut interval =
-        tokio::time::interval(std::time::Duration::from_millis(66));
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(66));
 
     loop {
         tokio::select! {

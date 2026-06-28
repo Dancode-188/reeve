@@ -32,7 +32,9 @@ pub async fn run(tx: mpsc::Sender<Action>) {
 
 fn map_event(event: Event) -> Option<Action> {
     match event {
-        Event::Key(KeyEvent { code, modifiers, .. }) => match (code, modifiers) {
+        Event::Key(KeyEvent {
+            code, modifiers, ..
+        }) => match (code, modifiers) {
             (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 Some(Action::Quit)
             }

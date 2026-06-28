@@ -2,11 +2,11 @@ use crate::app::AppState;
 use crate::ascii::AsciiMode;
 use crate::theme::Theme;
 use crate::widgets::{StreamingBox, TraceTree};
-use reeve_model::ids::SpanId;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
 };
+use reeve_model::ids::SpanId;
 use std::collections::HashMap;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, ascii: &AsciiMode) {

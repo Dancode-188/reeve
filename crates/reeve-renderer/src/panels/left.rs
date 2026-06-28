@@ -1,6 +1,5 @@
 use crate::app::{AppState, PanelFocus};
 use crate::theme::Theme;
-use reeve_model::entity::agent::AgentStatus;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -8,6 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem},
 };
+use reeve_model::entity::agent::AgentStatus;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if area.width == 0 {
@@ -77,7 +77,6 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{:.max$}", s, max = max.saturating_sub(1))
-            + "…"
+        format!("{:.max$}", s, max = max.saturating_sub(1)) + "…"
     }
 }

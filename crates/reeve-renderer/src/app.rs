@@ -174,7 +174,10 @@ impl App {
 
                 for span in spans {
                     if let Some(ref pid) = span.parent_id {
-                        children.entry(pid.clone()).or_default().push(span.id.clone());
+                        children
+                            .entry(pid.clone())
+                            .or_default()
+                            .push(span.id.clone());
                     } else if root.is_none() {
                         root = Some(span.id.clone());
                     }
@@ -209,8 +212,7 @@ impl App {
                 }
                 PanelFocus::Right => {
                     self.state.streaming.auto_scroll = false;
-                    self.state.streaming.scroll =
-                        self.state.streaming.scroll.saturating_sub(1);
+                    self.state.streaming.scroll = self.state.streaming.scroll.saturating_sub(1);
                 }
                 _ => {}
             },

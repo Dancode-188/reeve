@@ -103,7 +103,11 @@ fn render_span_detail(
                     Style::default().fg(theme.subtext()),
                 ));
             }
-            if let Some(cost) = span.attributes.get("gen_ai.usage.cost").and_then(|v| v.as_f64()) {
+            if let Some(cost) = span
+                .attributes
+                .get("gen_ai.usage.cost")
+                .and_then(|v| v.as_f64())
+            {
                 lines.push(Line::styled(
                     format!(" cost:   ${:.4}", cost),
                     Style::default().fg(theme.get("teal")),

@@ -14,9 +14,17 @@ const COLLAPSE_LEFT: u16 = 80;
 pub fn compute(area: Rect) -> Panels {
     if area.width < COLLAPSE_LEFT {
         Panels {
-            left: Rect { width: 0, height: 0, ..area },
+            left: Rect {
+                width: 0,
+                height: 0,
+                ..area
+            },
             center: area,
-            right: Rect { width: 0, height: 0, ..area },
+            right: Rect {
+                width: 0,
+                height: 0,
+                ..area
+            },
         }
     } else if area.width < COLLAPSE_RIGHT {
         let chunks = Layout::default()
@@ -26,7 +34,11 @@ pub fn compute(area: Rect) -> Panels {
         Panels {
             left: chunks[0],
             center: chunks[1],
-            right: Rect { width: 0, height: 0, ..area },
+            right: Rect {
+                width: 0,
+                height: 0,
+                ..area
+            },
         }
     } else {
         let chunks = Layout::default()

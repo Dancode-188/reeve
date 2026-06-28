@@ -1,6 +1,5 @@
 use crate::ascii::AsciiMode;
 use crate::theme::Theme;
-use reeve_model::ids::SpanId;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -8,6 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Widget},
 };
+use reeve_model::ids::SpanId;
 use std::collections::HashMap;
 
 pub struct TraceTree<'a> {
@@ -47,11 +47,7 @@ impl<'a> Widget for TraceTree<'a> {
             )));
         }
 
-        Widget::render(
-            Paragraph::new(lines).scroll((self.scroll, 0)),
-            inner,
-            buf,
-        );
+        Widget::render(Paragraph::new(lines).scroll((self.scroll, 0)), inner, buf);
     }
 }
 
@@ -72,7 +68,7 @@ impl<'a> TraceTree<'a> {
             self.ascii.tree_tee()
         };
 
-        let is_selected = self.selected.map_or(false, |s| s == id);
+        let is_selected = self.selected == Some(id);
         let label = format!("{}{}{}", prefix, connector, id.as_str());
 
         let style = if is_selected {
@@ -153,6 +149,9 @@ mod tests {
         assert!(content.contains("root-span"), "root span must appear");
         assert!(content.contains("child-span"), "child span must appear");
         // Box-drawing connector for the child
-        assert!(content.contains('└') || content.contains('├'), "tree connector must appear");
+        assert!(
+            content.contains('└') || content.contains('├'),
+            "tree connector must appear"
+        );
     }
 }

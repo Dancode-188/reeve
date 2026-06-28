@@ -59,20 +59,48 @@ impl Theme {
         Color::Magenta
     }
 
-    pub fn background(&self) -> Color { self.get("background") }
-    pub fn text(&self) -> Color { self.get("text") }
-    pub fn subtext(&self) -> Color { self.get("subtext") }
-    pub fn surface(&self) -> Color { self.get("surface") }
-    pub fn border_focused(&self) -> Color { self.get("border_focused") }
-    pub fn border_idle(&self) -> Color { self.get("border_idle") }
-    pub fn highlight(&self) -> Color { self.get("highlight") }
-    pub fn health_ok(&self) -> Color { self.get("health_ok") }
-    pub fn health_warn(&self) -> Color { self.get("health_warn") }
-    pub fn health_alert(&self) -> Color { self.get("health_alert") }
-    pub fn health_crit(&self) -> Color { self.get("health_crit") }
-    pub fn span_active(&self) -> Color { self.get("span_active") }
-    pub fn span_complete(&self) -> Color { self.get("span_complete") }
-    pub fn span_error(&self) -> Color { self.get("span_error") }
+    pub fn background(&self) -> Color {
+        self.get("background")
+    }
+    pub fn text(&self) -> Color {
+        self.get("text")
+    }
+    pub fn subtext(&self) -> Color {
+        self.get("subtext")
+    }
+    pub fn surface(&self) -> Color {
+        self.get("surface")
+    }
+    pub fn border_focused(&self) -> Color {
+        self.get("border_focused")
+    }
+    pub fn border_idle(&self) -> Color {
+        self.get("border_idle")
+    }
+    pub fn highlight(&self) -> Color {
+        self.get("highlight")
+    }
+    pub fn health_ok(&self) -> Color {
+        self.get("health_ok")
+    }
+    pub fn health_warn(&self) -> Color {
+        self.get("health_warn")
+    }
+    pub fn health_alert(&self) -> Color {
+        self.get("health_alert")
+    }
+    pub fn health_crit(&self) -> Color {
+        self.get("health_crit")
+    }
+    pub fn span_active(&self) -> Color {
+        self.get("span_active")
+    }
+    pub fn span_complete(&self) -> Color {
+        self.get("span_complete")
+    }
+    pub fn span_error(&self) -> Color {
+        self.get("span_error")
+    }
 }
 
 fn parse_hex(s: &str) -> Option<Color> {

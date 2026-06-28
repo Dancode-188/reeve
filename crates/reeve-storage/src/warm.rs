@@ -1,6 +1,6 @@
 use reeve_model::entity::{
-    Agent, AgentStatus, CommandStatus, EvaluationResult, EvaluatorType, EventType, InternalSpan,
-    IntegrationPath, InterventionCommand, SpanEvent, SpanStatus, TargetType, Trace, TraceStatus,
+    Agent, AgentStatus, CommandStatus, EvaluationResult, EvaluatorType, EventType, IntegrationPath,
+    InternalSpan, InterventionCommand, SpanEvent, SpanStatus, TargetType, Trace, TraceStatus,
 };
 use reeve_model::ids::{AgentId, CommandId, EvalId, SpanId, TraceId};
 use rusqlite::{Connection, Row, params};

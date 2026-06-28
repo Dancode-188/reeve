@@ -285,7 +285,9 @@ mod tests {
         router.route(trace, CompletionState::Completed).await;
 
         let signals: Vec<_> = std::iter::from_fn(|| signal_rx.try_recv().ok()).collect();
-        let has_connected = signals.iter().any(|s| matches!(s, EngineSignal::AgentConnected { .. }));
+        let has_connected = signals
+            .iter()
+            .any(|s| matches!(s, EngineSignal::AgentConnected { .. }));
         assert!(has_connected, "AgentConnected must fire on first encounter");
 
         // Second trace from same agent must not fire AgentConnected again.
@@ -293,7 +295,12 @@ mod tests {
         router.route(trace2, CompletionState::Completed).await;
 
         let signals2: Vec<_> = std::iter::from_fn(|| signal_rx.try_recv().ok()).collect();
-        let connected_again = signals2.iter().any(|s| matches!(s, EngineSignal::AgentConnected { .. }));
-        assert!(!connected_again, "AgentConnected must not fire on subsequent traces");
+        let connected_again = signals2
+            .iter()
+            .any(|s| matches!(s, EngineSignal::AgentConnected { .. }));
+        assert!(
+            !connected_again,
+            "AgentConnected must not fire on subsequent traces"
+        );
     }
 }
