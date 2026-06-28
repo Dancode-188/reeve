@@ -1,6 +1,6 @@
 use reeve_model::entity::{
-    Agent, CommandStatus, EvaluationResult, EvaluatorType, EventType, InternalSpan,
-    InterventionCommand, SpanEvent, SpanStatus, TargetType, Trace, TraceStatus,
+    Agent, AgentStatus, CommandStatus, EvaluationResult, EvaluatorType, EventType, InternalSpan,
+    IntegrationPath, InterventionCommand, SpanEvent, SpanStatus, TargetType, Trace, TraceStatus,
 };
 use reeve_model::ids::{AgentId, CommandId, EvalId, SpanId, TraceId};
 use rusqlite::{Connection, Row, params};
@@ -109,6 +109,20 @@ fn row_to_span_event(row: &Row) -> rusqlite::Result<SpanEvent> {
         event_type: text_to_enum::<EventType>(&event_type).map_err(rusqlite_serde_err)?,
         occurred_at: row.get("occurred_at")?,
         content: row.get("content")?,
+    })
+}
+
+fn row_to_agent(row: &Row) -> rusqlite::Result<Agent> {
+    let integration: String = row.get("integration")?;
+    let status: String = row.get("status")?;
+    Ok(Agent {
+        id: row.get::<_, String>("id")?.into(),
+        name: row.get("name")?,
+        framework: row.get("framework")?,
+        integration: text_to_enum::<IntegrationPath>(&integration).map_err(rusqlite_serde_err)?,
+        status: text_to_enum::<AgentStatus>(&status).map_err(rusqlite_serde_err)?,
+        first_seen_at: row.get("first_seen_at")?,
+        last_seen_at: row.get("last_seen_at")?,
     })
 }
 
@@ -462,6 +476,28 @@ impl WarmStore {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 e => Err(e),
             })
+        })
+        .await
+    }
+
+    pub async fn list_agents(&self) -> Result<Vec<Agent>, StorageError> {
+        self.with_conn(|conn| {
+            conn.prepare("SELECT * FROM agents ORDER BY last_seen_at DESC")?
+                .query_map([], row_to_agent)?
+                .collect()
+        })
+        .await
+    }
+
+    pub async fn list_spans_for_trace(
+        &self,
+        trace_id: &TraceId,
+    ) -> Result<Vec<InternalSpan>, StorageError> {
+        let trace_id = trace_id.clone();
+        self.with_conn(move |conn| {
+            conn.prepare("SELECT * FROM spans WHERE trace_id = ?1 ORDER BY start_time")?
+                .query_map(params![trace_id.as_str()], row_to_span)?
+                .collect()
         })
         .await
     }

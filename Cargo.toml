@@ -21,3 +21,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 tonic = { version = "0.14", features = ["transport"] }
+ratatui = "0.29"
+crossterm = "0.28"
+indexmap = { version = "2", features = ["serde"] }
+toml = "0.8"

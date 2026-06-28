@@ -1,25 +1,41 @@
 use crate::assemble::{CompletionState, InFlightTrace};
+use reeve_model::entity::agent::AgentStatus;
 use reeve_model::entity::span::SpanStatus;
 use reeve_model::entity::trace::{Trace, TraceStatus};
+use reeve_model::ids::AgentId;
+use reeve_model::signal::EngineSignal;
 use reeve_storage::hot::HotStore;
 use reeve_storage::warm::WarmStore;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 pub struct Router {
     hot: Arc<Mutex<HotStore>>,
     warm: Arc<WarmStore>,
+    signal_tx: broadcast::Sender<EngineSignal>,
+    seen_agents: HashSet<AgentId>,
 }
 
 impl Router {
-    pub fn new(hot: Arc<Mutex<HotStore>>, warm: Arc<WarmStore>) -> Self {
-        Self { hot, warm }
+    pub fn new(
+        hot: Arc<Mutex<HotStore>>,
+        warm: Arc<WarmStore>,
+        signal_tx: broadcast::Sender<EngineSignal>,
+    ) -> Self {
+        Self {
+            hot,
+            warm,
+            signal_tx,
+            seen_agents: HashSet::new(),
+        }
     }
 
-    pub async fn route(&self, trace: InFlightTrace, state: CompletionState) {
+    pub async fn route(&mut self, trace: InFlightTrace, state: CompletionState) {
         let trace_id = trace.trace_id.clone();
         let agent_id = trace.agent.id.clone();
         let span_count = trace.spans.len();
+        let cost = trace.cost_accumulator;
 
         let status = match state {
             CompletionState::Completed => {
@@ -89,8 +105,16 @@ impl Router {
             }
         }
 
+        let is_first_encounter = self.seen_agents.insert(agent_id.clone());
+
         if let Err(e) = self.warm.upsert_agent(trace.agent.clone()).await {
             tracing::error!(trace_id = %trace_id, error = %e, "failed to upsert agent");
+        }
+
+        if is_first_encounter {
+            let _ = self.signal_tx.send(EngineSignal::AgentConnected {
+                agent: trace.agent.clone(),
+            });
         }
 
         if let Err(e) = self.warm.save_trace(trace_entity).await {
@@ -111,13 +135,27 @@ impl Router {
             }
         }
 
+        let agent_status = match status {
+            TraceStatus::Failed => AgentStatus::Error,
+            _ => AgentStatus::Idle,
+        };
+        let _ = self.signal_tx.send(EngineSignal::AgentStatusChanged {
+            agent_id: agent_id.clone(),
+            status: agent_status,
+        });
+        let _ = self.signal_tx.send(EngineSignal::TraceCompleted {
+            trace_id: trace_id.clone(),
+            agent_id: agent_id.clone(),
+            span_count,
+            cost,
+        });
+
         tracing::debug!(
             trace_id = %trace_id,
             agent_id = %agent_id,
             status = ?status,
             spans = span_count,
             "trace routed to storage",
-            // TODO: emit EngineSignal::TraceCompleted once reeve-engine exists
         );
     }
 }
@@ -126,8 +164,9 @@ pub async fn run(
     mut rx: mpsc::Receiver<(InFlightTrace, CompletionState)>,
     hot: Arc<Mutex<HotStore>>,
     warm: Arc<WarmStore>,
+    signal_tx: broadcast::Sender<EngineSignal>,
 ) {
-    let router = Router::new(hot, warm);
+    let mut router = Router::new(hot, warm, signal_tx);
     while let Some((trace, state)) = rx.recv().await {
         router.route(trace, state).await;
     }
@@ -160,7 +199,8 @@ mod tests {
     fn make_router(hot_capacity: usize) -> (Router, Arc<WarmStore>) {
         let hot = Arc::new(Mutex::new(HotStore::new(hot_capacity)));
         let warm = Arc::new(WarmStore::open_in_memory().unwrap());
-        let router = Router::new(hot, warm.clone());
+        let (signal_tx, _) = broadcast::channel(16);
+        let router = Router::new(hot, warm.clone(), signal_tx);
         (router, warm)
     }
 
@@ -190,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_trace_is_flushed_to_warm_store() {
-        let (router, warm) = make_router(10_000);
+        let (mut router, warm) = make_router(10_000);
         let trace = make_trace_with_spans("trace-1", &["root-1", "child-1", "child-2"]);
 
         router.route(trace, CompletionState::Completed).await;
@@ -206,7 +246,7 @@ mod tests {
     #[tokio::test]
     async fn hot_store_eviction_flushes_evicted_span_to_warm_store() {
         // Capacity 1: the second span push evicts the first.
-        let (router, warm) = make_router(1);
+        let (mut router, warm) = make_router(1);
         let trace = make_trace_with_spans("trace-1", &["root-1", "child-1"]);
 
         router.route(trace, CompletionState::Completed).await;
@@ -220,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupted_trace_saved_with_interrupted_status() {
-        let (router, warm) = make_router(10_000);
+        let (mut router, warm) = make_router(10_000);
         let trace = make_trace_with_spans("trace-1", &["child-1"]);
 
         router.route(trace, CompletionState::Interrupted).await;
@@ -232,5 +272,28 @@ mod tests {
             TraceStatus::Interrupted,
             "interrupted traces must be saved with Interrupted status"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_connected_signal_fires_on_first_encounter() {
+        let hot = Arc::new(Mutex::new(HotStore::new(10_000)));
+        let warm = Arc::new(WarmStore::open_in_memory().unwrap());
+        let (signal_tx, mut signal_rx) = broadcast::channel(16);
+        let mut router = Router::new(hot, warm, signal_tx);
+
+        let trace = make_trace_with_spans("trace-1", &["root-1"]);
+        router.route(trace, CompletionState::Completed).await;
+
+        let signals: Vec<_> = std::iter::from_fn(|| signal_rx.try_recv().ok()).collect();
+        let has_connected = signals.iter().any(|s| matches!(s, EngineSignal::AgentConnected { .. }));
+        assert!(has_connected, "AgentConnected must fire on first encounter");
+
+        // Second trace from same agent must not fire AgentConnected again.
+        let trace2 = make_trace_with_spans("trace-2", &["root-2"]);
+        router.route(trace2, CompletionState::Completed).await;
+
+        let signals2: Vec<_> = std::iter::from_fn(|| signal_rx.try_recv().ok()).collect();
+        let connected_again = signals2.iter().any(|s| matches!(s, EngineSignal::AgentConnected { .. }));
+        assert!(!connected_again, "AgentConnected must not fire on subsequent traces");
     }
 }
