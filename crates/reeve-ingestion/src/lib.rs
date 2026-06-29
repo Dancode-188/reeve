@@ -5,7 +5,7 @@ pub mod route;
 
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
 use receive::OtlpReceiver;
-use reeve_model::signal::EngineSignal;
+use reeve_model::signal::IngestionEvent;
 use reeve_storage::hot::HotStore;
 use reeve_storage::warm::WarmStore;
 use std::net::SocketAddr;
@@ -17,7 +17,7 @@ use tonic_health::{ServingStatus, server::health_reporter};
 pub async fn serve(
     addr: SocketAddr,
     warm: Arc<WarmStore>,
-    signal_tx: broadcast::Sender<EngineSignal>,
+    signal_tx: broadcast::Sender<IngestionEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let hot = Arc::new(Mutex::new(HotStore::new(10_000)));
 

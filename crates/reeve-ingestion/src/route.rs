@@ -3,7 +3,7 @@ use reeve_model::entity::agent::AgentStatus;
 use reeve_model::entity::span::SpanStatus;
 use reeve_model::entity::trace::{Trace, TraceStatus};
 use reeve_model::ids::AgentId;
-use reeve_model::signal::EngineSignal;
+use reeve_model::signal::IngestionEvent;
 use reeve_storage::hot::HotStore;
 use reeve_storage::warm::WarmStore;
 use std::collections::HashSet;
@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, mpsc};
 pub struct Router {
     hot: Arc<Mutex<HotStore>>,
     warm: Arc<WarmStore>,
-    signal_tx: broadcast::Sender<EngineSignal>,
+    signal_tx: broadcast::Sender<IngestionEvent>,
     seen_agents: HashSet<AgentId>,
 }
 
@@ -21,7 +21,7 @@ impl Router {
     pub fn new(
         hot: Arc<Mutex<HotStore>>,
         warm: Arc<WarmStore>,
-        signal_tx: broadcast::Sender<EngineSignal>,
+        signal_tx: broadcast::Sender<IngestionEvent>,
     ) -> Self {
         Self {
             hot,
@@ -112,7 +112,7 @@ impl Router {
         }
 
         if is_first_encounter {
-            let _ = self.signal_tx.send(EngineSignal::AgentConnected {
+            let _ = self.signal_tx.send(IngestionEvent::AgentConnected {
                 agent: trace.agent.clone(),
             });
         }
@@ -139,11 +139,11 @@ impl Router {
             TraceStatus::Failed => AgentStatus::Error,
             _ => AgentStatus::Idle,
         };
-        let _ = self.signal_tx.send(EngineSignal::AgentStatusChanged {
+        let _ = self.signal_tx.send(IngestionEvent::AgentStatusChanged {
             agent_id: agent_id.clone(),
             status: agent_status,
         });
-        let _ = self.signal_tx.send(EngineSignal::TraceCompleted {
+        let _ = self.signal_tx.send(IngestionEvent::TraceCompleted {
             trace_id: trace_id.clone(),
             agent_id: agent_id.clone(),
             span_count,
@@ -164,7 +164,7 @@ pub async fn run(
     mut rx: mpsc::Receiver<(InFlightTrace, CompletionState)>,
     hot: Arc<Mutex<HotStore>>,
     warm: Arc<WarmStore>,
-    signal_tx: broadcast::Sender<EngineSignal>,
+    signal_tx: broadcast::Sender<IngestionEvent>,
 ) {
     let mut router = Router::new(hot, warm, signal_tx);
     while let Some((trace, state)) = rx.recv().await {
@@ -287,7 +287,7 @@ mod tests {
         let signals: Vec<_> = std::iter::from_fn(|| signal_rx.try_recv().ok()).collect();
         let has_connected = signals
             .iter()
-            .any(|s| matches!(s, EngineSignal::AgentConnected { .. }));
+            .any(|s| matches!(s, IngestionEvent::AgentConnected { .. }));
         assert!(has_connected, "AgentConnected must fire on first encounter");
 
         // Second trace from same agent must not fire AgentConnected again.
@@ -297,7 +297,7 @@ mod tests {
         let signals2: Vec<_> = std::iter::from_fn(|| signal_rx.try_recv().ok()).collect();
         let connected_again = signals2
             .iter()
-            .any(|s| matches!(s, EngineSignal::AgentConnected { .. }));
+            .any(|s| matches!(s, IngestionEvent::AgentConnected { .. }));
         assert!(
             !connected_again,
             "AgentConnected must not fire on subsequent traces"
