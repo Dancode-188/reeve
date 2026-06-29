@@ -1,4 +1,5 @@
 pub mod fingerprint;
+pub mod health_score;
 pub mod heuristic;
 pub mod llm_judge;
 

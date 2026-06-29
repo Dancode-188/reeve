@@ -259,6 +259,22 @@ impl WarmStore {
         .await
     }
 
+    pub async fn update_trace_health_score(
+        &self,
+        trace_id: &TraceId,
+        score: f64,
+    ) -> Result<(), StorageError> {
+        let trace_id = trace_id.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE traces SET final_health_score = ?1 WHERE id = ?2",
+                params![score, trace_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn get_trace(&self, id: &TraceId) -> Result<Option<Trace>, StorageError> {
         let id = id.clone();
         self.with_conn(move |conn| {

@@ -3,6 +3,7 @@ pub mod policy;
 
 use evaluation::TraceContext;
 use evaluation::fingerprint::AgentFingerprint;
+use evaluation::health_score;
 use evaluation::heuristic::{
     CostEfficiencyEvaluator, Evaluator, FingerprintDeviationEvaluator,
     IntentActionDivergenceEvaluator, LatencyNormalityEvaluator, LoopDetector,
@@ -49,7 +50,6 @@ pub async fn run(
                         vec![]
                     });
 
-                // Compute trace duration before moving spans into context.
                 let min_start = spans.iter().map(|s| s.start_time).min();
                 let max_end = spans.iter().filter_map(|s| s.end_time).max();
                 let duration_secs = match (min_start, max_end) {
@@ -68,22 +68,41 @@ pub async fn run(
                     fingerprint: fp,
                 };
 
+                let mut metric_scores: HashMap<&str, f64> = HashMap::new();
+
                 for evaluator in &evaluators {
                     if let Some(score) = evaluator.evaluate(&ctx) {
-                        let event = EngineEvent::EvaluationComplete {
+                        let _ = engine_tx.send(EngineEvent::EvaluationComplete {
                             trace_id: trace_id.clone(),
                             span_id: None,
                             metric: evaluator.name().to_string(),
                             score,
-                        };
-                        if engine_tx.send(event).is_err() {
-                            tracing::debug!("no engine event subscribers");
-                        }
+                        });
+                        metric_scores.insert(evaluator.name(), score);
                     }
                 }
 
-                // Update fingerprint after evaluation so scores compare against
-                // the historical baseline, not one that already includes this trace.
+                if let Some(hs) = health_score::compute(&metric_scores) {
+                    let event = EngineEvent::HealthScoreUpdated {
+                        agent_id: agent_id.clone(),
+                        trace_id: trace_id.clone(),
+                        score: hs.value,
+                        tier2_pending: hs.tier2_pending,
+                        weight_coverage: hs.weight_coverage,
+                    };
+                    if engine_tx.send(event).is_err() {
+                        tracing::debug!("no engine event subscribers");
+                    }
+
+                    if let Err(e) = warm.update_trace_health_score(&trace_id, hs.value).await {
+                        tracing::warn!(
+                            trace_id = %trace_id,
+                            error = %e,
+                            "failed to persist health score"
+                        );
+                    }
+                }
+
                 fingerprints
                     .entry(agent_id)
                     .or_default()
