@@ -39,10 +39,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| "127.0.0.1:4317".parse().unwrap());
 
+    let engine_ingestion_rx = ingestion_tx.subscribe();
     tokio::spawn(reeve_ingestion::serve(addr, warm.clone(), ingestion_tx));
-
-    // engine_event_tx is held here until reeve-engine exists and subscribes.
-    let _ = &engine_event_tx;
+    tokio::spawn(reeve_engine::run(
+        engine_ingestion_rx,
+        engine_event_tx,
+        warm.clone(),
+    ));
     reeve_renderer::run(ingestion_rx, engine_event_rx, warm, ascii_mode).await?;
 
     Ok(())
