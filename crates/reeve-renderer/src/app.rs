@@ -3,7 +3,7 @@ use indexmap::IndexMap;
 use reeve_model::entity::agent::Agent;
 use reeve_model::entity::span::InternalSpan;
 use reeve_model::ids::{AgentId, SpanId, TraceId};
-use reeve_model::signal::EngineSignal;
+use reeve_model::signal::{EngineEvent, IngestionEvent};
 use reeve_storage::warm::WarmStore;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -80,14 +80,19 @@ pub struct AppState {
 }
 
 pub struct App {
-    pub engine_rx: broadcast::Receiver<EngineSignal>,
+    pub ingestion_rx: broadcast::Receiver<IngestionEvent>,
+    pub engine_event_rx: broadcast::Receiver<EngineEvent>,
     pub warm: Arc<WarmStore>,
     pub should_quit: bool,
     pub state: AppState,
 }
 
 impl App {
-    pub async fn new(engine_rx: broadcast::Receiver<EngineSignal>, warm: Arc<WarmStore>) -> Self {
+    pub async fn new(
+        ingestion_rx: broadcast::Receiver<IngestionEvent>,
+        engine_event_rx: broadcast::Receiver<EngineEvent>,
+        warm: Arc<WarmStore>,
+    ) -> Self {
         let mut agents: IndexMap<AgentId, AgentState> = IndexMap::new();
         match warm.list_agents().await {
             Ok(list) => {
@@ -107,7 +112,8 @@ impl App {
         let selected_agent = if agents.is_empty() { None } else { Some(0) };
 
         Self {
-            engine_rx,
+            ingestion_rx,
+            engine_event_rx,
             warm,
             should_quit: false,
             state: AppState {
@@ -123,9 +129,9 @@ impl App {
         }
     }
 
-    pub async fn handle_signal(&mut self, signal: EngineSignal) {
-        match signal {
-            EngineSignal::AgentConnected { agent } => {
+    pub async fn handle_ingestion_event(&mut self, event: IngestionEvent) {
+        match event {
+            IngestionEvent::AgentConnected { agent } => {
                 let id = agent.id.clone();
                 self.state
                     .agents
@@ -135,12 +141,12 @@ impl App {
                     self.state.selected_agent = Some(0);
                 }
             }
-            EngineSignal::AgentStatusChanged { agent_id, status } => {
+            IngestionEvent::AgentStatusChanged { agent_id, status } => {
                 if let Some(s) = self.state.agents.get_mut(&agent_id) {
                     s.agent.status = status;
                 }
             }
-            EngineSignal::TraceCompleted {
+            IngestionEvent::TraceCompleted {
                 trace_id,
                 agent_id,
                 span_count: _,
@@ -166,10 +172,20 @@ impl App {
                     self.load_trace(trace_id).await;
                 }
             }
-            EngineSignal::StreamingUpdate { content, .. } => {
+            IngestionEvent::StreamingUpdate { content, .. } => {
                 self.state.streaming.content.push_str(&content);
             }
-            EngineSignal::SpanCompleted { .. } => {}
+            IngestionEvent::SpanCompleted { .. } => {}
+        }
+    }
+
+    pub fn handle_engine_event(&mut self, event: EngineEvent) {
+        match event {
+            EngineEvent::HealthScoreUpdated { score, .. } => {
+                self.state.health_score = Some(score);
+            }
+            EngineEvent::EvaluationComplete { .. } => {}
+            EngineEvent::PolicyAlert { .. } => {}
         }
     }
 

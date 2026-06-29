@@ -30,16 +30,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let warm = Arc::new(WarmStore::open(&db_path)?);
-    let (signal_tx, signal_rx) = broadcast::channel(256);
+    let (ingestion_tx, ingestion_rx) = broadcast::channel(256);
+    let (engine_event_tx, engine_event_rx) =
+        broadcast::channel::<reeve_model::signal::EngineEvent>(64);
 
     let addr: SocketAddr = std::env::var("REEVE_ADDR")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| "127.0.0.1:4317".parse().unwrap());
 
-    tokio::spawn(reeve_ingestion::serve(addr, warm.clone(), signal_tx));
+    tokio::spawn(reeve_ingestion::serve(addr, warm.clone(), ingestion_tx));
 
-    reeve_renderer::run(signal_rx, warm, ascii_mode).await?;
+    // engine_event_tx is held here until reeve-engine exists and subscribes.
+    let _ = &engine_event_tx;
+    reeve_renderer::run(ingestion_rx, engine_event_rx, warm, ascii_mode).await?;
 
     Ok(())
 }
