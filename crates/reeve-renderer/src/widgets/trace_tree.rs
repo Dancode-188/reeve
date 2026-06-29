@@ -8,11 +8,12 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 use reeve_model::ids::SpanId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct TraceTree<'a> {
     pub children: &'a HashMap<SpanId, Vec<SpanId>>,
     pub names: &'a HashMap<SpanId, String>,
+    pub collapsed: &'a HashSet<SpanId>,
     pub root: Option<&'a SpanId>,
     pub selected: Option<&'a SpanId>,
     pub scroll: u16,
@@ -61,6 +62,13 @@ impl<'a> TraceTree<'a> {
         is_last: bool,
         lines: &mut Vec<Line<'static>>,
     ) {
+        let has_children = self
+            .children
+            .get(id)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let is_collapsed = self.collapsed.contains(id);
+
         let connector: &str = if is_root {
             self.ascii.tree_open()
         } else if is_last {
@@ -75,7 +83,12 @@ impl<'a> TraceTree<'a> {
             .get(id)
             .map(|s| s.as_str())
             .unwrap_or_else(|| id.as_str());
-        let label = format!("{}{}{}", prefix, connector, display);
+        let fold = if has_children && is_collapsed {
+            if self.ascii.enabled() { " >" } else { " ▸" }
+        } else {
+            ""
+        };
+        let label = format!("{}{}{}{}", prefix, connector, display, fold);
 
         let style = if is_selected {
             Style::default()
@@ -87,6 +100,10 @@ impl<'a> TraceTree<'a> {
         };
 
         lines.push(Line::from(Span::styled(label, style)));
+
+        if is_collapsed {
+            return;
+        }
 
         let child_prefix = if is_root {
             prefix.to_string()
@@ -129,6 +146,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
+        let collapsed = HashSet::new();
         terminal
             .draw(|frame| {
                 let theme = make_theme();
@@ -136,6 +154,7 @@ mod tests {
                 let widget = TraceTree {
                     children: &children,
                     names: &names,
+                    collapsed: &collapsed,
                     root: Some(&root),
                     selected: None,
                     scroll: 0,

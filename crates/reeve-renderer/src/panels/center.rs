@@ -7,9 +7,16 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
 };
 use reeve_model::ids::SpanId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, ascii: &AsciiMode) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    ascii: &AsciiMode,
+    right_hidden: bool,
+) {
     let has_streaming = !state.streaming.content.is_empty();
 
     let (tree_area, stream_area) = if has_streaming && area.height > 10 {
@@ -23,16 +30,22 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, as
     };
 
     let focused = matches!(state.panel_focus, crate::app::PanelFocus::Center);
+    let title = if right_hidden {
+        "TRACE [SPAN ▷]"
+    } else {
+        "TRACE"
+    };
 
     if let Some(tv) = state.trace.as_ref() {
         frame.render_widget(
             TraceTree {
                 children: &tv.children,
                 names: &tv.names,
+                collapsed: &tv.collapsed,
                 root: tv.root.as_ref(),
                 selected: tv.selected.as_ref(),
                 scroll: tv.scroll,
-                title: "TRACE",
+                title,
                 focused,
                 theme,
                 ascii,
@@ -42,14 +55,16 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, as
     } else {
         let empty: HashMap<SpanId, Vec<SpanId>> = HashMap::new();
         let empty_names: HashMap<SpanId, String> = HashMap::new();
+        let empty_collapsed: HashSet<SpanId> = HashSet::new();
         frame.render_widget(
             TraceTree {
                 children: &empty,
                 names: &empty_names,
+                collapsed: &empty_collapsed,
                 root: None,
                 selected: None,
                 scroll: 0,
-                title: "TRACE",
+                title,
                 focused,
                 theme,
                 ascii,

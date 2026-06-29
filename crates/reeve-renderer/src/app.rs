@@ -5,7 +5,7 @@ use reeve_model::entity::span::InternalSpan;
 use reeve_model::ids::{AgentId, SpanId, TraceId};
 use reeve_model::signal::EngineSignal;
 use reeve_storage::warm::WarmStore;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -39,6 +39,7 @@ pub struct TraceView {
     pub span_order: Vec<SpanId>,
     pub scroll: u16,
     pub selected: Option<SpanId>,
+    pub collapsed: HashSet<SpanId>,
 }
 
 pub struct StreamingState {
@@ -74,6 +75,7 @@ pub struct AppState {
     pub streaming: StreamingState,
     pub health_score: Option<f64>,
     pub panel_focus: PanelFocus,
+    pub show_help: bool,
     pub errors: Vec<String>,
 }
 
@@ -115,6 +117,7 @@ impl App {
                 streaming: StreamingState::default(),
                 health_score: None,
                 panel_focus: PanelFocus::default(),
+                show_help: false,
                 errors: Vec::new(),
             },
         }
@@ -191,9 +194,10 @@ impl App {
                     span_map.insert(span.id.clone(), span);
                 }
 
+                let collapsed = HashSet::new();
                 let span_order = root
                     .as_ref()
-                    .map(|r| flatten_tree(r, &children))
+                    .map(|r| flatten_tree(r, &children, &collapsed))
                     .unwrap_or_default();
 
                 self.state.trace = Some(TraceView {
@@ -205,6 +209,7 @@ impl App {
                     span_order,
                     scroll: 0,
                     selected: None,
+                    collapsed,
                 });
             }
             Err(e) => {
@@ -269,7 +274,30 @@ impl App {
                     PanelFocus::Right => PanelFocus::Center,
                 };
             }
-            Action::Select => {}
+            Action::Select => {
+                if self.state.panel_focus == PanelFocus::Center {
+                    if let Some(ref mut tv) = self.state.trace {
+                        if let Some(selected) = tv.selected.clone() {
+                            if tv.collapsed.contains(&selected) {
+                                tv.collapsed.remove(&selected);
+                            } else {
+                                tv.collapsed.insert(selected.clone());
+                            }
+                            tv.span_order = tv
+                                .root
+                                .as_ref()
+                                .map(|r| flatten_tree(r, &tv.children, &tv.collapsed))
+                                .unwrap_or_default();
+                        }
+                    }
+                }
+            }
+            Action::ToggleHelp => {
+                self.state.show_help = !self.state.show_help;
+            }
+            Action::Dismiss => {
+                self.state.show_help = false;
+            }
             Action::Resize(_, _) => {}
         }
     }
@@ -318,11 +346,18 @@ impl App {
     }
 }
 
-fn flatten_tree(root: &SpanId, children: &HashMap<SpanId, Vec<SpanId>>) -> Vec<SpanId> {
+fn flatten_tree(
+    root: &SpanId,
+    children: &HashMap<SpanId, Vec<SpanId>>,
+    collapsed: &HashSet<SpanId>,
+) -> Vec<SpanId> {
     let mut order = Vec::new();
     let mut stack = vec![root.clone()];
     while let Some(id) = stack.pop() {
         order.push(id.clone());
+        if collapsed.contains(&id) {
+            continue;
+        }
         if let Some(kids) = children.get(&id) {
             for kid in kids.iter().rev() {
                 stack.push(kid.clone());

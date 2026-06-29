@@ -11,6 +11,8 @@ pub enum Action {
     ScrollDown,
     NextPanel,
     PrevPanel,
+    ToggleHelp,
+    Dismiss,
     Resize(u16, u16),
 }
 
@@ -40,11 +42,15 @@ fn map_event(event: Event) -> Option<Action> {
             }
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => Some(Action::MoveUp),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => Some(Action::MoveDown),
+            (KeyCode::Char('l'), _) => Some(Action::NextPanel),
+            (KeyCode::Char('h'), _) => Some(Action::PrevPanel),
             (KeyCode::Enter, _) => Some(Action::Select),
             (KeyCode::Tab, _) => Some(Action::NextPanel),
             (KeyCode::BackTab, _) => Some(Action::PrevPanel),
             (KeyCode::PageUp, _) => Some(Action::ScrollUp),
             (KeyCode::PageDown, _) => Some(Action::ScrollDown),
+            (KeyCode::Char('?'), _) => Some(Action::ToggleHelp),
+            (KeyCode::Esc, _) => Some(Action::Dismiss),
             _ => None,
         },
         Event::Resize(w, h) => Some(Action::Resize(w, h)),
