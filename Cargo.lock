@@ -987,6 +987,7 @@ dependencies = [
 name = "reeve"
 version = "0.1.0"
 dependencies = [
+ "reeve-engine",
  "reeve-ingestion",
  "reeve-model",
  "reeve-renderer",
@@ -999,6 +1000,13 @@ dependencies = [
 [[package]]
 name = "reeve-engine"
 version = "0.1.0"
+dependencies = [
+ "reeve-model",
+ "reeve-storage",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "reeve-ingestion"
