@@ -79,9 +79,10 @@ async fn run_inner(
                 terminal.draw(|frame| {
                     let full = layout::compute_full(frame.area());
                     let right_hidden = full.panels.right.width == 0;
+                    let left_hidden = full.panels.left.width == 0;
                     panels::render_header(frame, full.header, &app.state, &theme);
                     panels::render(frame, &full.panels, &app.state, &theme, &ascii);
-                    panels::render_footer(frame, full.footer, &theme, right_hidden);
+                    panels::render_footer(frame, full.footer, &theme, right_hidden, left_hidden);
                     if app.state.show_help {
                         panels::render_help_overlay(frame, frame.area(), &theme);
                     }

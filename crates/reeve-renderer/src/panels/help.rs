@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 pub fn render(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let popup = centered(36, 14, area);
+    let popup = centered(48, 14, area);
 
     let key = Style::default().fg(theme.highlight());
     let desc = Style::default().fg(theme.text());

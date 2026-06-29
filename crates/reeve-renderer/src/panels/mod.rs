@@ -25,8 +25,14 @@ pub fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     header::render(frame, area, state, theme);
 }
 
-pub fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, right_hidden: bool) {
-    footer::render(frame, area, theme, right_hidden);
+pub fn render_footer(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    right_hidden: bool,
+    left_hidden: bool,
+) {
+    footer::render(frame, area, theme, right_hidden, left_hidden);
 }
 
 pub fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
