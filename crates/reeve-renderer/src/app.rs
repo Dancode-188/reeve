@@ -74,6 +74,7 @@ pub struct AppState {
     pub trace: Option<TraceView>,
     pub streaming: StreamingState,
     pub health_score: Option<f64>,
+    pub health_weight_coverage: Option<f64>,
     pub panel_focus: PanelFocus,
     pub show_help: bool,
     pub errors: Vec<String>,
@@ -122,6 +123,7 @@ impl App {
                 trace: None,
                 streaming: StreamingState::default(),
                 health_score: None,
+                health_weight_coverage: None,
                 panel_focus: PanelFocus::default(),
                 show_help: false,
                 errors: Vec::new(),
@@ -181,8 +183,13 @@ impl App {
 
     pub fn handle_engine_event(&mut self, event: EngineEvent) {
         match event {
-            EngineEvent::HealthScoreUpdated { score, .. } => {
+            EngineEvent::HealthScoreUpdated {
+                score,
+                weight_coverage,
+                ..
+            } => {
                 self.state.health_score = Some(score);
+                self.state.health_weight_coverage = Some(weight_coverage);
             }
             EngineEvent::EvaluationComplete { .. } => {}
             EngineEvent::PolicyAlert { .. } => {}

@@ -42,6 +42,7 @@ pub enum EngineEvent {
         trace_id: TraceId,
         score: f64,
         tier2_pending: bool,
+        weight_coverage: f64,
     },
     PolicyAlert {
         rule_id: String,
