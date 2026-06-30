@@ -75,6 +75,9 @@ pub struct AppState {
     pub streaming: StreamingState,
     pub health_score: Option<f64>,
     pub health_weight_coverage: Option<f64>,
+    /// Human-readable evaluation backend description, e.g. "local (phi4-mini)"
+    /// or "disabled". Set once on engine startup.
+    pub eval_backend: Option<String>,
     pub panel_focus: PanelFocus,
     pub show_help: bool,
     pub errors: Vec<String>,
@@ -124,6 +127,7 @@ impl App {
                 streaming: StreamingState::default(),
                 health_score: None,
                 health_weight_coverage: None,
+                eval_backend: None,
                 panel_focus: PanelFocus::default(),
                 show_help: false,
                 errors: Vec::new(),
@@ -190,6 +194,12 @@ impl App {
             } => {
                 self.state.health_score = Some(score);
                 self.state.health_weight_coverage = Some(weight_coverage);
+            }
+            EngineEvent::EvaluationBackendReady { backend, reason } => {
+                if let Some(ref r) = reason {
+                    tracing::info!(reason = r, "evaluation backend disabled");
+                }
+                self.state.eval_backend = Some(backend);
             }
             EngineEvent::EvaluationComplete { .. } => {}
             EngineEvent::PolicyAlert { .. } => {}

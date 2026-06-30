@@ -8,8 +8,10 @@ use evaluation::heuristic::{
     CostEfficiencyEvaluator, Evaluator, FingerprintDeviationEvaluator,
     IntentActionDivergenceEvaluator, LatencyNormalityEvaluator, LoopDetector,
 };
+use evaluation::llm_judge::{self, LlmJudge};
+use reeve_model::entity::span::InternalSpan;
 use reeve_model::ids::AgentId;
-use reeve_model::signal::{EngineEvent, IngestionEvent};
+use reeve_model::signal::{EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::WarmStore;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,6 +22,20 @@ pub async fn run(
     engine_tx: broadcast::Sender<EngineEvent>,
     warm: Arc<WarmStore>,
 ) {
+    let backend = llm_judge::probe().await;
+    let (backend_name, backend_reason) = match &backend {
+        llm_judge::JudgeBackend::Local { model, .. } => (format!("local ({})", model), None),
+        llm_judge::JudgeBackend::Disabled { reason } => {
+            ("disabled".to_string(), Some(reason.clone()))
+        }
+    };
+    tracing::info!(backend = %backend_name, "evaluation backend ready");
+    let _ = engine_tx.send(EngineEvent::EvaluationBackendReady {
+        backend: backend_name,
+        reason: backend_reason,
+    });
+    let judge = Arc::new(LlmJudge::new(backend));
+
     let mut fingerprints: HashMap<AgentId, AgentFingerprint> = HashMap::new();
 
     let evaluators: Vec<Box<dyn Evaluator>> = vec![
@@ -77,6 +93,7 @@ pub async fn run(
                             span_id: None,
                             metric: evaluator.name().to_string(),
                             score,
+                            confidence: None,
                         });
                         metric_scores.insert(evaluator.name(), score);
                     }
@@ -103,10 +120,26 @@ pub async fn run(
                     }
                 }
 
-                fingerprints
-                    .entry(agent_id)
-                    .or_default()
-                    .update(span_count, cost, duration_secs);
+                fingerprints.entry(agent_id.clone()).or_default().update(
+                    span_count,
+                    cost,
+                    duration_secs,
+                );
+
+                // Tier 2 runs asynchronously after Tier 1 completes.
+                let tier1_scores: HashMap<String, f64> = metric_scores
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), *v))
+                    .collect();
+                tokio::spawn(run_tier2(
+                    trace_id,
+                    agent_id,
+                    spans,
+                    tier1_scores,
+                    engine_tx.clone(),
+                    warm.clone(),
+                    judge.clone(),
+                ));
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -116,6 +149,58 @@ pub async fn run(
                 tracing::info!("ingestion channel closed, engine shutting down");
                 break;
             }
+        }
+    }
+}
+
+async fn run_tier2(
+    trace_id: reeve_model::ids::TraceId,
+    agent_id: AgentId,
+    spans: Vec<InternalSpan>,
+    tier1_scores: HashMap<String, f64>,
+    engine_tx: broadcast::Sender<EngineEvent>,
+    warm: Arc<WarmStore>,
+    judge: Arc<LlmJudge>,
+) {
+    let results = judge.evaluate_trace(&spans).await;
+
+    for &(metric, score, confidence) in &results {
+        let _ = engine_tx.send(EngineEvent::EvaluationComplete {
+            trace_id: trace_id.clone(),
+            span_id: None,
+            metric: metric.to_string(),
+            score,
+            confidence: Some(confidence),
+        });
+    }
+
+    // Merge Tier 1 scores with non-Low-confidence Tier 2 scores before
+    // recomputing. Low-confidence results are still emitted above so the
+    // policy engine and renderer can act on them, but they do not affect
+    // the health score value.
+    let mut all_scores: HashMap<&str, f64> =
+        tier1_scores.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    for &(metric, score, confidence) in &results {
+        if confidence != EvaluationConfidence::Low {
+            all_scores.insert(metric, score);
+        }
+    }
+
+    if let Some(hs) = health_score::compute(&all_scores) {
+        let event = EngineEvent::HealthScoreUpdated {
+            agent_id,
+            trace_id: trace_id.clone(),
+            score: hs.value,
+            tier2_pending: hs.tier2_pending,
+            weight_coverage: hs.weight_coverage,
+        };
+        let _ = engine_tx.send(event);
+        if let Err(e) = warm.update_trace_health_score(&trace_id, hs.value).await {
+            tracing::warn!(
+                trace_id = %trace_id,
+                error = %e,
+                "failed to persist tier2 health score"
+            );
         }
     }
 }
