@@ -159,21 +159,33 @@ mod tests {
     fn low_health_score_fires_rule() {
         let mut engine = PolicyEngine::with_defaults();
         let fired = engine.evaluate(&agent(), &trace(), &ctx(25.0, 1.0, 0.9), Instant::now(), 0);
-        assert!(fired.iter().any(|f| f.rule.id.as_str() == "builtin_low_health"));
+        assert!(
+            fired
+                .iter()
+                .any(|f| f.rule.id.as_str() == "builtin_low_health")
+        );
     }
 
     #[test]
     fn high_cost_fires_rule() {
         let mut engine = PolicyEngine::with_defaults();
         let fired = engine.evaluate(&agent(), &trace(), &ctx(80.0, 6.0, 0.9), Instant::now(), 0);
-        assert!(fired.iter().any(|f| f.rule.id.as_str() == "builtin_high_cost"));
+        assert!(
+            fired
+                .iter()
+                .any(|f| f.rule.id.as_str() == "builtin_high_cost")
+        );
     }
 
     #[test]
     fn loop_detection_fires_rule() {
         let mut engine = PolicyEngine::with_defaults();
         let fired = engine.evaluate(&agent(), &trace(), &ctx(80.0, 1.0, 0.3), Instant::now(), 0);
-        assert!(fired.iter().any(|f| f.rule.id.as_str() == "builtin_loop_detected"));
+        assert!(
+            fired
+                .iter()
+                .any(|f| f.rule.id.as_str() == "builtin_loop_detected")
+        );
     }
 
     #[test]
@@ -196,9 +208,17 @@ mod tests {
         let c = ctx(25.0, 1.0, 0.9);
         let now = Instant::now();
         let first = engine.evaluate(&agent(), &trace(), &c, now, 0);
-        assert!(first.iter().any(|f| f.rule.id.as_str() == "builtin_low_health"));
+        assert!(
+            first
+                .iter()
+                .any(|f| f.rule.id.as_str() == "builtin_low_health")
+        );
         let second = engine.evaluate(&agent(), &trace(), &c, now, 0);
-        assert!(second.iter().all(|f| f.rule.id.as_str() != "builtin_low_health"));
+        assert!(
+            second
+                .iter()
+                .all(|f| f.rule.id.as_str() != "builtin_low_health")
+        );
     }
 
     #[test]
@@ -209,7 +229,11 @@ mod tests {
         engine.evaluate(&agent(), &trace(), &c, now, 0);
         let later = now + Duration::from_secs(301);
         let fired = engine.evaluate(&agent(), &trace(), &c, later, 0);
-        assert!(fired.iter().any(|f| f.rule.id.as_str() == "builtin_low_health"));
+        assert!(
+            fired
+                .iter()
+                .any(|f| f.rule.id.as_str() == "builtin_low_health")
+        );
     }
 
     #[test]
@@ -243,6 +267,10 @@ mod tests {
         let now = Instant::now();
         engine.evaluate(&AgentId::from("agent-a"), &trace(), &c, now, 0);
         let fired = engine.evaluate(&AgentId::from("agent-b"), &trace(), &c, now, 0);
-        assert!(fired.iter().any(|f| f.rule.id.as_str() == "builtin_low_health"));
+        assert!(
+            fired
+                .iter()
+                .any(|f| f.rule.id.as_str() == "builtin_low_health")
+        );
     }
 }

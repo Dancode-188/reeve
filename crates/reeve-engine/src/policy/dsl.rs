@@ -1,4 +1,4 @@
-use evalexpr::{eval_boolean_with_context, ContextWithMutableVariables, HashMapContext, Value};
+use evalexpr::{ContextWithMutableVariables, HashMapContext, Value, eval_boolean_with_context};
 use std::collections::HashMap;
 
 /// evalexpr context built from Tier 1 evaluation results.
@@ -26,7 +26,8 @@ impl PolicyContext {
         let mut ctx = HashMapContext::new();
         ctx.set_value("health_score".into(), Value::Float(health_score))
             .ok();
-        ctx.set_value("cost_usd".into(), Value::Float(cost_usd)).ok();
+        ctx.set_value("cost_usd".into(), Value::Float(cost_usd))
+            .ok();
         ctx.set_value("span_count".into(), Value::Float(span_count as f64))
             .ok();
         ctx.set_value("tier2_pending".into(), Value::Boolean(tier2_pending))
