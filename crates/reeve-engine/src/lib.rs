@@ -9,12 +9,15 @@ use evaluation::heuristic::{
     IntentActionDivergenceEvaluator, LatencyNormalityEvaluator, LoopDetector,
 };
 use evaluation::llm_judge::{self, LlmJudge};
+use policy::dsl::PolicyContext;
+use policy::{PolicyEngine, alert_fields};
 use reeve_model::entity::span::InternalSpan;
 use reeve_model::ids::AgentId;
 use reeve_model::signal::{EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::WarmStore;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 pub async fn run(
@@ -37,6 +40,7 @@ pub async fn run(
     let judge = Arc::new(LlmJudge::new(backend));
 
     let mut fingerprints: HashMap<AgentId, AgentFingerprint> = HashMap::new();
+    let mut policy_engine = PolicyEngine::with_defaults();
 
     let evaluators: Vec<Box<dyn Evaluator>> = vec![
         Box::new(LoopDetector::new(3)),
@@ -118,6 +122,41 @@ pub async fn run(
                             "failed to persist health score"
                         );
                     }
+
+                    // Policy evaluation runs on Tier 1 results. Tier 2 does not
+                    // re-trigger to avoid double-firing on the same trace.
+                    let now_ms = current_ms();
+                    let policy_ctx = PolicyContext::build(
+                        hs.value,
+                        cost,
+                        span_count,
+                        hs.tier2_pending,
+                        hs.weight_coverage,
+                        &metric_scores,
+                    );
+                    let fired = policy_engine.evaluate(
+                        &agent_id,
+                        &trace_id,
+                        &policy_ctx,
+                        Instant::now(),
+                        now_ms,
+                    );
+                    for fr in fired {
+                        let (rule_id_str, cmd_type, requires_confirmation) = alert_fields(&fr);
+                        let rule_id_owned = rule_id_str.to_string();
+                        let _ = engine_tx.send(EngineEvent::PolicyAlert {
+                            rule_id: rule_id_owned.clone(),
+                            command_type: cmd_type.to_string(),
+                            requires_confirmation,
+                        });
+                        if let Err(e) = warm.save_intervention_command(fr.command).await {
+                            tracing::warn!(
+                                rule_id = %rule_id_owned,
+                                error = %e,
+                                "failed to persist intervention command"
+                            );
+                        }
+                    }
                 }
 
                 fingerprints.entry(agent_id.clone()).or_default().update(
@@ -151,6 +190,13 @@ pub async fn run(
             }
         }
     }
+}
+
+fn current_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 async fn run_tier2(
