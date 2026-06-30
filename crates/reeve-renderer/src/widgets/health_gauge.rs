@@ -8,6 +8,7 @@ use ratatui::{
 
 pub struct HealthGauge<'a> {
     pub score: Option<f64>,
+    pub tier2_pending: bool,
     pub focused: bool,
     pub theme: &'a Theme,
 }
@@ -49,6 +50,7 @@ impl<'a> Widget for HealthGauge<'a> {
 
         let label = match self.score {
             None => "N/A".to_string(),
+            Some(s) if self.tier2_pending => format!("{:.1} \u{22EF}", s),
             Some(s) => format!("{:.1}", s),
         };
 
