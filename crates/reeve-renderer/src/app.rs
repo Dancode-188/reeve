@@ -3,11 +3,17 @@ use indexmap::IndexMap;
 use reeve_model::entity::agent::Agent;
 use reeve_model::entity::span::InternalSpan;
 use reeve_model::ids::{AgentId, SpanId, TraceId};
-use reeve_model::signal::{EngineEvent, IngestionEvent};
+use reeve_model::signal::{EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::WarmStore;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::broadcast;
+
+pub struct MetricScore {
+    pub name: String,
+    pub score: f64,
+    pub confidence: Option<EvaluationConfidence>,
+}
 
 #[derive(Clone)]
 pub struct AgentState {
@@ -75,6 +81,9 @@ pub struct AppState {
     pub streaming: StreamingState,
     pub health_score: Option<f64>,
     pub health_weight_coverage: Option<f64>,
+    pub health_tier2_pending: bool,
+    pub metric_scores: Vec<MetricScore>,
+    pub policy_alerts: VecDeque<(String, String)>,
     /// Human-readable evaluation backend description, e.g. "local (phi4-mini)"
     /// or "disabled". Set once on engine startup.
     pub eval_backend: Option<String>,
@@ -127,6 +136,9 @@ impl App {
                 streaming: StreamingState::default(),
                 health_score: None,
                 health_weight_coverage: None,
+                health_tier2_pending: false,
+                metric_scores: Vec::new(),
+                policy_alerts: VecDeque::new(),
                 eval_backend: None,
                 panel_focus: PanelFocus::default(),
                 show_help: false,
@@ -175,6 +187,8 @@ impl App {
                     .map(|(id, _)| id == &agent_id)
                     .unwrap_or(false);
                 if is_selected {
+                    self.state.metric_scores.clear();
+                    self.state.health_tier2_pending = false;
                     self.load_trace(trace_id).await;
                 }
             }
@@ -190,10 +204,12 @@ impl App {
             EngineEvent::HealthScoreUpdated {
                 score,
                 weight_coverage,
+                tier2_pending,
                 ..
             } => {
                 self.state.health_score = Some(score);
                 self.state.health_weight_coverage = Some(weight_coverage);
+                self.state.health_tier2_pending = tier2_pending;
             }
             EngineEvent::EvaluationBackendReady { backend, reason } => {
                 if let Some(ref r) = reason {
@@ -201,8 +217,38 @@ impl App {
                 }
                 self.state.eval_backend = Some(backend);
             }
-            EngineEvent::EvaluationComplete { .. } => {}
-            EngineEvent::PolicyAlert { .. } => {}
+            EngineEvent::EvaluationComplete {
+                metric,
+                score,
+                confidence,
+                ..
+            } => {
+                if let Some(entry) = self
+                    .state
+                    .metric_scores
+                    .iter_mut()
+                    .find(|e| e.name == metric)
+                {
+                    entry.score = score;
+                    entry.confidence = confidence;
+                } else {
+                    self.state.metric_scores.push(MetricScore {
+                        name: metric,
+                        score,
+                        confidence,
+                    });
+                }
+            }
+            EngineEvent::PolicyAlert {
+                rule_id,
+                command_type,
+                ..
+            } => {
+                if self.state.policy_alerts.len() >= 5 {
+                    self.state.policy_alerts.pop_front();
+                }
+                self.state.policy_alerts.push_back((rule_id, command_type));
+            }
         }
     }
 
