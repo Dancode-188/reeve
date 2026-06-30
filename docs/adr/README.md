@@ -25,6 +25,7 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0018](./0018-warmstore-created-in-main-and-shared-via-arc.md) | `WarmStore` Created in `main.rs` and Shared via `Arc` | Accepted | 2026-06-28 |
 | [0019](./0019-separate-ingestion-and-engine-event-channels.md) | Separate IngestionEvent and EngineEvent Channels | Accepted | 2026-06-28 |
 | [0020](./0020-composite-health-score.md) | Composite Health Score Design | Accepted | 2026-06-30 |
+| [0021](./0021-tier2-llm-judge.md) | Tier 2 LLM Judge via Ollama with Self-Consistency Scoring | Accepted | 2026-06-30 |
 
 ## Format
 

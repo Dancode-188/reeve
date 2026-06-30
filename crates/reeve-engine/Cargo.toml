@@ -8,6 +8,6 @@ reeve-model = { path = "../reeve-model" }
 reeve-storage = { path = "../reeve-storage" }
 tokio = { workspace = true }
 tracing = { workspace = true }
-
-[dev-dependencies]
+serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
