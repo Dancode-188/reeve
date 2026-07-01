@@ -1,6 +1,7 @@
 #![deny(clippy::all)]
 
 use reeve_storage::warm::WarmStore;
+use std::fs::OpenOptions;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,13 +9,6 @@ use tokio::sync::broadcast;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "reeve=info,reeve_ingestion=info,reeve_renderer=info".into()),
-        )
-        .init();
-
     let ascii_mode = std::env::args().any(|a| a == "--ascii");
 
     let db_path = std::env::var("REEVE_DB")
@@ -28,6 +22,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+
+    // Log to a file so the TUI is not corrupted by tracing output on stderr.
+    let log_path = db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("reeve.log");
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "reeve=info,reeve_ingestion=info,reeve_renderer=info,reeve_engine=info".into()
+            }),
+        )
+        .with_writer(log_file)
+        .with_ansi(false)
+        .init();
+
+    tracing::info!(path = %log_path.display(), "logging to file");
 
     let warm = Arc::new(WarmStore::open(&db_path)?);
     let (ingestion_tx, ingestion_rx) = broadcast::channel(256);

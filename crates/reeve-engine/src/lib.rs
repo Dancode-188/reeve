@@ -237,7 +237,7 @@ async fn run_tier2(
             agent_id,
             trace_id: trace_id.clone(),
             score: hs.value,
-            tier2_pending: hs.tier2_pending,
+            tier2_pending: false,
             weight_coverage: hs.weight_coverage,
         };
         let _ = engine_tx.send(event);
