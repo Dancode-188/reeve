@@ -34,8 +34,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open(&log_path)?;
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "reeve=info,reeve_ingestion=info,reeve_renderer=info,reeve_engine=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "reeve=info,reeve_ingestion=info,reeve_renderer=info,reeve_engine=info".into()
+            }),
         )
         .with_writer(log_file)
         .with_ansi(false)
