@@ -35,7 +35,7 @@ Reeve is for that moment.
 ---
 
 ```
-┌─ REEVE v0.1.0 ──────────────────────── ● research-bot  ◆72 CAUTION  $0.047 ──┐
+┌─ REEVE v0.2.0 ──────────────────────── ● research-bot  ◆72 CAUTION  $0.047 ──┐
 │ AGENTS          │ TRACE ── task-0047 ── 12.4s                   │ SPAN DETAIL│
 │                 │                                               │            │
 │ ● research-bot  │ ▾ agent.execute  ◷ 12.4s  ●                   │ gen_ai.chat│
@@ -251,11 +251,11 @@ Full reference at [docs/guides/configuration.md](docs/guides/configuration.md).
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md): how the five layers fit together
-- [Architecture Decision Records](docs/adr/README.md): 30+ design decisions
-  documented with context, alternatives considered, and consequences. Why a
-  2-second straggler window and not 30 seconds. Why phi4-mini. Why the control
-  channel is separate from the OTel channel. Most projects lose this reasoning
-  the moment a decision is made. It is all in here.
+- [Architecture Decision Records](docs/adr/README.md): every significant design
+  decision documented with context, alternatives considered, and consequences.
+  Why a 2-second straggler window and not 30 seconds. Why phi4-mini. Why the
+  control channel is separate from the OTel channel. Most projects lose this
+  reasoning the moment a decision is made. It is all in here.
 - [Getting started](docs/guides/getting-started.md)
 - [Framework integration guides](docs/guides/)
 - [Configuration](docs/guides/configuration.md)
