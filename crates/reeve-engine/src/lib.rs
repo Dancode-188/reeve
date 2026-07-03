@@ -16,7 +16,7 @@ use reeve_model::entity::span::InternalSpan;
 use reeve_model::ids::{AgentId, EvalId};
 use reeve_model::signal::{EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::WarmStore;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
@@ -42,6 +42,7 @@ pub async fn run(
     let judge = Arc::new(LlmJudge::new(backend));
 
     let mut fingerprints: HashMap<AgentId, AgentFingerprint> = HashMap::new();
+    let mut score_histories: HashMap<AgentId, VecDeque<f64>> = HashMap::new();
     let mut policy_engine = PolicyEngine::with_defaults();
 
     let evaluators: Vec<Box<dyn Evaluator>> = vec![
@@ -105,7 +106,10 @@ pub async fn run(
                     }
                 }
 
+                let mut tier1_health: Option<f64> = None;
+
                 if let Some(hs) = health_score::compute(&metric_scores) {
+                    tier1_health = Some(hs.value);
                     let event = EngineEvent::HealthScoreUpdated {
                         agent_id: agent_id.clone(),
                         trace_id: trace_id.clone(),
@@ -169,20 +173,33 @@ pub async fn run(
                     duration_secs,
                 );
 
-                // Tier 2 runs asynchronously after Tier 1 completes.
+                // Update per-agent health score history and compute Tier 2 rate.
+                let history = score_histories.entry(agent_id.clone()).or_default();
+                if let Some(score) = tier1_health {
+                    history.push_back(score);
+                    if history.len() > 5 {
+                        history.pop_front();
+                    }
+                }
+                let rate = tier2_sample_rate(history);
+
+                // Tier 2 runs asynchronously after Tier 1 completes. Tier 1
+                // always runs; only the Tier 2 spawn is gated by the sample rate.
                 let tier1_scores: HashMap<String, f64> = metric_scores
                     .iter()
                     .map(|(k, v)| (k.to_string(), *v))
                     .collect();
-                tokio::spawn(run_tier2(
-                    trace_id,
-                    agent_id,
-                    spans,
-                    tier1_scores,
-                    engine_tx.clone(),
-                    warm.clone(),
-                    judge.clone(),
-                ));
+                if rand::random::<f64>() < rate {
+                    tokio::spawn(run_tier2(
+                        trace_id,
+                        agent_id,
+                        spans,
+                        tier1_scores,
+                        engine_tx.clone(),
+                        warm.clone(),
+                        judge.clone(),
+                    ));
+                }
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -201,6 +218,34 @@ fn current_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// Returns the Tier 2 sampling rate for an agent based on recent health scores.
+///
+/// Scores below 60 warrant full coverage; scores above 80 with no downward
+/// spike in the last 5 traces can be sampled lightly. Everything else gets
+/// the 20% default.
+fn tier2_sample_rate(history: &VecDeque<f64>) -> f64 {
+    let latest = match history.back() {
+        Some(&s) => s,
+        None => return 0.20,
+    };
+    if latest < 60.0 {
+        return 1.0;
+    }
+    if latest > 80.0 && is_score_stable(history) {
+        return 0.10;
+    }
+    0.20
+}
+
+/// Returns true when no consecutive pair in `history` shows a downward delta
+/// greater than 5 points.
+fn is_score_stable(history: &VecDeque<f64>) -> bool {
+    history
+        .iter()
+        .zip(history.iter().skip(1))
+        .all(|(prev, curr)| prev - curr <= 5.0)
 }
 
 async fn run_tier2(
@@ -272,5 +317,64 @@ async fn run_tier2(
                 "failed to persist tier2 health score"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn history(scores: &[f64]) -> VecDeque<f64> {
+        scores.iter().copied().collect()
+    }
+
+    #[test]
+    fn rate_is_full_when_score_below_60() {
+        let h = history(&[45.0]);
+        assert!((tier2_sample_rate(&h) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn rate_is_default_when_no_history() {
+        let h = VecDeque::new();
+        assert!((tier2_sample_rate(&h) - 0.20).abs() < 0.001);
+    }
+
+    #[test]
+    fn rate_is_low_when_stable_above_80() {
+        let h = history(&[82.0, 83.0, 84.0, 85.0, 86.0]);
+        assert!((tier2_sample_rate(&h) - 0.10).abs() < 0.001);
+    }
+
+    #[test]
+    fn rate_is_default_when_above_80_but_unstable() {
+        // Drop from 90 to 84 is a delta of 6 — unstable.
+        let h = history(&[82.0, 90.0, 84.0, 85.0, 86.0]);
+        assert!((tier2_sample_rate(&h) - 0.20).abs() < 0.001);
+    }
+
+    #[test]
+    fn rate_is_default_for_mid_range_stable_scores() {
+        let h = history(&[70.0, 71.0, 72.0]);
+        assert!((tier2_sample_rate(&h) - 0.20).abs() < 0.001);
+    }
+
+    #[test]
+    fn stability_exact_5_point_drop_is_stable() {
+        // A delta of exactly 5.0 is not a downward spike — the threshold is > 5.
+        let h = history(&[85.0, 80.0]);
+        assert!(is_score_stable(&h));
+    }
+
+    #[test]
+    fn stability_over_5_point_drop_is_unstable() {
+        let h = history(&[90.0, 84.0]);
+        assert!(!is_score_stable(&h));
+    }
+
+    #[test]
+    fn single_entry_history_is_stable() {
+        let h = history(&[85.0]);
+        assert!(is_score_stable(&h));
     }
 }
