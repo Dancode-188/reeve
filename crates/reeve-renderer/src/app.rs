@@ -100,6 +100,11 @@ pub enum PanelFocus {
     Right,
 }
 
+pub struct FatalError {
+    pub message: String,
+    pub hint: Option<String>,
+}
+
 pub struct AppState {
     pub agents: IndexMap<AgentId, AgentState>,
     pub selected_agent: Option<usize>,
@@ -114,6 +119,8 @@ pub struct AppState {
     /// Human-readable evaluation backend description, e.g. "local (phi4-mini)"
     /// or "disabled". Set once on engine startup.
     pub eval_backend: Option<String>,
+    /// Reason the evaluation backend is disabled, if applicable.
+    pub eval_backend_reason: Option<String>,
     /// Active privacy tier from engine startup event. 1 = default (no content
     /// capture); 2+ = content capture enabled. Controls mini-metric row states.
     pub privacy_tier: u8,
@@ -121,6 +128,11 @@ pub struct AppState {
     pub panel_focus: PanelFocus,
     pub show_help: bool,
     pub errors: Vec<String>,
+    /// Unrecoverable startup error. When set, the normal cockpit is replaced
+    /// by a full-screen error card.
+    pub fatal_error: Option<FatalError>,
+    /// True when the user has dimmed the degraded-backend banner with [d].
+    pub degraded_dismissed: bool,
 }
 
 impl AppState {
@@ -193,11 +205,14 @@ impl App {
                 metric_scores: Vec::new(),
                 policy_alerts: VecDeque::new(),
                 eval_backend: None,
+                eval_backend_reason: None,
                 privacy_tier: 1,
                 flash_targets: HashMap::new(),
                 panel_focus: PanelFocus::default(),
                 show_help: false,
                 errors: Vec::new(),
+                fatal_error: None,
+                degraded_dismissed: false,
             },
         }
     }
@@ -307,6 +322,7 @@ impl App {
                 if let Some(ref r) = reason {
                     tracing::info!(reason = r, "evaluation backend disabled");
                 }
+                self.state.eval_backend_reason = reason;
                 self.state.eval_backend = Some(backend);
                 self.state.privacy_tier = privacy_tier;
             }
@@ -476,6 +492,19 @@ impl App {
             }
             Action::Dismiss => {
                 self.state.show_help = false;
+            }
+            Action::DismissDegraded => {
+                self.state.degraded_dismissed = true;
+            }
+            Action::Retry => {
+                if self.state.fatal_error.is_some() {
+                    self.state.fatal_error = None;
+                } else {
+                    // Clear known degraded state; engine reprobe not yet wired
+                    self.state.eval_backend = None;
+                    self.state.eval_backend_reason = None;
+                    self.state.degraded_dismissed = false;
+                }
             }
             Action::Resize(_, _) => {}
         }
