@@ -11,8 +11,9 @@ use evaluation::heuristic::{
 use evaluation::llm_judge::{self, LlmJudge};
 use policy::dsl::PolicyContext;
 use policy::{PolicyEngine, alert_fields};
+use reeve_model::entity::evaluation::{EvaluationResult, EvaluatorType, TargetType};
 use reeve_model::entity::span::InternalSpan;
-use reeve_model::ids::AgentId;
+use reeve_model::ids::{AgentId, EvalId};
 use reeve_model::signal::{EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::WarmStore;
 use std::collections::HashMap;
@@ -213,14 +214,34 @@ async fn run_tier2(
 ) {
     let results = judge.evaluate_trace(&spans).await;
 
-    for &(metric, score, confidence) in &results {
+    let model_version = match &judge.backend {
+        llm_judge::JudgeBackend::Local { model, .. } => Some(model.clone()),
+        llm_judge::JudgeBackend::Disabled { .. } => None,
+    };
+    let now = current_ms();
+
+    for (metric, score, confidence, cot_json) in &results {
         let _ = engine_tx.send(EngineEvent::EvaluationComplete {
             trace_id: trace_id.clone(),
             span_id: None,
             metric: metric.to_string(),
-            score,
-            confidence: Some(confidence),
+            score: *score,
+            confidence: Some(*confidence),
         });
+        let eval = EvaluationResult {
+            id: EvalId::from(format!("{}-{}", trace_id, metric)),
+            target_id: trace_id.to_string(),
+            target_type: TargetType::Trace,
+            metric: metric.to_string(),
+            score: *score,
+            evaluator: EvaluatorType::LlmJudge,
+            evaluated_at: now,
+            judge_model_version: model_version.clone(),
+            cot_json: cot_json.clone(),
+        };
+        if let Err(e) = warm.save_evaluation_result(eval).await {
+            tracing::warn!(error = %e, metric, "failed to persist tier2 evaluation");
+        }
     }
 
     // Merge Tier 1 scores with non-Low-confidence Tier 2 scores before
@@ -229,9 +250,9 @@ async fn run_tier2(
     // the health score value.
     let mut all_scores: HashMap<&str, f64> =
         tier1_scores.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-    for &(metric, score, confidence) in &results {
-        if confidence != EvaluationConfidence::Low {
-            all_scores.insert(metric, score);
+    for (metric, score, confidence, _) in &results {
+        if *confidence != EvaluationConfidence::Low {
+            all_scores.insert(metric, *score);
         }
     }
 
