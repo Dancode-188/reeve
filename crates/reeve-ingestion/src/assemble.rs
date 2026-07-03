@@ -312,7 +312,7 @@ mod tests {
             trace
                 .children
                 .get("root-1")
-                .map_or(false, |c| c.iter().any(|id| id.as_str() == "child-1")),
+                .is_some_and(|c| c.iter().any(|id| id.as_str() == "child-1")),
             "root-1 must have child-1 in its children list"
         );
     }
