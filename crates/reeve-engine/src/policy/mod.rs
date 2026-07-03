@@ -58,6 +58,19 @@ impl PolicyEngine {
                 enabled: true,
                 auto_confirm_after_secs: None,
             },
+            // Prediction accuracy improves after 10 traces warm the agent fingerprint.
+            PolicyRule {
+                id: RuleId::from("builtin_predicted_cost"),
+                name: "Predicted cost overrun".to_string(),
+                description: "Extrapolated final cost exceeds the configured limit.".to_string(),
+                trigger_condition: "predicted_cost_at_completion > 8.0".to_string(),
+                command_type: CommandType::Pause,
+                requires_confirmation: true,
+                cooldown_secs: 300,
+                scope: RuleScope::Global,
+                enabled: true,
+                auto_confirm_after_secs: None,
+            },
         ];
         Self {
             rules,
@@ -80,6 +93,44 @@ impl PolicyEngine {
         let mut fired = Vec::new();
         for rule in &self.rules {
             if !rule.enabled {
+                continue;
+            }
+            let key = (agent_id.clone(), rule.id.clone());
+            if let Some(&last) = self.cooldowns.get(&key) {
+                if now.duration_since(last) < Duration::from_secs(rule.cooldown_secs) {
+                    continue;
+                }
+            }
+            if ctx.evaluate(&rule.trigger_condition) {
+                self.cooldowns.insert(key, now);
+                fired.push(FiredRule {
+                    command: build_command(rule, trace_id, now_ms),
+                    rule: rule.clone(),
+                });
+            }
+        }
+        fired
+    }
+
+    /// Evaluate rules that reference `predicted_cost_at_completion` for an
+    /// in-flight trace. Other rules fire at TraceCompleted with full Tier 1
+    /// context; running them here would produce false positives.
+    pub fn evaluate_mid_trace(
+        &mut self,
+        agent_id: &AgentId,
+        trace_id: &TraceId,
+        predicted_cost: f64,
+        now: Instant,
+        now_ms: i64,
+    ) -> Vec<FiredRule> {
+        let ctx = PolicyContext::build_mid_trace(predicted_cost);
+        let mut fired = Vec::new();
+        for rule in &self.rules {
+            if !rule.enabled
+                || !rule
+                    .trigger_condition
+                    .contains("predicted_cost_at_completion")
+            {
                 continue;
             }
             let key = (agent_id.clone(), rule.id.clone());
@@ -156,7 +207,7 @@ mod tests {
     fn ctx(health_score: f64, cost_usd: f64, loop_detection: f64) -> PolicyContext {
         let mut metrics = HashMap::new();
         metrics.insert("loop_detection", loop_detection);
-        PolicyContext::build(health_score, cost_usd, 5, false, 0.45, &metrics)
+        PolicyContext::build(health_score, cost_usd, 5, false, 0.45, 0.0, &metrics)
     }
 
     #[test]
@@ -262,6 +313,33 @@ mod tests {
             .unwrap()
             .command;
         assert_eq!(cmd.status, CommandStatus::PendingConfirmation);
+    }
+
+    #[test]
+    fn predicted_cost_fires_mid_trace_rule() {
+        let mut engine = PolicyEngine::with_defaults();
+        let fired = engine.evaluate_mid_trace(&agent(), &trace(), 9.5, Instant::now(), 0);
+        assert!(
+            fired
+                .iter()
+                .any(|f| f.rule.id.as_str() == "builtin_predicted_cost")
+        );
+    }
+
+    #[test]
+    fn predicted_cost_below_threshold_does_not_fire() {
+        let mut engine = PolicyEngine::with_defaults();
+        let fired = engine.evaluate_mid_trace(&agent(), &trace(), 4.0, Instant::now(), 0);
+        assert!(fired.is_empty());
+    }
+
+    #[test]
+    fn mid_trace_does_not_fire_trace_level_rules() {
+        let mut engine = PolicyEngine::with_defaults();
+        // Even with predicted_cost well above threshold, only the predicted_cost rule fires.
+        let fired = engine.evaluate_mid_trace(&agent(), &trace(), 20.0, Instant::now(), 0);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].rule.id.as_str(), "builtin_predicted_cost");
     }
 
     #[test]
