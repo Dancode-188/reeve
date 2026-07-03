@@ -15,6 +15,10 @@ pub enum RuleScope {
 pub struct PolicyRule {
     pub id: RuleId,
     pub name: String,
+    /// Human-readable sentence shown in the ALERTS section when this rule fires.
+    /// Engine-owned: the renderer never derives this from the rule ID so that
+    /// user-defined rules work without any renderer changes.
+    pub description: String,
     /// evalexpr DSL string, e.g. `health_score < 30`.
     pub trigger_condition: String,
     pub command_type: CommandType,

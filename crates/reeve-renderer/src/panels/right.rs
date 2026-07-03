@@ -1,16 +1,26 @@
-use crate::app::{AppState, PanelFocus};
+use crate::app::AppState;
 use crate::ascii::AsciiMode;
 use crate::theme::Theme;
-use crate::widgets::{CostSparkline, HealthGauge};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph},
+    layout::{Constraint, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
 };
 use reeve_model::signal::EvaluationConfidence;
 
+// Fixed three Tier 2 metrics shown in QUALITY. Tier 1 metrics (loop, cost, latency, fingerprint)
+// contribute to SCORE only and have no individual rows.
+const TIER2_METRICS: [(&str, &str, bool); 3] = [
+    ("faith", "faithfulness", true), // (label, canonical_name, content_gated)
+    ("tools", "tool_selection", false),
+    ("hallu", "hallucination_detection", true),
+];
+
+// Metrics that factor into the composite health score (from health_score.rs WEIGHTS table).
+// fingerprint_deviation, hallucination_detection, and intent_action_divergence are NOT in this
+// list: they trigger policy alerts but do not factor into the health score.
 const WEIGHT_METRICS: &[&str] = &[
     "faithfulness",
     "tool_selection",
@@ -26,157 +36,319 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, as
 
     let _ = ascii;
 
-    let focused = state.panel_focus == PanelFocus::Right;
-
-    let constraints: Vec<Constraint> = if state.metric_scores.is_empty() {
-        vec![
-            Constraint::Length(3),
-            Constraint::Length(5),
-            Constraint::Fill(1),
-        ]
+    if state.metric_scores.is_empty() {
+        render_span_detail(frame, area, state, theme);
     } else {
-        vec![
-            Constraint::Length(3),
-            Constraint::Length(5),
-            Constraint::Length(quality_height(state)),
-            Constraint::Fill(1),
-        ]
-    };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
-
-    frame.render_widget(
-        HealthGauge {
-            score: state.health_score,
-            tier2_pending: state.health_tier2_pending,
-            focused,
-            theme,
-        },
-        chunks[0],
-    );
-
-    let cost_history: &[f64] = state
-        .selected_agent
-        .and_then(|i| state.agents.get_index(i))
-        .map(|(_, s)| s.cost_history.as_slice())
-        .unwrap_or(&[]);
-
-    frame.render_widget(
-        CostSparkline {
-            history: cost_history,
-            focused,
-            theme,
-        },
-        chunks[1],
-    );
-
-    if !state.metric_scores.is_empty() {
-        render_quality(frame, chunks[2], state, theme, focused);
-        render_span_detail(frame, chunks[3], state, theme, focused);
-    } else {
-        render_span_detail(frame, chunks[2], state, theme, focused);
+        let sdh = span_detail_height(state);
+        let chunks = Layout::vertical([Constraint::Length(sdh), Constraint::Fill(1)]).split(area);
+        render_span_detail(frame, chunks[0], state, theme);
+        render_quality(frame, chunks[1], state, theme);
     }
 }
 
-fn quality_height(state: &AppState) -> u16 {
-    let metric_rows = state.metric_scores.len() as u16;
-    let has_note = state.health_tier2_pending
-        || state
-            .health_weight_coverage
-            .map(|w| w < 0.99)
-            .unwrap_or(false);
-    let note_row: u16 = if has_note { 1 } else { 0 };
-    (2 + metric_rows + note_row).min(9)
+fn span_detail_height(state: &AppState) -> u16 {
+    let selected_span = state
+        .trace
+        .as_ref()
+        .and_then(|tv| tv.selected.as_ref().and_then(|id| tv.spans.get(id)));
+
+    match selected_span {
+        None => 3, // label + "select a span" + divider
+        Some(span) => {
+            let mut h = 2u16; // label + span name row
+            if span.attributes.get("gen_ai.request.model").is_some() {
+                h += 1;
+            }
+            if span.end_time.is_some() {
+                h += 1; // dur
+            }
+            if span.attributes.get("gen_ai.usage.input_tokens").is_some() {
+                h += 1;
+            }
+            if span.attributes.get("gen_ai.usage.output_tokens").is_some() {
+                h += 1;
+            }
+            if span.attributes.get("gen_ai.usage.cost").is_some() {
+                h += 1;
+            }
+            h + 1 // divider
+        }
+    }
 }
 
-fn render_quality(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, focused: bool) {
-    let border_style = Style::default().fg(if focused {
-        theme.border_focused()
-    } else {
-        theme.border_idle()
-    });
-
-    let block = Block::default()
-        .title("QUALITY")
-        .borders(Borders::ALL)
-        .border_style(border_style);
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let max_rows = inner.height as usize;
+fn render_quality(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let mut lines: Vec<Line> = Vec::new();
 
-    for entry in &state.metric_scores {
-        if lines.len() >= max_rows {
-            break;
-        }
-        let name = abbrev_metric(&entry.name);
-        let bar = score_bar(entry.score);
-        let score_str = format!("{:.2}", entry.score);
-        let bar_color = score_color(entry.score, theme);
+    lines.push(section_label("QUALITY", theme));
 
-        let mut spans = vec![
-            Span::styled(name, Style::default().fg(theme.subtext())),
-            Span::raw(" "),
-            Span::styled(bar, Style::default().fg(bar_color)),
-            Span::raw(" "),
-            Span::styled(score_str, Style::default().fg(theme.text())),
-        ];
+    let tier2_disabled = state
+        .eval_backend
+        .as_deref()
+        .map(|b| b == "disabled")
+        .unwrap_or(false);
 
-        if let Some(conf) = entry.confidence {
-            let (badge, color) = conf_badge(conf, theme);
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(badge, Style::default().fg(color)));
-        }
+    let tick = state.streaming.cursor_tick;
+    let pulse_visible = (tick / 4) % 2 == 0;
 
-        lines.push(Line::from(spans));
-    }
+    // Three fixed Tier 2 metric rows (faith / tools / hallu).
+    // Tier 1 metrics (loop, cost, latency, fingerprint) contribute to SCORE only.
+    if !tier2_disabled {
+        for &(label, canonical, content_gated) in &TIER2_METRICS {
+            let unavailable = content_gated && state.privacy_tier < 2;
 
-    if lines.len() < max_rows {
-        if state.health_tier2_pending {
-            lines.push(Line::styled(
-                " \u{22EF} tier 2 scoring",
-                Style::default().fg(theme.subtext()),
-            ));
-        } else if let Some(w) = state.health_weight_coverage {
-            if w < 0.99 {
-                let active = state
-                    .metric_scores
-                    .iter()
-                    .filter(|e| {
-                        WEIGHT_METRICS.contains(&e.name.as_str())
-                            && e.confidence != Some(EvaluationConfidence::Low)
-                    })
-                    .count();
-                let note = format!("{}/5 metrics \u{00B7} renormalized", active);
-                lines.push(Line::styled(note, Style::default().fg(theme.subtext())));
+            if unavailable {
+                lines.push(Line::styled(
+                    "\u{2013}  enable content capture",
+                    Style::default().fg(theme.get("muted")),
+                ));
+            } else if let Some(entry) = state.metric_scores.iter().find(|e| e.name == canonical) {
+                // Resolved: name bar score confidence-icon
+                let bar = score_bar(entry.score);
+                let bar_color = score_color(entry.score, theme);
+                let (icon, icon_color) = quality_icon(entry.score, entry.confidence, theme);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<5}  ", label),
+                        Style::default().fg(theme.subtext()),
+                    ),
+                    Span::styled(bar, Style::default().fg(bar_color)),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("{:.2}", entry.score),
+                        Style::default().fg(theme.text()),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(icon, Style::default().fg(icon_color)),
+                ]));
+            } else if state.health_tier2_pending {
+                // Pending: ⋯ and "scoring" both animate together in chrome (fading pulse)
+                let pulse = if pulse_visible {
+                    theme.get("blue")
+                } else {
+                    theme.get("muted")
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<5}  ", label),
+                        Style::default().fg(theme.subtext()),
+                    ),
+                    Span::styled("\u{22EF} scoring", Style::default().fg(pulse)),
+                ]));
+            } else {
+                // Tier 2 finished but no score arrived
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<5}  ", label),
+                        Style::default().fg(theme.subtext()),
+                    ),
+                    Span::styled(
+                        "\u{2013} no result",
+                        Style::default().fg(theme.get("muted")),
+                    ),
+                ]));
             }
         }
     }
 
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    // One empty row separating metric rows from SCORE (not a full divider)
+    lines.push(Line::raw(""));
+
+    // SCORE row
+    if let Some(score) = state.health_score {
+        let pct = score / 100.0;
+        let bar = score_bar(pct);
+        let bar_color = score_color(pct, theme);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<5}  ", "SCORE"),
+                Style::default().fg(theme.subtext()),
+            ),
+            Span::styled(bar, Style::default().fg(bar_color)),
+            Span::raw(" "),
+            Span::styled(
+                format!("{}", score.round() as u32),
+                Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    } else {
+        lines.push(Line::raw(""));
+    }
+
+    // Renormalization note row: always reserved, blank text when all metrics are present
+    let note = if state.health_tier2_pending {
+        " \u{22EF} tier 2 scoring".to_string()
+    } else if state
+        .health_weight_coverage
+        .map(|w| w < 0.99)
+        .unwrap_or(false)
+    {
+        let active = state
+            .metric_scores
+            .iter()
+            .filter(|e| WEIGHT_METRICS.contains(&e.name.as_str()))
+            .count();
+        format!("{}/5 metrics \u{00B7} renormalized", active)
+    } else {
+        String::new()
+    };
+    lines.push(Line::styled(note, Style::default().fg(theme.subtext())));
+
+    lines.push(divider(area.width, theme));
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn abbrev_metric(name: &str) -> String {
-    let abbrev = match name {
-        "faithfulness" => "faithful",
-        "tool_selection" => "tool_sel",
-        "loop_detection" => "loop_det",
-        "cost_efficiency" => "cost_eff",
-        "latency_normality" => "latency",
-        "hallucination_detection" => "hallucin",
-        "fingerprint_deviation" => "fingerpr",
-        "intent_action_divergence" => "intent",
-        other => {
-            let end = other.len().min(8);
-            return format!("{:<8}", &other[..end]);
+fn render_span_detail(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(section_label("SPAN DETAIL", theme));
+
+    match state
+        .trace
+        .as_ref()
+        .and_then(|tv| tv.selected.as_ref().and_then(|id| tv.spans.get(id)))
+    {
+        None => {
+            lines.push(Line::from(Span::styled(
+                " select a span",
+                Style::default().fg(theme.subtext()),
+            )));
         }
-    };
-    format!("{:<8}", abbrev)
+        Some(span) => {
+            // span name row
+            if let Some(tv) = state.trace.as_ref() {
+                if let Some(sel_id) = tv.selected.as_ref() {
+                    if let Some(name) = tv.names.get(sel_id) {
+                        let checkmark = if span.end_time.is_some() {
+                            " \u{2713}"
+                        } else {
+                            ""
+                        };
+                        lines.push(Line::from(Span::styled(
+                            format!("{}{}", name, checkmark),
+                            Style::default()
+                                .fg(theme.text())
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                    }
+                }
+            }
+            // model
+            if let Some(model) = span
+                .attributes
+                .get("gen_ai.request.model")
+                .and_then(|v| v.as_str())
+            {
+                let w = area.width as usize;
+                let val_max = w.saturating_sub(11);
+                let model_str = truncate(model, val_max);
+                lines.push(field_line("model", &model_str, theme.text(), theme));
+            }
+
+            // dur
+            if let Some(end) = span.end_time {
+                let dur_ms = end - span.start_time;
+                lines.push(field_line("dur", &fmt_dur(dur_ms), theme.subtext(), theme));
+            }
+
+            // tokens in
+            if let Some(tok_in) = span
+                .attributes
+                .get("gen_ai.usage.input_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                lines.push(field_line(
+                    "tokens \u{2191}",
+                    &format_tokens(tok_in),
+                    theme.subtext(),
+                    theme,
+                ));
+            }
+
+            // tokens out
+            if let Some(tok_out) = span
+                .attributes
+                .get("gen_ai.usage.output_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                lines.push(field_line(
+                    "tokens \u{2193}",
+                    &format_tokens(tok_out),
+                    theme.subtext(),
+                    theme,
+                ));
+            }
+
+            // cost
+            if let Some(cost) = span
+                .attributes
+                .get("gen_ai.usage.cost")
+                .and_then(|v| v.as_f64())
+            {
+                lines.push(field_line(
+                    "cost",
+                    &format!("${:.4}", cost),
+                    theme.get("teal"),
+                    theme,
+                ));
+            }
+        }
+    }
+
+    lines.push(divider(area.width, theme));
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+fn section_label(title: &str, theme: &Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        title.to_string(),
+        Style::default().fg(theme.get("blue")),
+    ))
+}
+
+fn divider(width: u16, theme: &Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        "\u{2500}".repeat(width as usize),
+        Style::default().fg(theme.surface()),
+    ))
+}
+
+fn field_line<'a>(
+    label: &str,
+    value: &str,
+    value_color: ratatui::style::Color,
+    theme: &Theme,
+) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(
+            format!("{:<10}", label),
+            Style::default().fg(theme.subtext()),
+        ),
+        Span::styled(value.to_string(), Style::default().fg(value_color)),
+    ])
+}
+
+// High confidence: pass (>=0.6) shows checkmark, fail shows cross. Medium/Low shows ? regardless.
+fn quality_icon(
+    score: f64,
+    conf: Option<EvaluationConfidence>,
+    theme: &Theme,
+) -> (&'static str, ratatui::style::Color) {
+    match conf {
+        Some(EvaluationConfidence::Medium) | Some(EvaluationConfidence::Low) => {
+            ("?", theme.health_warn())
+        }
+        _ => {
+            if score >= 0.6 {
+                ("\u{2713}", theme.health_ok())
+            } else {
+                ("\u{2717}", theme.health_crit())
+            }
+        }
+    }
 }
 
 fn score_bar(score: f64) -> String {
@@ -185,7 +357,7 @@ fn score_bar(score: f64) -> String {
     format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty))
 }
 
-fn score_color(score: f64, theme: &Theme) -> Color {
+fn score_color(score: f64, theme: &Theme) -> ratatui::style::Color {
     if score >= 0.8 {
         theme.health_ok()
     } else if score >= 0.6 {
@@ -195,91 +367,28 @@ fn score_color(score: f64, theme: &Theme) -> Color {
     }
 }
 
-fn conf_badge(conf: EvaluationConfidence, theme: &Theme) -> (&'static str, Color) {
-    match conf {
-        EvaluationConfidence::High => ("H", theme.health_ok()),
-        EvaluationConfidence::Medium => ("M", theme.health_warn()),
-        EvaluationConfidence::Low => ("L", theme.health_crit()),
+fn fmt_dur(ms: i64) -> String {
+    if ms < 1_000 {
+        format!("{} ms", ms)
+    } else {
+        format!("{:.1} s", ms as f64 / 1_000.0)
     }
 }
 
-fn render_span_detail(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    theme: &Theme,
-    focused: bool,
-) {
-    let border_style = Style::default().fg(if focused {
-        theme.border_focused()
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000 {
+        format!("{},{:03}", n / 1_000, n % 1_000)
     } else {
-        theme.border_idle()
-    });
-
-    let block = Block::default()
-        .title("SPAN")
-        .borders(Borders::ALL)
-        .border_style(border_style);
-
-    let text = match state
-        .trace
-        .as_ref()
-        .and_then(|tv| tv.selected.as_ref().and_then(|id| tv.spans.get(id)))
-    {
-        None => Text::from(Line::styled(
-            " select a span",
-            Style::default().fg(theme.subtext()),
-        )),
-        Some(span) => {
-            let inner_w = area.width.saturating_sub(2) as usize;
-            let op_max = inner_w.saturating_sub(9);
-            let op = if span.operation.len() > op_max && op_max > 3 {
-                format!("{}...", &span.operation[..op_max - 3])
-            } else {
-                span.operation.clone()
-            };
-            let mut lines = vec![
-                Line::styled(
-                    format!(" op:     {}", op),
-                    Style::default().fg(theme.text()),
-                ),
-                Line::styled(
-                    format!(" status: {:?}", span.status),
-                    Style::default().fg(theme.subtext()),
-                ),
-                Line::styled(
-                    format!(" start:  {}", fmt_ts(span.start_time)),
-                    Style::default().fg(theme.subtext()),
-                ),
-            ];
-            if let Some(end) = span.end_time {
-                lines.push(Line::styled(
-                    format!(" dur:    {}ms", end - span.start_time),
-                    Style::default().fg(theme.subtext()),
-                ));
-            }
-            if let Some(cost) = span
-                .attributes
-                .get("gen_ai.usage.cost")
-                .and_then(|v| v.as_f64())
-            {
-                lines.push(Line::styled(
-                    format!(" cost:   ${:.4}", cost),
-                    Style::default().fg(theme.get("teal")),
-                ));
-            }
-            Text::from(lines)
-        }
-    };
-
-    frame.render_widget(Paragraph::new(text).block(block), area);
+        format!("{}", n)
+    }
 }
 
-fn fmt_ts(ms: i64) -> String {
-    let secs = (ms / 1000).unsigned_abs();
-    let ms_part = (ms % 1000).unsigned_abs();
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    format!("{h:02}:{m:02}:{s:02}.{ms_part:03}")
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else if max > 1 {
+        format!("{}\u{2026}", &s[..max.saturating_sub(1)])
+    } else {
+        s[..max].to_string()
+    }
 }

@@ -3,7 +3,7 @@ use indexmap::IndexMap;
 use reeve_model::entity::agent::Agent;
 use reeve_model::entity::span::InternalSpan;
 use reeve_model::ids::{AgentId, SpanId, TraceId};
-use reeve_model::signal::{EngineEvent, EvaluationConfidence, IngestionEvent};
+use reeve_model::signal::{CostTrend, EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::WarmStore;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -15,6 +15,27 @@ pub struct MetricScore {
     pub confidence: Option<EvaluationConfidence>,
 }
 
+pub struct PolicyAlertEntry {
+    pub description: String,
+    pub command_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FlashTarget {
+    HealthGauge,
+    CostTotal,
+    AlertSection,
+    AgentRow(AgentId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlashDirection {
+    Positive,
+    Negative,
+    Neutral,
+    Alert,
+}
+
 #[derive(Clone)]
 pub struct AgentState {
     pub agent: Agent,
@@ -22,6 +43,7 @@ pub struct AgentState {
     pub trace_count: u32,
     pub total_cost: f64,
     pub cost_history: Vec<f64>,
+    pub cost_trend: Option<CostTrend>,
 }
 
 impl AgentState {
@@ -32,6 +54,7 @@ impl AgentState {
             trace_count: 0,
             total_cost: 0.0,
             cost_history: Vec::new(),
+            cost_trend: None,
         }
     }
 }
@@ -46,6 +69,9 @@ pub struct TraceView {
     pub scroll: u16,
     pub selected: Option<SpanId>,
     pub collapsed: HashSet<SpanId>,
+    /// Per-span composite health scores. Populated when HealthScoreUpdated fires
+    /// for the trace. Only gen_ai.* operation spans receive a badge.
+    pub span_health_scores: HashMap<SpanId, f64>,
 }
 
 pub struct StreamingState {
@@ -80,16 +106,44 @@ pub struct AppState {
     pub trace: Option<TraceView>,
     pub streaming: StreamingState,
     pub health_score: Option<f64>,
+    pub prev_health_score: Option<f64>,
     pub health_weight_coverage: Option<f64>,
     pub health_tier2_pending: bool,
     pub metric_scores: Vec<MetricScore>,
-    pub policy_alerts: VecDeque<(String, String)>,
+    pub policy_alerts: VecDeque<PolicyAlertEntry>,
     /// Human-readable evaluation backend description, e.g. "local (phi4-mini)"
     /// or "disabled". Set once on engine startup.
     pub eval_backend: Option<String>,
+    /// Active privacy tier from engine startup event. 1 = default (no content
+    /// capture); 2+ = content capture enabled. Controls mini-metric row states.
+    pub privacy_tier: u8,
+    pub flash_targets: HashMap<FlashTarget, (FlashDirection, u8)>,
     pub panel_focus: PanelFocus,
     pub show_help: bool,
     pub errors: Vec<String>,
+}
+
+impl AppState {
+    /// Decrement all flash TTLs by one tick and remove expired entries.
+    pub fn advance_flash(&mut self) {
+        self.flash_targets.retain(|_, (_, ttl)| {
+            *ttl = ttl.saturating_sub(1);
+            *ttl > 0
+        });
+    }
+
+    pub fn flash_color(
+        &self,
+        target: &FlashTarget,
+        theme: &crate::theme::Theme,
+    ) -> Option<ratatui::style::Color> {
+        self.flash_targets.get(target).map(|(dir, _)| match dir {
+            FlashDirection::Positive => theme.health_ok(),
+            FlashDirection::Negative => theme.health_crit(),
+            FlashDirection::Neutral => theme.text(),
+            FlashDirection::Alert => theme.health_warn(),
+        })
+    }
 }
 
 pub struct App {
@@ -110,8 +164,6 @@ impl App {
         match warm.list_agents().await {
             Ok(list) => {
                 for mut agent in list {
-                    // No agent is actively streaming at process startup.
-                    // Warm store status reflects the last session and may be stale.
                     agent.status = reeve_model::entity::agent::AgentStatus::Idle;
                     let id = agent.id.clone();
                     agents.insert(id, AgentState::new(agent));
@@ -135,11 +187,14 @@ impl App {
                 trace: None,
                 streaming: StreamingState::default(),
                 health_score: None,
+                prev_health_score: None,
                 health_weight_coverage: None,
                 health_tier2_pending: false,
                 metric_scores: Vec::new(),
                 policy_alerts: VecDeque::new(),
                 eval_backend: None,
+                privacy_tier: 1,
+                flash_targets: HashMap::new(),
                 panel_focus: PanelFocus::default(),
                 show_help: false,
                 errors: Vec::new(),
@@ -179,7 +234,6 @@ impl App {
                         s.cost_history.remove(0);
                     }
                 }
-                // Load the trace if the selected agent just completed it.
                 let is_selected = self
                     .state
                     .selected_agent
@@ -202,20 +256,59 @@ impl App {
     pub fn handle_engine_event(&mut self, event: EngineEvent) {
         match event {
             EngineEvent::HealthScoreUpdated {
+                agent_id,
+                trace_id,
                 score,
                 weight_coverage,
                 tier2_pending,
-                ..
             } => {
+                let prev = self.state.prev_health_score;
+                self.state.prev_health_score = Some(score);
                 self.state.health_score = Some(score);
                 self.state.health_weight_coverage = Some(weight_coverage);
                 self.state.health_tier2_pending = tier2_pending;
+
+                if let Some(prev_score) = prev {
+                    let dir = if score > prev_score + 0.5 {
+                        FlashDirection::Positive
+                    } else if score < prev_score - 0.5 {
+                        FlashDirection::Negative
+                    } else {
+                        FlashDirection::Neutral
+                    };
+                    self.state
+                        .flash_targets
+                        .insert(FlashTarget::HealthGauge, (dir, 2));
+                    self.state
+                        .flash_targets
+                        .insert(FlashTarget::AgentRow(agent_id.clone()), (dir, 2));
+                }
+
+                // Associate the score with gen_ai.* spans in the loaded trace.
+                if let Some(ref mut tv) = self.state.trace {
+                    if tv.trace_id == trace_id {
+                        let llm_spans: Vec<SpanId> = tv
+                            .spans
+                            .iter()
+                            .filter(|(_, s)| s.operation.starts_with("gen_ai."))
+                            .map(|(id, _)| id.clone())
+                            .collect();
+                        for sid in llm_spans {
+                            tv.span_health_scores.insert(sid, score);
+                        }
+                    }
+                }
             }
-            EngineEvent::EvaluationBackendReady { backend, reason } => {
+            EngineEvent::EvaluationBackendReady {
+                backend,
+                reason,
+                privacy_tier,
+            } => {
                 if let Some(ref r) = reason {
                     tracing::info!(reason = r, "evaluation backend disabled");
                 }
                 self.state.eval_backend = Some(backend);
+                self.state.privacy_tier = privacy_tier;
             }
             EngineEvent::EvaluationComplete {
                 metric,
@@ -240,14 +333,20 @@ impl App {
                 }
             }
             EngineEvent::PolicyAlert {
-                rule_id,
+                description,
                 command_type,
                 ..
             } => {
                 if self.state.policy_alerts.len() >= 5 {
                     self.state.policy_alerts.pop_front();
                 }
-                self.state.policy_alerts.push_back((rule_id, command_type));
+                self.state.policy_alerts.push_back(PolicyAlertEntry {
+                    description,
+                    command_type,
+                });
+                self.state
+                    .flash_targets
+                    .insert(FlashTarget::AlertSection, (FlashDirection::Alert, 2));
             }
         }
     }
@@ -289,6 +388,7 @@ impl App {
                     scroll: 0,
                     selected: None,
                     collapsed,
+                    span_health_scores: HashMap::new(),
                 });
             }
             Err(e) => {

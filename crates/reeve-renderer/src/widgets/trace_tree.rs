@@ -1,4 +1,5 @@
 use crate::ascii::AsciiMode;
+use crate::panels::left::health_color;
 use crate::theme::Theme;
 use ratatui::{
     buffer::Buffer,
@@ -14,6 +15,7 @@ pub struct TraceTree<'a> {
     pub children: &'a HashMap<SpanId, Vec<SpanId>>,
     pub names: &'a HashMap<SpanId, String>,
     pub collapsed: &'a HashSet<SpanId>,
+    pub span_health_scores: &'a HashMap<SpanId, f64>,
     pub root: Option<&'a SpanId>,
     pub selected: Option<&'a SpanId>,
     pub scroll: u16,
@@ -84,13 +86,17 @@ impl<'a> TraceTree<'a> {
             .map(|s| s.as_str())
             .unwrap_or_else(|| id.as_str());
         let fold = if has_children && is_collapsed {
-            if self.ascii.enabled() { " >" } else { " ▸" }
+            if self.ascii.enabled() {
+                " >"
+            } else {
+                " \u{25B8}"
+            }
         } else {
             ""
         };
         let label = format!("{}{}{}{}", prefix, connector, display, fold);
 
-        let style = if is_selected {
+        let label_style = if is_selected {
             Style::default()
                 .bg(self.theme.highlight())
                 .fg(self.theme.background())
@@ -99,7 +105,29 @@ impl<'a> TraceTree<'a> {
             Style::default().fg(self.theme.text())
         };
 
-        lines.push(Line::from(Span::styled(label, style)));
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(label, label_style)];
+
+        // Quality badge for spans that have a health score
+        if let Some(&score) = self.span_health_scores.get(id) {
+            let hcolor = health_color(score, self.theme);
+            let star = if self.ascii.enabled() {
+                "*"
+            } else {
+                "\u{2605}"
+            };
+            let score_str = format!("{}", score.round() as u32);
+            spans.push(Span::styled(
+                " [",
+                Style::default().fg(self.theme.subtext()),
+            ));
+            spans.push(Span::styled(
+                format!("{}{}", star, score_str),
+                Style::default().fg(hcolor).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled("]", Style::default().fg(self.theme.subtext())));
+        }
+
+        lines.push(Line::from(spans));
 
         if is_collapsed {
             return;
@@ -147,6 +175,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let collapsed = HashSet::new();
+        let scores: HashMap<SpanId, f64> = HashMap::new();
         terminal
             .draw(|frame| {
                 let theme = make_theme();
@@ -155,6 +184,7 @@ mod tests {
                     children: &children,
                     names: &names,
                     collapsed: &collapsed,
+                    span_health_scores: &scores,
                     root: Some(&root),
                     selected: None,
                     scroll: 0,
@@ -177,7 +207,6 @@ mod tests {
 
         assert!(content.contains("root-span"), "root span must appear");
         assert!(content.contains("child-span"), "child span must appear");
-        // Box-drawing connector for the child
         assert!(
             content.contains('└') || content.contains('├'),
             "tree connector must appear"

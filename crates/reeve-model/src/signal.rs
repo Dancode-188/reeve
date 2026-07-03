@@ -41,6 +41,16 @@ pub enum EvaluationConfidence {
     Low,
 }
 
+/// Direction of cost rate change. Emitted by the engine once enough cost
+/// samples have accumulated (minimum 3 deltas). Until then the field is None
+/// in AgentState and no trend arrow is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CostTrend {
+    Accelerating,
+    Stable,
+    Decelerating,
+}
+
 /// Produced by the evaluation engine. Consumer: renderer.
 #[derive(Clone, Debug)]
 pub enum EngineEvent {
@@ -65,9 +75,16 @@ pub enum EngineEvent {
         backend: String,
         /// Why the backend is disabled, if applicable.
         reason: Option<String>,
+        /// Active privacy tier. 1 = default (no content capture); 2+ = content capture
+        /// enabled. Always 1 until config loading ships in issue #65.
+        privacy_tier: u8,
     },
     PolicyAlert {
         rule_id: String,
+        /// Human-readable description owned by the engine and carried from the firing
+        /// PolicyRule. The renderer never looks this up; user-defined rules would break
+        /// any renderer-side table.
+        description: String,
         command_type: String,
         requires_confirmation: bool,
     },

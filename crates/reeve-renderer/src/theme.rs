@@ -101,6 +101,9 @@ impl Theme {
     pub fn span_error(&self) -> Color {
         self.get("span_error")
     }
+    pub fn chrome_bg(&self) -> Color {
+        self.get("chrome_bg")
+    }
 }
 
 fn parse_hex(s: &str) -> Option<Color> {
