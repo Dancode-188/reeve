@@ -13,6 +13,8 @@ pub enum Action {
     PrevPanel,
     ToggleHelp,
     Dismiss,
+    DismissDegraded,
+    Retry,
     Resize(u16, u16),
 }
 
@@ -51,6 +53,8 @@ fn map_event(event: Event) -> Option<Action> {
             (KeyCode::PageDown, _) => Some(Action::ScrollDown),
             (KeyCode::Char('?'), _) => Some(Action::ToggleHelp),
             (KeyCode::Esc, _) => Some(Action::Dismiss),
+            (KeyCode::Char('d'), _) => Some(Action::DismissDegraded),
+            (KeyCode::Char('r'), _) => Some(Action::Retry),
             _ => None,
         },
         Event::Resize(w, h) => Some(Action::Resize(w, h)),

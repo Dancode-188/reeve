@@ -8,6 +8,9 @@ pub struct Panels {
 
 pub struct FullLayout {
     pub header: Rect,
+    /// Full body area before panel split. Use this to carve out space for
+    /// banners that sit above the three-panel cockpit.
+    pub body: Rect,
     pub panels: Panels,
     pub footer: Rect,
 }
@@ -67,6 +70,7 @@ pub fn compute_full(area: Rect) -> FullLayout {
     if area.height < 3 {
         return FullLayout {
             header: Rect { height: 0, ..area },
+            body: area,
             panels: compute(area),
             footer: Rect { height: 0, ..area },
         };
@@ -81,6 +85,7 @@ pub fn compute_full(area: Rect) -> FullLayout {
         .split(area);
     FullLayout {
         header: rows[0],
+        body: rows[1],
         panels: compute(rows[1]),
         footer: rows[2],
     }

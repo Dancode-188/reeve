@@ -1,4 +1,6 @@
 pub mod center;
+pub mod degraded;
+pub mod fatal;
 pub mod footer;
 pub mod header;
 pub mod help;
@@ -62,4 +64,12 @@ pub fn render_footer(
 
 pub fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
     help::render(frame, area, theme);
+}
+
+pub fn render_fatal(frame: &mut Frame, area: Rect, err: &crate::app::FatalError, theme: &Theme) {
+    fatal::render(frame, area, err, theme);
+}
+
+pub fn render_degraded(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    degraded::render(frame, area, state, theme);
 }

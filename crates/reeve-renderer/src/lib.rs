@@ -15,7 +15,11 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use errors::RendererError;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Layout},
+};
 use reeve_model::signal::{EngineEvent, IngestionEvent};
 use reeve_storage::warm::WarmStore;
 use std::sync::Arc;
@@ -92,11 +96,31 @@ async fn run_inner(
                 app.state.advance_flash();
 
                 terminal.draw(|frame| {
+                    if let Some(ref err) = app.state.fatal_error {
+                        panels::render_fatal(frame, frame.area(), err, &theme);
+                        return;
+                    }
+
                     let full = layout::compute_full(frame.area());
                     let right_hidden = full.panels.right.width == 0;
                     let left_hidden = full.panels.left.width == 0;
                     panels::render_header(frame, full.header, &app.state, &theme);
-                    panels::render(frame, &full.panels, &app.state, &theme, &ascii);
+
+                    let is_degraded = app.state.eval_backend.as_deref() == Some("disabled")
+                        && !app.state.degraded_dismissed;
+                    let panels = if is_degraded && full.body.height >= 3 {
+                        let chunks = Layout::vertical([
+                            Constraint::Length(2),
+                            Constraint::Fill(1),
+                        ])
+                        .split(full.body);
+                        panels::render_degraded(frame, chunks[0], &app.state, &theme);
+                        layout::compute(chunks[1])
+                    } else {
+                        full.panels
+                    };
+
+                    panels::render(frame, &panels, &app.state, &theme, &ascii);
                     panels::render_footer(frame, full.footer, &theme, right_hidden, left_hidden);
                     if app.state.show_help {
                         panels::render_help_overlay(frame, frame.area(), &theme);
