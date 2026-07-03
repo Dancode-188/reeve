@@ -25,6 +25,7 @@ impl PolicyEngine {
             PolicyRule {
                 id: RuleId::from("builtin_low_health"),
                 name: "Low health score".to_string(),
+                description: "Agent health score is critical.".to_string(),
                 trigger_condition: "health_score < 30".to_string(),
                 command_type: CommandType::Pause,
                 requires_confirmation: true,
@@ -36,6 +37,7 @@ impl PolicyEngine {
             PolicyRule {
                 id: RuleId::from("builtin_high_cost"),
                 name: "High trace cost".to_string(),
+                description: "Running cost has exceeded the configured threshold.".to_string(),
                 trigger_condition: "cost_usd > 5.0".to_string(),
                 command_type: CommandType::Pause,
                 requires_confirmation: true,
@@ -47,6 +49,7 @@ impl PolicyEngine {
             PolicyRule {
                 id: RuleId::from("builtin_loop_detected"),
                 name: "Loop detected".to_string(),
+                description: "Loop detection score indicates repeated behavior.".to_string(),
                 trigger_condition: "loop_detection < 0.5".to_string(),
                 command_type: CommandType::Pause,
                 requires_confirmation: true,
@@ -128,9 +131,10 @@ fn command_type_str(ct: &CommandType) -> &'static str {
     }
 }
 
-pub fn alert_fields(fired: &FiredRule) -> (&str, &'static str, bool) {
+pub fn alert_fields(fired: &FiredRule) -> (&str, &str, &'static str, bool) {
     (
         fired.rule.id.as_str(),
+        &fired.rule.description,
         command_type_str(&fired.rule.command_type),
         fired.rule.requires_confirmation,
     )

@@ -1,139 +1,495 @@
-use crate::app::{AppState, PanelFocus};
+use crate::app::{AppState, FlashTarget};
 use crate::theme::Theme;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem},
+    widgets::{Paragraph, Sparkline, Widget},
 };
 use reeve_model::entity::agent::AgentStatus;
+use reeve_model::signal::CostTrend;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if area.width == 0 {
         return;
     }
 
-    let focused = state.panel_focus == PanelFocus::Left;
+    let tier2_disabled = state
+        .eval_backend
+        .as_deref()
+        .map(|b| b == "disabled")
+        .unwrap_or(false);
+    let mini_metric_rows: u16 = if tier2_disabled { 0 } else { 3 };
 
-    let (agents_area, alerts_area) = if state.policy_alerts.is_empty() {
-        (area, None)
+    let health_height = 1 + 1 + 1 + mini_metric_rows + 1; // label+gauge+status+metrics+divider
+
+    let selected_agent = state.selected_agent.and_then(|i| state.agents.get_index(i));
+    let cost_history: &[f64] = selected_agent
+        .map(|(_, s)| s.cost_history.as_slice())
+        .unwrap_or(&[]);
+    let has_predicted = false; // populated when issue #55 ships
+    let cost_height = 1 + 1 + 1 + u16::from(has_predicted) + 1; // label+total+sparkline+predicted+divider
+
+    let has_alerts = !state.policy_alerts.is_empty();
+    let alert_height = if has_alerts {
+        1 + state.policy_alerts.len().min(4) as u16 // label+rows (capped at 4)
     } else {
-        let alert_rows = (state.policy_alerts.len() as u16 + 2).min(5);
-        let chunks =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(alert_rows)]).split(area);
-        (chunks[0], Some(chunks[1]))
+        0
     };
 
-    render_agents(frame, agents_area, state, theme, focused);
+    let agent_count = state.agents.len();
+    let agents_height: u16 = if agent_count == 0 {
+        3 // label + "no agents" + divider
+    } else {
+        1 + (agent_count as u16) * 2 + 1 // label + 2 rows per agent + divider
+    };
 
-    if let Some(alerts_area) = alerts_area {
-        render_alerts(frame, alerts_area, state, theme, focused);
+    let mut constraints = vec![
+        Constraint::Length(agents_height),
+        Constraint::Length(health_height),
+        Constraint::Length(cost_height),
+    ];
+    if has_alerts {
+        constraints.push(Constraint::Length(alert_height));
+    }
+    constraints.push(Constraint::Fill(1)); // empty space sink
+
+    let chunks = Layout::vertical(constraints).split(area);
+
+    render_agents(frame, chunks[0], state, theme);
+    render_health(frame, chunks[1], state, theme, tier2_disabled);
+    render_cost(frame, chunks[2], state, theme, cost_history);
+    if has_alerts {
+        render_alerts(frame, chunks[3], state, theme);
     }
 }
 
-fn render_agents(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, focused: bool) {
-    let border_style = Style::default().fg(if focused {
-        theme.border_focused()
-    } else {
-        theme.border_idle()
-    });
+fn render_agents(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let w = area.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
 
-    let block = Block::default()
-        .title("AGENTS")
-        .borders(Borders::ALL)
-        .border_style(border_style);
+    lines.push(section_label("AGENTS", theme));
 
-    let max_name = (area.width as usize).saturating_sub(5);
+    for (i, (agent_id, agent_state)) in state.agents.iter().enumerate() {
+        let is_selected = state.selected_agent == Some(i);
 
-    let items: Vec<ListItem> = state
-        .agents
-        .iter()
-        .enumerate()
-        .map(|(i, (_, agent_state))| {
-            let indicator = status_indicator(agent_state.agent.status);
-            let indicator_color = match agent_state.agent.status {
-                AgentStatus::Running => theme.health_ok(),
-                AgentStatus::Idle => theme.subtext(),
-                AgentStatus::Paused => theme.health_warn(),
-                AgentStatus::Error => theme.health_crit(),
-            };
+        let indicator = status_indicator(agent_state.agent.status);
+        let indicator_color = match agent_state.agent.status {
+            AgentStatus::Running => theme.health_ok(),
+            AgentStatus::Idle => theme.subtext(),
+            AgentStatus::Paused => theme.health_warn(),
+            AgentStatus::Error => theme.health_crit(),
+        };
 
-            let is_selected = state.selected_agent == Some(i);
-            let name = truncate(&agent_state.agent.name, max_name);
+        let max_name = w.saturating_sub(3);
+        let name = truncate(&agent_state.agent.name, max_name);
 
-            let name_style = if is_selected {
-                Style::default()
-                    .fg(theme.background())
-                    .bg(theme.highlight())
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.text())
-            };
+        let flash_color = state.flash_color(&FlashTarget::AgentRow(agent_id.clone()), theme);
+        let name_style = if is_selected {
+            Style::default()
+                .fg(theme.background())
+                .bg(theme.highlight())
+                .add_modifier(Modifier::BOLD)
+        } else if let Some(c) = flash_color {
+            Style::default().fg(c).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme.text())
+                .add_modifier(Modifier::BOLD)
+        };
 
-            ListItem::new(Line::from(vec![
-                Span::styled(indicator, Style::default().fg(indicator_color)),
-                Span::raw(" "),
-                Span::styled(name, name_style),
-            ]))
-        })
-        .collect();
+        lines.push(Line::from(vec![
+            Span::styled(indicator, Style::default().fg(indicator_color)),
+            Span::raw(" "),
+            Span::styled(name, name_style),
+        ]));
 
-    frame.render_widget(List::new(items).block(block), area);
+        // Sub-line: score + cost + trend for active/paused, idle text for idle
+        let sub = match agent_state.agent.status {
+            AgentStatus::Running | AgentStatus::Paused => {
+                let score_str = state
+                    .health_score
+                    .filter(|_| is_selected)
+                    .map(|s| format!("{}", s.round() as u32))
+                    .unwrap_or_else(|| "--".to_string());
+                let cost_str = format!("${:.3}", agent_state.total_cost);
+                let health_color = state
+                    .health_score
+                    .filter(|_| is_selected)
+                    .map(|s| health_color(s, theme))
+                    .unwrap_or(theme.subtext());
+
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled("\u{25C6}", Style::default().fg(theme.get("blue"))),
+                    Span::styled(
+                        score_str,
+                        Style::default()
+                            .fg(health_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(cost_str, Style::default().fg(theme.subtext())),
+                ];
+                if let Some(trend) = agent_state.cost_trend {
+                    let (arrow, color) = trend_arrow(trend, theme);
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(arrow, Style::default().fg(color)));
+                }
+                Line::from(spans)
+            }
+            AgentStatus::Error => Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "error",
+                    Style::default()
+                        .fg(theme.health_crit())
+                        .add_modifier(Modifier::DIM),
+                ),
+            ]),
+            AgentStatus::Idle => Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("idle \u{00B7} ${:.3}", agent_state.total_cost),
+                    Style::default()
+                        .fg(theme.subtext())
+                        .add_modifier(Modifier::DIM),
+                ),
+            ]),
+        };
+        lines.push(sub);
+    }
+
+    if state.agents.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " no agents",
+            Style::default().fg(theme.subtext()),
+        )));
+    }
+
+    lines.push(divider(area.width, theme));
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(theme.text())),
+        area,
+    );
 }
 
-fn render_alerts(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, focused: bool) {
-    let border_style = Style::default().fg(if focused {
-        theme.border_focused()
-    } else {
-        theme.border_idle()
-    });
+fn render_health(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    tier2_disabled: bool,
+) {
+    let w = area.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
 
-    let block = Block::default()
-        .title("ALERTS")
-        .borders(Borders::ALL)
-        .border_style(border_style);
+    lines.push(section_label("HEALTH", theme));
 
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let flash_color = state.flash_color(&FlashTarget::HealthGauge, theme);
 
-    let max_label = (inner.width as usize).saturating_sub(2);
+    // Gauge row
+    match state.health_score {
+        None => {
+            lines.push(Line::from(Span::styled(
+                format!("{:\u{2500}<width$}", "", width = w.saturating_sub(1)),
+                Style::default().fg(theme.subtext()),
+            )));
+        }
+        Some(score) => {
+            let color = flash_color.unwrap_or_else(|| health_color(score, theme));
+            let score_str = format!(" {}", score.round() as u32);
+            let gauge_w = w.saturating_sub(score_str.len());
+            let filled = ((score.clamp(0.0, 100.0) / 100.0) * gauge_w as f64).round() as usize;
+            let empty = gauge_w.saturating_sub(filled);
 
-    let items: Vec<ListItem> = state
-        .policy_alerts
-        .iter()
-        .rev()
-        .take(inner.height as usize)
-        .map(|(rule_id, _)| {
-            let name = rule_id.strip_prefix("builtin_").unwrap_or(rule_id);
-            let label = if name.len() > max_label {
-                format!("{:.max$}", name, max = max_label)
+            let mut modifier = Modifier::BOLD;
+            if score < 20.0 {
+                modifier |= Modifier::SLOW_BLINK;
+            }
+
+            lines.push(Line::from(vec![
+                Span::styled("\u{2588}".repeat(filled), Style::default().fg(color)),
+                Span::styled(
+                    "\u{2591}".repeat(empty),
+                    Style::default().fg(theme.get("muted")),
+                ),
+                Span::styled(score_str, Style::default().fg(color).add_modifier(modifier)),
+            ]));
+
+            // Status row
+            let band = health_band(score);
+            let mut status_spans = vec![Span::styled(
+                band,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )];
+            if state.health_tier2_pending {
+                status_spans.push(Span::styled(
+                    " \u{00B7} t2 scoring",
+                    Style::default().fg(theme.subtext()),
+                ));
+            }
+            lines.push(Line::from(status_spans));
+        }
+    }
+
+    // Mini-metric rows: indicator first, then name, then value: ✓ faith  0.89 / ⋯ tools  scoring
+    if !tier2_disabled {
+        let metrics = [
+            ("faith", "faithfulness"),
+            ("tools", "tool_selection"),
+            ("hallu", "hallucination_detection"),
+        ];
+
+        let tick = state.streaming.cursor_tick;
+        let pulse_visible = (tick / 4) % 2 == 0;
+
+        for (abbrev, metric_name) in metrics {
+            let is_content_metric =
+                metric_name == "faithfulness" || metric_name == "hallucination_detection";
+            let unavailable = is_content_metric && state.privacy_tier < 2;
+
+            if unavailable {
+                // dim, non-pulsing; fixed row position identifies which metric
+                lines.push(Line::styled(
+                    "\u{2013} capture off",
+                    Style::default().fg(theme.get("muted")),
+                ));
+            } else if let Some(entry) = state.metric_scores.iter().find(|e| e.name == metric_name) {
+                // ✓  faith  0.89
+                let sc = score_color(entry.score, theme);
+                lines.push(Line::from(vec![
+                    Span::styled("\u{2713}", Style::default().fg(theme.health_ok())),
+                    Span::styled(
+                        format!(" {:<5}  ", abbrev),
+                        Style::default().fg(theme.subtext()),
+                    ),
+                    Span::styled(format!("{:.2}", entry.score), Style::default().fg(sc)),
+                ]));
+            } else if state.health_tier2_pending {
+                // Pending: ⋯ pulses chrome/muted; label and "scoring" are dim throughout
+                let pulse = if pulse_visible {
+                    theme.get("blue")
+                } else {
+                    theme.get("muted")
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("\u{22EF}", Style::default().fg(pulse)),
+                    Span::styled(
+                        format!(" {:<5}  scoring", abbrev),
+                        Style::default().fg(theme.get("muted")),
+                    ),
+                ]));
             } else {
-                name.to_string()
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled("\u{26A0} ", Style::default().fg(theme.health_crit())),
-                Span::styled(label, Style::default().fg(theme.text())),
-            ]))
-        })
-        .collect();
+                // Tier 2 finished but no score arrived (skipped or failed in this run)
+                lines.push(Line::styled(
+                    "\u{2013} no result",
+                    Style::default().fg(theme.get("muted")),
+                ));
+            }
+        }
+    }
 
-    frame.render_widget(List::new(items), inner);
+    lines.push(divider(area.width, theme));
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(theme.text())),
+        area,
+    );
+}
+
+fn render_cost(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    cost_history: &[f64],
+) {
+    if area.height == 0 {
+        return;
+    }
+
+    let selected_agent = state
+        .selected_agent
+        .and_then(|i| state.agents.get_index(i))
+        .map(|(_, s)| s);
+
+    let total_cost = selected_agent.map(|s| s.total_cost).unwrap_or(0.0);
+    let cost_trend = selected_agent.and_then(|s| s.cost_trend);
+
+    // Layout: label(1) + total(1) + sparkline(1) + divider(1) = 4 rows minimum
+    let n_rows = area.height;
+    let sparkline_row = 2u16; // 0-indexed within area
+
+    // Label + total lines
+    let label_line = section_label("COST", theme);
+
+    let flash_color = state.flash_color(&FlashTarget::CostTotal, theme);
+    let cost_color = flash_color.unwrap_or_else(|| theme.get("teal"));
+
+    let total_line = Line::from(vec![
+        Span::styled(
+            format!("${:.3}", total_cost),
+            Style::default().fg(cost_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" today", Style::default().fg(theme.subtext())),
+    ]);
+
+    // Render label and total as a paragraph over the first 2 rows
+    let top_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 2,
+    };
+    frame.render_widget(Paragraph::new(vec![label_line, total_line]), top_area);
+
+    // Sparkline row
+    let spark_area = Rect {
+        x: area.x,
+        y: area.y + sparkline_row,
+        width: area.width,
+        height: 1,
+    };
+
+    if !cost_history.is_empty() {
+        let data: Vec<u64> = cost_history
+            .iter()
+            .map(|&c| (c * 10_000.0) as u64)
+            .collect();
+        Sparkline::default()
+            .style(Style::default().fg(theme.get("teal")))
+            .data(data.as_slice())
+            .render(spark_area, frame.buffer_mut());
+    }
+
+    // Trend arrow after sparkline (rendered as a single char at right edge of spark row)
+    if let Some(trend) = cost_trend {
+        let (arrow, color) = trend_arrow(trend, theme);
+        let arrow_x = area.x + area.width.saturating_sub(2);
+        if arrow_x < area.x + area.width {
+            let arrow_area = Rect {
+                x: arrow_x,
+                y: area.y + sparkline_row,
+                width: 1,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(arrow, Style::default().fg(color)))),
+                arrow_area,
+            );
+        }
+    }
+
+    // Divider on last row
+    let divider_y = area.y + n_rows.saturating_sub(1);
+    if divider_y < area.y + area.height {
+        let div_area = Rect {
+            x: area.x,
+            y: divider_y,
+            width: area.width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(divider(area.width, theme)), div_area);
+    }
+}
+
+fn render_alerts(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    let flash_color = state.flash_color(&FlashTarget::AlertSection, theme);
+    let label_color = flash_color.unwrap_or_else(|| theme.get("blue"));
+
+    lines.push(Line::from(Span::styled(
+        "ALERTS",
+        Style::default().fg(label_color),
+    )));
+
+    let max_label = (area.width as usize).saturating_sub(3);
+    let max_rows = area.height.saturating_sub(1) as usize;
+
+    for alert in state.policy_alerts.iter().rev().take(max_rows) {
+        let label = truncate(&alert.description, max_label);
+        lines.push(Line::from(vec![
+            Span::styled("\u{26A0} ", Style::default().fg(theme.health_warn())),
+            Span::styled(label, Style::default().fg(theme.text())),
+        ]));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(theme.text())),
+        area,
+    );
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+fn section_label<'a>(title: &'static str, theme: &Theme) -> Line<'a> {
+    Line::from(Span::styled(title, Style::default().fg(theme.get("blue"))))
+}
+
+fn divider(width: u16, theme: &Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        "\u{2500}".repeat(width as usize),
+        Style::default().fg(theme.surface()),
+    ))
+}
+
+pub fn health_color(score: f64, theme: &Theme) -> ratatui::style::Color {
+    if score >= 80.0 {
+        theme.health_ok()
+    } else if score >= 50.0 {
+        theme.health_warn()
+    } else {
+        theme.health_crit()
+    }
+}
+
+fn health_band(score: f64) -> &'static str {
+    if score >= 80.0 {
+        "HEALTHY"
+    } else if score >= 50.0 {
+        "CAUTION"
+    } else {
+        "CRITICAL"
+    }
+}
+
+fn score_color(score: f64, theme: &Theme) -> ratatui::style::Color {
+    if score >= 0.8 {
+        theme.health_ok()
+    } else if score >= 0.6 {
+        theme.health_warn()
+    } else {
+        theme.health_crit()
+    }
+}
+
+fn trend_arrow(trend: CostTrend, theme: &Theme) -> (&'static str, ratatui::style::Color) {
+    match trend {
+        CostTrend::Accelerating => ("\u{2191}", theme.health_warn()),
+        CostTrend::Stable => ("", theme.subtext()),
+        CostTrend::Decelerating => ("\u{2193}", theme.health_ok()),
+    }
 }
 
 fn status_indicator(status: AgentStatus) -> &'static str {
     match status {
-        AgentStatus::Running => "●",
-        AgentStatus::Idle => "○",
-        AgentStatus::Paused => "⏸",
-        AgentStatus::Error => "✗",
+        AgentStatus::Running => "\u{25CF}",
+        AgentStatus::Idle => "\u{25CB}",
+        AgentStatus::Paused => "\u{23F8}",
+        AgentStatus::Error => "\u{2717}",
     }
 }
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
+    } else if max > 1 {
+        format!("{}\u{2026}", &s[..max.saturating_sub(1)])
     } else {
-        format!("{:.max$}", s, max = max.saturating_sub(1)) + "…"
+        s[..max].to_string()
     }
 }

@@ -5,6 +5,7 @@ name = "mocha"
 
 [colors]
 background   = "#1e1e2e"
+mantle       = "#181825"
 surface      = "#313244"
 overlay      = "#45475a"
 muted        = "#585b70"
@@ -45,3 +46,4 @@ border_focused = "blue"
 border_idle    = "overlay"
 highlight      = "mauve"
 cursor         = "rosewater"
+chrome_bg      = "mantle"

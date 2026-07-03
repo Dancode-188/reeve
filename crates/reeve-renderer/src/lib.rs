@@ -88,6 +88,7 @@ async fn run_inner(
 
                 app.state.streaming.cursor_tick =
                     app.state.streaming.cursor_tick.wrapping_add(1);
+                app.state.advance_flash();
 
                 terminal.draw(|frame| {
                     let full = layout::compute_full(frame.area());

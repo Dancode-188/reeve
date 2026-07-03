@@ -1,10 +1,10 @@
 use crate::theme::Theme;
 use ratatui::{
     Frame,
-    layout::Rect,
-    style::Style,
+    layout::{Alignment, Constraint, Layout, Rect},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Paragraph},
 };
 
 pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, right_hidden: bool, left_hidden: bool) {
@@ -12,41 +12,65 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, right_hidden: bool, 
         return;
     }
 
-    let key = Style::default().fg(theme.text());
-    let sep = Style::default().fg(theme.subtext());
+    let chrome_style = Style::default().bg(theme.chrome_bg());
+    frame.render_widget(Block::default().style(chrome_style), area);
+
+    let kb = Style::default()
+        .fg(theme.get("blue"))
+        .add_modifier(Modifier::BOLD);
+    let action = Style::default().fg(theme.subtext());
+    let bracket = Style::default().fg(theme.subtext());
     let warn = Style::default().fg(theme.health_warn());
 
-    let line = if left_hidden {
-        // Both panels are hidden — terminal is very narrow, keep hints minimal.
-        Line::from(vec![
-            Span::raw(" "),
-            Span::styled("j/k", key),
-            Span::styled(" navigate", sep),
-            Span::styled("   ?", key),
-            Span::styled(" help", sep),
-            Span::styled("   q", key),
-            Span::styled(" quit", sep),
-            Span::styled("   [AGENTS ◁  SPAN ▷]", warn),
-        ])
+    let groups: Vec<Line> = if left_hidden {
+        vec![
+            key_group("[j/k]", "nav", &kb, &action, &bracket),
+            key_group("[?]", "help", &kb, &action, &bracket),
+            key_group("[q]", "quit", &kb, &action, &bracket),
+        ]
     } else {
-        let mut spans = vec![
-            Span::raw(" "),
-            Span::styled("j/k", key),
-            Span::styled(" navigate", sep),
-            Span::styled("   h/l", key),
-            Span::styled(" switch panel", sep),
-            Span::styled("   Enter", key),
-            Span::styled(" expand/fold", sep),
-            Span::styled("   ?", key),
-            Span::styled(" help", sep),
-            Span::styled("   q", key),
-            Span::styled(" quit", sep),
+        let mut g = vec![
+            key_group("[j/k]", "nav", &kb, &action, &bracket),
+            key_group("[h/l]", "panels", &kb, &action, &bracket),
+            key_group("[Enter]", "fold", &kb, &action, &bracket),
+            key_group("[?]", "help", &kb, &action, &bracket),
+            key_group("[q]", "quit", &kb, &action, &bracket),
         ];
         if right_hidden {
-            spans.push(Span::styled("   [SPAN ▷]", warn));
+            g.push(Line::from(Span::styled("SPAN \u{25B7}", warn)));
         }
-        Line::from(spans)
+        g
     };
 
-    frame.render_widget(Paragraph::new(line), area);
+    let n = groups.len();
+    let constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Fill(1)).collect();
+    let chunks = Layout::horizontal(constraints).split(area);
+
+    for (chunk, line) in chunks.iter().zip(groups) {
+        frame.render_widget(
+            Paragraph::new(line)
+                .alignment(Alignment::Center)
+                .style(chrome_style),
+            *chunk,
+        );
+    }
+}
+
+fn key_group<'a>(
+    key: &'a str,
+    label: &'a str,
+    kb: &'a Style,
+    action: &'a Style,
+    bracket: &'a Style,
+) -> Line<'a> {
+    let open = &key[..1];
+    let close = &key[key.len() - 1..];
+    let inner = &key[1..key.len() - 1];
+    Line::from(vec![
+        Span::styled(open, *bracket),
+        Span::styled(inner, *kb),
+        Span::styled(close, *bracket),
+        Span::raw(" "),
+        Span::styled(label, *action),
+    ])
 }

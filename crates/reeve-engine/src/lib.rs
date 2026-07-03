@@ -36,6 +36,7 @@ pub async fn run(
     let _ = engine_tx.send(EngineEvent::EvaluationBackendReady {
         backend: backend_name,
         reason: backend_reason,
+        privacy_tier: 1,
     });
     let judge = Arc::new(LlmJudge::new(backend));
 
@@ -142,10 +143,12 @@ pub async fn run(
                         now_ms,
                     );
                     for fr in fired {
-                        let (rule_id_str, cmd_type, requires_confirmation) = alert_fields(&fr);
+                        let (rule_id_str, description, cmd_type, requires_confirmation) =
+                            alert_fields(&fr);
                         let rule_id_owned = rule_id_str.to_string();
                         let _ = engine_tx.send(EngineEvent::PolicyAlert {
                             rule_id: rule_id_owned.clone(),
+                            description: description.to_string(),
                             command_type: cmd_type.to_string(),
                             requires_confirmation,
                         });
