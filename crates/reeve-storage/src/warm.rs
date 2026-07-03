@@ -23,7 +23,10 @@ pub enum StorageError {
 
 /// Embedded at compile time so the binary doesn't depend on a migrations
 /// directory existing next to wherever it's installed.
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../../../migrations/0001_initial.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../../../migrations/0001_initial.sql")),
+    (2, include_str!("../../../migrations/0002_cot_json.sql")),
+];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -138,6 +141,7 @@ fn row_to_evaluation_result(row: &Row) -> rusqlite::Result<EvaluationResult> {
         evaluator: text_to_enum::<EvaluatorType>(&evaluator).map_err(rusqlite_serde_err)?,
         evaluated_at: row.get("evaluated_at")?,
         judge_model_version: row.get("judge_model_version")?,
+        cot_json: row.get("cot_json")?,
     })
 }
 
@@ -401,8 +405,8 @@ impl WarmStore {
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT INTO evaluation_results
-                    (id, target_id, target_type, metric, score, evaluator, judge_model_version, evaluated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    (id, target_id, target_type, metric, score, evaluator, judge_model_version, evaluated_at, cot_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     result.id.as_str(),
                     result.target_id,
@@ -412,6 +416,7 @@ impl WarmStore {
                     evaluator,
                     result.judge_model_version,
                     result.evaluated_at,
+                    result.cot_json,
                 ],
             )?;
             Ok(())
@@ -646,15 +651,17 @@ mod tests {
         insert_test_agent(&store, "agent-1").await;
         store.save_trace(trace("t1")).await.unwrap();
 
+        let cot = r#"{"claims":["sky is blue"],"supported":["sky is blue"],"unsupported":[]}"#;
         let result = EvaluationResult {
             id: "ev1".into(),
             target_id: "t1".to_string(),
             target_type: TT::Trace,
-            metric: "loop_detection".to_string(),
+            metric: "faithfulness".to_string(),
             score: 0.9,
-            evaluator: ET::Heuristic,
+            evaluator: ET::LlmJudge,
             evaluated_at: 10,
-            judge_model_version: None,
+            judge_model_version: Some("phi4-mini".to_string()),
+            cot_json: Some(cot.to_string()),
         };
         store.save_evaluation_result(result).await.unwrap();
 
@@ -663,9 +670,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.metric, "loop_detection");
-        assert_eq!(loaded.evaluator, ET::Heuristic);
+        assert_eq!(loaded.metric, "faithfulness");
+        assert_eq!(loaded.evaluator, ET::LlmJudge);
         assert_eq!(loaded.score, 0.9);
+        assert_eq!(loaded.cot_json.as_deref(), Some(cot));
     }
 
     #[tokio::test]

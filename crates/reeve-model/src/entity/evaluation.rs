@@ -32,4 +32,7 @@ pub struct EvaluationResult {
     /// Stored for historical comparison integrity even after the judge
     /// model changes.
     pub judge_model_version: Option<String>,
+    /// Chain-of-thought breakdown for faithfulness and hallucination_detection.
+    /// JSON blob with keys: claims, supported, unsupported.
+    pub cot_json: Option<String>,
 }

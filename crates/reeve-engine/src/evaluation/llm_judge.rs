@@ -38,10 +38,13 @@ struct OllamaGenerateResponse {
     response: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct JudgeResult {
     pub score: f64,
     pub confidence: EvaluationConfidence,
+    /// Populated for faithfulness and hallucination_detection when the model
+    /// returned the structured CoT format. Keys: claims, supported, unsupported.
+    pub cot_json: Option<String>,
 }
 
 /// Probe for Ollama at the default endpoint. Returns the appropriate backend.
@@ -101,17 +104,21 @@ impl LlmJudge {
     }
 
     /// Run all three Tier 2 evaluators against the completed trace spans.
-    /// Returns `(metric_name, score, confidence)` for each metric that
-    /// produced a result. Metrics requiring content return nothing under
-    /// privacy tier 1 because span content is null.
+    /// Returns `(metric_name, score, confidence, cot_json)` for each metric
+    /// that produced a result. Metrics requiring content return nothing under
+    /// privacy tier 1 because span content is null. `cot_json` is Some only
+    /// for faithfulness and hallucination_detection when the model returned
+    /// the structured CoT format.
     pub async fn evaluate_trace(
         &self,
         spans: &[InternalSpan],
-    ) -> Vec<(&'static str, f64, EvaluationConfidence)> {
+    ) -> Vec<(&'static str, f64, EvaluationConfidence, Option<String>)> {
         let (endpoint, model) = match &self.backend {
             JudgeBackend::Local { endpoint, model } => (endpoint.as_str(), model.as_str()),
             JudgeBackend::Disabled { .. } => return vec![],
         };
+
+        let cot_schema = r#"{"claims": ["<each factual claim in the response>"], "supported": ["<claims grounded in context>"], "unsupported": ["<claims not grounded in context>"], "score": <0.0-1.0>, "reason": "<explanation>"}"#;
 
         let mut results = Vec::new();
 
@@ -136,7 +143,7 @@ impl LlmJudge {
                 .run_with_consistency(endpoint, model, &prompt_a, &prompt_b)
                 .await
             {
-                results.push(("tool_selection", r.score, r.confidence));
+                results.push(("tool_selection", r.score, r.confidence, r.cot_json));
             }
         }
 
@@ -147,42 +154,42 @@ impl LlmJudge {
                 "Does the following response use only information from the provided \
                  context? Score 0.0 if it introduces unsupported claims, 1.0 if \
                  fully grounded.\n\nContext: {}\n\nResponse: {}\n\n\
-                 Return JSON: {{\"score\": <number>, \"reason\": \"<explanation>\"}}",
-                context, content
+                 Return JSON: {}",
+                context, content, cot_schema
             );
             let faith_b = format!(
                 "Evaluate whether this response stays faithful to the given context. \
                  Score 0.0 if it fabricates information not in the context, 1.0 if \
                  entirely grounded.\n\nContext: {}\n\nResponse: {}\n\n\
-                 Return JSON: {{\"score\": <number>, \"reason\": \"<explanation>\"}}",
-                context, content
+                 Return JSON: {}",
+                context, content, cot_schema
             );
             if let Some(r) = self
                 .run_with_consistency(endpoint, model, &faith_a, &faith_b)
                 .await
             {
-                results.push(("faithfulness", r.score, r.confidence));
+                results.push(("faithfulness", r.score, r.confidence, r.cot_json));
             }
 
             let hall_a = format!(
                 "Does this response introduce claims not supported by the context? \
                  Score 0.0 if hallucinations are present, 1.0 if fully accurate.\n\n\
                  Context: {}\n\nResponse: {}\n\n\
-                 Return JSON: {{\"score\": <number>, \"reason\": \"<explanation>\"}}",
-                context, content
+                 Return JSON: {}",
+                context, content, cot_schema
             );
             let hall_b = format!(
                 "Identify any hallucinated content in this response not supported by \
                  the context. Score 0.0 if hallucinations are present, 1.0 if all \
                  claims are grounded.\n\nContext: {}\n\nResponse: {}\n\n\
-                 Return JSON: {{\"score\": <number>, \"reason\": \"<explanation>\"}}",
-                context, content
+                 Return JSON: {}",
+                context, content, cot_schema
             );
             if let Some(r) = self
                 .run_with_consistency(endpoint, model, &hall_a, &hall_b)
                 .await
             {
-                results.push(("hallucination_detection", r.score, r.confidence));
+                results.push(("hallucination_detection", r.score, r.confidence, r.cot_json));
             }
         }
 
@@ -196,8 +203,8 @@ impl LlmJudge {
         prompt_a: &str,
         prompt_b: &str,
     ) -> Option<JudgeResult> {
-        let score_a = self.run_single(endpoint, model, prompt_a).await?;
-        let score_b = self.run_single(endpoint, model, prompt_b).await?;
+        let (score_a, cot_a) = self.run_single(endpoint, model, prompt_a).await?;
+        let (score_b, cot_b) = self.run_single(endpoint, model, prompt_b).await?;
         let score = (score_a + score_b) / 2.0;
         let divergence = (score_a - score_b).abs();
         let confidence = if divergence < CONFIDENCE_HIGH_THRESHOLD {
@@ -207,16 +214,26 @@ impl LlmJudge {
         } else {
             EvaluationConfidence::Low
         };
-        Some(JudgeResult { score, confidence })
+        let cot_json = cot_a.or(cot_b);
+        Some(JudgeResult {
+            score,
+            confidence,
+            cot_json,
+        })
     }
 
-    async fn run_single(&self, endpoint: &str, model: &str, prompt: &str) -> Option<f64> {
+    async fn run_single(
+        &self,
+        endpoint: &str,
+        model: &str,
+        prompt: &str,
+    ) -> Option<(f64, Option<String>)> {
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(2u64.pow(attempt - 1))).await;
             }
             match self.call_ollama(endpoint, model, prompt).await {
-                Ok(score) => return Some(score),
+                Ok(result) => return Some(result),
                 Err(e) => {
                     tracing::debug!(attempt, error = %e, "ollama call failed");
                 }
@@ -229,7 +246,12 @@ impl LlmJudge {
         None
     }
 
-    async fn call_ollama(&self, endpoint: &str, model: &str, prompt: &str) -> Result<f64, String> {
+    async fn call_ollama(
+        &self,
+        endpoint: &str,
+        model: &str,
+        prompt: &str,
+    ) -> Result<(f64, Option<String>), String> {
         let body = serde_json::json!({
             "model": model,
             "prompt": prompt,
@@ -244,8 +266,26 @@ impl LlmJudge {
             .await
             .map_err(|e| e.to_string())?;
         let ollama_resp: OllamaGenerateResponse = resp.json().await.map_err(|e| e.to_string())?;
-        parse_score(&ollama_resp.response)
+        let text = &ollama_resp.response;
+        if let Some((score, cot)) = parse_cot(text) {
+            return Ok((score, Some(cot)));
+        }
+        parse_score(text).map(|s| (s, None))
     }
+}
+
+fn parse_cot(text: &str) -> Option<(f64, String)> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let score = v.get("score")?.as_f64()?.clamp(0.0, 1.0);
+    if v.get("claims").is_none() && v.get("supported").is_none() && v.get("unsupported").is_none() {
+        return None;
+    }
+    let cot = serde_json::json!({
+        "claims": v.get("claims").cloned().unwrap_or(serde_json::json!([])),
+        "supported": v.get("supported").cloned().unwrap_or(serde_json::json!([])),
+        "unsupported": v.get("unsupported").cloned().unwrap_or(serde_json::json!([])),
+    });
+    Some((score, cot.to_string()))
 }
 
 fn parse_score(text: &str) -> Result<f64, String> {
@@ -351,6 +391,38 @@ mod tests {
             attributes: attrs,
             raw_attributes: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn parse_cot_extracts_structured_response() {
+        let json = r#"{"claims":["sky is blue"],"supported":["sky is blue"],"unsupported":[],"score":0.9,"reason":"ok"}"#;
+        let (score, cot) = parse_cot(json).unwrap();
+        assert!((score - 0.9).abs() < 0.001);
+        let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
+        assert_eq!(v["claims"][0], "sky is blue");
+        assert!(v["unsupported"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_cot_returns_none_for_flat_format() {
+        let json = r#"{"score": 0.8, "reason": "looks fine"}"#;
+        assert!(parse_cot(json).is_none());
+    }
+
+    #[test]
+    fn parse_cot_clamps_score() {
+        let json = r#"{"claims":["x"],"supported":["x"],"unsupported":[],"score":1.5}"#;
+        let (score, _) = parse_cot(json).unwrap();
+        assert!((score - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_cot_strips_extra_fields() {
+        let json = r#"{"claims":["a"],"supported":["a"],"unsupported":[],"score":0.7,"reason":"r","extra":"ignored"}"#;
+        let (_, cot) = parse_cot(json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
+        assert!(v.get("extra").is_none());
+        assert!(v.get("reason").is_none());
     }
 
     #[test]
