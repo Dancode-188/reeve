@@ -33,16 +33,43 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, as
     if area.width == 0 {
         return;
     }
-
     let _ = ascii;
 
-    if state.metric_scores.is_empty() {
-        render_span_detail(frame, area, state, theme);
-    } else {
-        let sdh = span_detail_height(state);
-        let chunks = Layout::vertical([Constraint::Length(sdh), Constraint::Fill(1)]).split(area);
-        render_span_detail(frame, chunks[0], state, theme);
-        render_quality(frame, chunks[1], state, theme);
+    let sdh = span_detail_height(state);
+    let ctx_h = ctx_window_height(state);
+    let has_quality = !state.metric_scores.is_empty();
+
+    match (ctx_h, has_quality) {
+        (0, false) => {
+            render_span_detail(frame, area, state, theme);
+        }
+        (0, true) => {
+            let chunks =
+                Layout::vertical([Constraint::Length(sdh), Constraint::Fill(1)]).split(area);
+            render_span_detail(frame, chunks[0], state, theme);
+            render_quality(frame, chunks[1], state, theme);
+        }
+        (h, false) => {
+            let chunks = Layout::vertical([
+                Constraint::Length(sdh),
+                Constraint::Length(h),
+                Constraint::Fill(1),
+            ])
+            .split(area);
+            render_span_detail(frame, chunks[0], state, theme);
+            render_ctx_window(frame, chunks[1], state, theme);
+        }
+        (h, true) => {
+            let chunks = Layout::vertical([
+                Constraint::Length(sdh),
+                Constraint::Length(h),
+                Constraint::Fill(1),
+            ])
+            .split(area);
+            render_span_detail(frame, chunks[0], state, theme);
+            render_ctx_window(frame, chunks[1], state, theme);
+            render_quality(frame, chunks[2], state, theme);
+        }
     }
 }
 
@@ -74,6 +101,99 @@ fn span_detail_height(state: &AppState) -> u16 {
             h + 1 // divider
         }
     }
+}
+
+fn ctx_window_height(state: &AppState) -> u16 {
+    let span = state
+        .trace
+        .as_ref()
+        .and_then(|tv| tv.selected.as_ref().and_then(|id| tv.spans.get(id)));
+    let span = match span {
+        Some(s) => s,
+        None => return 0,
+    };
+    if span
+        .attributes
+        .get("gen_ai.usage.input_tokens")
+        .and_then(|v| v.as_u64())
+        .is_none()
+    {
+        return 0;
+    }
+    let model = span
+        .attributes
+        .get("gen_ai.request.model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if crate::context_windows::context_window_for_model(model).is_some() {
+        4 // label + gauge + count + divider
+    } else {
+        3 // label + count + divider (no gauge for unknown model)
+    }
+}
+
+fn render_ctx_window(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let span = match state
+        .trace
+        .as_ref()
+        .and_then(|tv| tv.selected.as_ref().and_then(|id| tv.spans.get(id)))
+    {
+        Some(s) => s,
+        None => return,
+    };
+    let tok_in = match span
+        .attributes
+        .get("gen_ai.usage.input_tokens")
+        .and_then(|v| v.as_u64())
+    {
+        Some(t) => t,
+        None => return,
+    };
+    let model = span
+        .attributes
+        .get("gen_ai.request.model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let window = crate::context_windows::context_window_for_model(model);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(section_label("CTX WINDOW", theme));
+
+    if let Some(max_tokens) = window {
+        let pct = (tok_in as f64 / max_tokens as f64).clamp(0.0, 1.0);
+        let (bar_color, warn) = if pct >= 0.95 {
+            (theme.health_crit(), " \u{26A0}")
+        } else if pct >= 0.85 {
+            (theme.health_warn(), " \u{26A0}")
+        } else {
+            (theme.health_ok(), "")
+        };
+        lines.push(Line::from(vec![
+            Span::styled(score_bar(pct), Style::default().fg(bar_color)),
+            Span::raw(" "),
+            Span::styled(
+                format!("{:.0}%", pct * 100.0),
+                Style::default().fg(bar_color),
+            ),
+            Span::styled(warn, Style::default().fg(bar_color)),
+        ]));
+        lines.push(Line::styled(
+            format!(
+                "{} / {} tok",
+                format_tokens(tok_in),
+                format_tokens(u64::from(max_tokens))
+            ),
+            Style::default().fg(theme.get("muted")),
+        ));
+    } else {
+        lines.push(Line::styled(
+            format!("{} tok", format_tokens(tok_in)),
+            Style::default().fg(theme.get("muted")),
+        ));
+    }
+
+    lines.push(divider(area.width, theme));
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_quality(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -376,7 +496,14 @@ fn fmt_dur(ms: i64) -> String {
 }
 
 fn format_tokens(n: u64) -> String {
-    if n >= 1_000 {
+    if n >= 1_000_000 {
+        format!(
+            "{},{:03},{:03}",
+            n / 1_000_000,
+            (n / 1_000) % 1_000,
+            n % 1_000
+        )
+    } else if n >= 1_000 {
         format!("{},{:03}", n / 1_000, n % 1_000)
     } else {
         format!("{}", n)
