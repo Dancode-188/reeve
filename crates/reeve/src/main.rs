@@ -58,9 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(reeve_ingestion::serve(addr, warm.clone(), ingestion_tx));
     tokio::spawn(reeve_engine::run(
         engine_ingestion_rx,
-        engine_event_tx,
+        engine_event_tx.clone(),
         warm.clone(),
     ));
+    let _control_server = reeve_intervention::server::run(engine_event_tx.clone()).await;
     reeve_renderer::run(ingestion_rx, engine_event_rx, warm, ascii_mode).await?;
 
     Ok(())

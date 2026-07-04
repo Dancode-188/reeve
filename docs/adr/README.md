@@ -27,6 +27,7 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0020](./0020-composite-health-score.md) | Composite Health Score Design | Accepted | 2026-06-30 |
 | [0021](./0021-tier2-llm-judge.md) | Tier 2 LLM Judge via Ollama with Self-Consistency Scoring | Accepted | 2026-06-30 |
 | [0022](./0022-evalexpr-policy-dsl.md) | evalexpr for Policy Rule Conditions | Accepted | 2026-06-30 |
+| [0023](./0023-grpc-control-channel-protocol.md) | gRPC Control Channel Protocol | Accepted | 2026-07-04 |
 
 ## Format
 

@@ -364,6 +364,10 @@ impl App {
                     .flash_targets
                     .insert(FlashTarget::AlertSection, (FlashDirection::Alert, 2));
             }
+            EngineEvent::AgentControlConnected { .. }
+            | EngineEvent::AgentControlDisconnected { .. } => {
+                // Intervention overlay state is not yet wired (#61).
+            }
         }
     }
 

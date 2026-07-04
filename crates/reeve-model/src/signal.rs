@@ -88,4 +88,14 @@ pub enum EngineEvent {
         command_type: String,
         requires_confirmation: bool,
     },
+    /// An agent completed the gRPC handshake on the control channel.
+    /// `capabilities` lists which command types the adapter supports
+    /// (e.g. "pause", "redirect").
+    AgentControlConnected {
+        agent_id: AgentId,
+        capabilities: Vec<String>,
+    },
+    AgentControlDisconnected {
+        agent_id: AgentId,
+    },
 }

@@ -4,3 +4,13 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
+reeve-model = { path = "../reeve-model" }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+tonic = { workspace = true }
+tonic-prost = "0.14"
+prost = "0.14"
+tracing = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
