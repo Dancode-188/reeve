@@ -1409,6 +1409,7 @@ version = "0.2.0"
 dependencies = [
  "prost",
  "reeve-model",
+ "reeve-storage",
  "tokio",
  "tokio-stream",
  "tonic",

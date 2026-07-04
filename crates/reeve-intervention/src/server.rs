@@ -2,6 +2,8 @@ use crate::proto::{
     self, agent_message, control_message, reeve_control_server::ReeveControl,
     reeve_control_server::ReeveControlServer,
 };
+use crate::types::AckNotification;
+use reeve_model::entity::intervention::AckStatus;
 use reeve_model::ids::AgentId;
 use reeve_model::signal::EngineEvent;
 use std::collections::HashMap;
@@ -23,6 +25,7 @@ struct AgentStreamEntry {
 pub struct ControlServer {
     connected: Arc<Mutex<HashMap<AgentId, AgentStreamEntry>>>,
     engine_tx: broadcast::Sender<EngineEvent>,
+    ack_sink: Arc<Mutex<Option<mpsc::Sender<AckNotification>>>>,
 }
 
 impl ControlServer {
@@ -30,7 +33,15 @@ impl ControlServer {
         Self {
             connected: Arc::new(Mutex::new(HashMap::new())),
             engine_tx,
+            ack_sink: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Register a channel through which the server forwards `CommandAck`
+    /// messages to the dispatcher. Call this once after the dispatcher is
+    /// constructed.
+    pub fn register_ack_sink(&self, tx: mpsc::Sender<AckNotification>) {
+        *self.ack_sink.lock().unwrap() = Some(tx);
     }
 
     /// Send a control message to a connected agent. Returns `true` if the
@@ -127,6 +138,7 @@ impl ReeveControl for ControlServer {
 
         let connected = self.connected.clone();
         let engine_tx = self.engine_tx.clone();
+        let ack_sink = self.ack_sink.clone();
 
         tokio::spawn(async move {
             while let Ok(Some(msg)) = inbound.message().await {
@@ -143,6 +155,16 @@ impl ReeveControl for ControlServer {
                             status = ack.status,
                             "command ack received",
                         );
+                        if let Some(status) = proto_ack_to_domain(ack.status) {
+                            let sink = ack_sink.lock().unwrap().clone();
+                            if let Some(tx) = sink {
+                                let _ = tx.try_send(AckNotification {
+                                    command_id: ack.command_id.as_str().into(),
+                                    agent_id: agent_id.clone(),
+                                    status,
+                                });
+                            }
+                        }
                     }
                     Some(agent_message::Payload::NtpFollowup(f)) => {
                         tracing::debug!(
@@ -191,11 +213,30 @@ pub async fn run(engine_tx: broadcast::Sender<EngineEvent>) -> Arc<ControlServer
     handle
 }
 
+fn proto_ack_to_domain(status: i32) -> Option<AckStatus> {
+    match status {
+        1 => Some(AckStatus::Received),
+        2 => Some(AckStatus::Applying),
+        3 => Some(AckStatus::Applied),
+        4 => Some(AckStatus::Failed),
+        5 => Some(AckStatus::Expired),
+        6 => Some(AckStatus::Cancelled),
+        _ => None,
+    }
+}
+
 fn current_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// Create an `Arc<ControlServer>` without binding any port. For use in
+/// unit tests that need a real server handle but not a live gRPC socket.
+#[cfg(test)]
+pub fn new_for_test(engine_tx: broadcast::Sender<EngineEvent>) -> Arc<ControlServer> {
+    Arc::new(ControlServer::new(engine_tx))
 }
 
 #[cfg(test)]

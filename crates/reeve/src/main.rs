@@ -61,7 +61,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine_event_tx.clone(),
         warm.clone(),
     ));
-    let _control_server = reeve_intervention::server::run(engine_event_tx.clone()).await;
+    let control_server = reeve_intervention::server::run(engine_event_tx.clone()).await;
+    let audit_path = db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("audit.log");
+    let _dispatcher =
+        reeve_intervention::dispatcher::Dispatcher::new(control_server, warm.clone(), audit_path);
     reeve_renderer::run(ingestion_rx, engine_event_rx, warm, ascii_mode).await?;
 
     Ok(())
