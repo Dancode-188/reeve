@@ -1,6 +1,7 @@
 use reeve_model::entity::{
     Agent, AgentStatus, CommandStatus, EvaluationResult, EvaluatorType, EventType, IntegrationPath,
-    InternalSpan, InterventionCommand, SpanEvent, SpanStatus, TargetType, Trace, TraceStatus,
+    InternalSpan, InterventionCommand, InterventionOutcome, SpanEvent, SpanStatus, TargetType,
+    Trace, TraceStatus,
 };
 use reeve_model::ids::{AgentId, CommandId, EvalId, SpanId, TraceId};
 use rusqlite::{Connection, Row, params};
@@ -160,6 +161,19 @@ fn row_to_intervention_command(row: &Row) -> rusqlite::Result<InterventionComman
         acknowledged_at: row.get("acknowledged_at")?,
         issued_by: row.get("issued_by")?,
         valid_until_ms: row.get("valid_until_ms")?,
+    })
+}
+
+fn row_to_intervention_outcome(row: &Row) -> rusqlite::Result<InterventionOutcome> {
+    Ok(InterventionOutcome {
+        id: row.get("id")?,
+        command_id: row.get::<_, String>("command_id")?.into(),
+        trace_id: row.get::<_, String>("trace_id")?.into(),
+        pre_intervention_score: row.get("pre_intervention_score")?,
+        post_intervention_score: row.get("post_intervention_score")?,
+        delta: row.get("delta")?,
+        spans_measured: row.get("spans_measured")?,
+        measured_at: row.get("measured_at")?,
     })
 }
 
@@ -510,6 +524,64 @@ impl WarmStore {
         .await
     }
 
+    /// Persist an agent record. Callers from the control channel use this to
+    /// ensure agent identities survive server restarts independent of whether
+    /// the agent also sends OTel spans. Delegates to `upsert_agent`.
+    pub async fn save_agent(&self, agent: Agent) -> Result<(), StorageError> {
+        self.upsert_agent(agent).await
+    }
+
+    pub async fn save_intervention_outcome(
+        &self,
+        outcome: InterventionOutcome,
+    ) -> Result<(), StorageError> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO intervention_outcomes
+                    (id, command_id, trace_id, pre_intervention_score,
+                     post_intervention_score, delta, spans_measured, measured_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                    post_intervention_score = excluded.post_intervention_score,
+                    delta                   = excluded.delta,
+                    spans_measured          = excluded.spans_measured,
+                    measured_at             = excluded.measured_at",
+                params![
+                    outcome.id,
+                    outcome.command_id.as_str(),
+                    outcome.trace_id.as_str(),
+                    outcome.pre_intervention_score,
+                    outcome.post_intervention_score,
+                    outcome.delta,
+                    outcome.spans_measured,
+                    outcome.measured_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn get_intervention_outcome(
+        &self,
+        command_id: &CommandId,
+    ) -> Result<Option<InterventionOutcome>, StorageError> {
+        let command_id = command_id.clone();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT * FROM intervention_outcomes WHERE command_id = ?1",
+                params![command_id.as_str()],
+                row_to_intervention_outcome,
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
+        })
+        .await
+    }
+
     pub async fn list_spans_for_trace(
         &self,
         trace_id: &TraceId,
@@ -531,20 +603,16 @@ mod tests {
     use reeve_model::ids::{AgentId, CommandId, EvalId, SpanId, TraceId};
     use std::collections::HashMap as Map;
 
-    /// `save_agent` is deliberately out of scope for this crate's first
-    /// pass (see the issue), but `traces.agent_id` has a real foreign key
-    /// constraint, so tests insert the minimum row directly rather than
-    /// adding a public method that wasn't promised.
     async fn insert_test_agent(store: &WarmStore, id: &str) {
-        let id = id.to_string();
         store
-            .with_conn(move |conn| {
-                conn.execute(
-                    "INSERT INTO agents (id, name, framework, integration, status, first_seen_at, last_seen_at)
-                     VALUES (?1, 'test-agent', 'custom', 'sdk', 'idle', 0, 0)",
-                    params![id],
-                )?;
-                Ok(())
+            .save_agent(Agent {
+                id: id.into(),
+                name: "test-agent".to_string(),
+                framework: "custom".to_string(),
+                integration: IntegrationPath::Sdk,
+                status: AgentStatus::Idle,
+                first_seen_at: 0,
+                last_seen_at: 0,
             })
             .await
             .unwrap();
@@ -574,6 +642,22 @@ mod tests {
             arrived_at: 5,
             attributes: serde_json::json!({"k": "v"}),
             raw_attributes: Map::new(),
+        }
+    }
+
+    fn make_command(id: &str, trace_id: &str) -> InterventionCommand {
+        InterventionCommand {
+            id: id.into(),
+            trace_id: trace_id.into(),
+            span_id: None,
+            policy_id: None,
+            command_type: CT::Pause,
+            status: CommandStatus::Pending,
+            requires_confirmation: false,
+            issued_at: 0,
+            acknowledged_at: None,
+            issued_by: "human".to_string(),
+            valid_until_ms: i64::MAX,
         }
     }
 
@@ -731,5 +815,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn save_agent_round_trips() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-rt").await;
+        let agents = store.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id.as_str(), "agent-rt");
+    }
+
+    #[tokio::test]
+    async fn save_agent_upserts_on_conflict() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-u").await;
+        store
+            .save_agent(Agent {
+                id: "agent-u".into(),
+                name: "updated".to_string(),
+                framework: "custom".to_string(),
+                integration: IntegrationPath::Sdk,
+                status: AgentStatus::Running,
+                first_seen_at: 0,
+                last_seen_at: 100,
+            })
+            .await
+            .unwrap();
+        let agents = store.list_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status, AgentStatus::Running);
+        assert_eq!(agents[0].last_seen_at, 100);
+    }
+
+    #[tokio::test]
+    async fn intervention_outcome_round_trips() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t1")).await.unwrap();
+        store
+            .save_intervention_command(make_command("cmd-1", "t1"))
+            .await
+            .unwrap();
+
+        let outcome = InterventionOutcome {
+            id: "out-1".to_string(),
+            command_id: "cmd-1".into(),
+            trace_id: "t1".into(),
+            pre_intervention_score: Some(40.0),
+            post_intervention_score: Some(75.0),
+            delta: Some(35.0),
+            spans_measured: Some(4),
+            measured_at: 999,
+        };
+        store
+            .save_intervention_outcome(outcome.clone())
+            .await
+            .unwrap();
+
+        let loaded = store
+            .get_intervention_outcome(&CommandId::from("cmd-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.id, "out-1");
+        assert_eq!(loaded.delta, Some(35.0));
+        assert_eq!(loaded.spans_measured, Some(4));
+    }
+
+    #[tokio::test]
+    async fn get_intervention_outcome_missing_returns_none() {
+        let store = WarmStore::open_in_memory().unwrap();
+        let result = store
+            .get_intervention_outcome(&CommandId::from("no-such"))
+            .await
+            .unwrap();
+        assert!(result.is_none());
     }
 }
