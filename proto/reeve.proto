@@ -7,23 +7,92 @@ package reeve;
 // Observation data goes through the OTel channel (ports 4317/4318), not here.
 
 service ReeveControl {
-  // Bidirectional stream: server sends commands, client sends acks.
-  rpc Connect(stream CommandAck) returns (stream InterventionCommand);
+  rpc ControlStream(stream AgentMessage) returns (stream ControlMessage);
 }
 
+// ------------------------------------------------------------------
+// Top-level message envelopes
+// ------------------------------------------------------------------
+
+// All agent → Reeve messages are wrapped here. The oneof lets the server
+// dispatch on type without a separate framing header.
+message AgentMessage {
+  oneof payload {
+    AgentHandshake handshake    = 1;
+    CommandAck     ack          = 2;
+    Heartbeat      heartbeat    = 3;
+    NtpFollowup    ntp_followup = 4;
+  }
+}
+
+// All Reeve → agent messages are wrapped here.
+message ControlMessage {
+  oneof payload {
+    InterventionCommand command       = 1;
+    HandshakeAck        handshake_ack = 2;
+    Heartbeat           heartbeat     = 3;
+  }
+}
+
+// ------------------------------------------------------------------
+// Handshake and clock sync
+// ------------------------------------------------------------------
+
+// First message the agent sends on connect. Declares capabilities so
+// Reeve knows which command types this adapter supports.
+message AgentHandshake {
+  string          agent_id     = 1;
+  string          framework    = 2;  // e.g. "langchain", "openai_agents", "custom"
+  string          sdk_version  = 3;
+  repeated string capabilities = 4;  // e.g. ["pause", "redirect", "inject_context", "kill"]
+  int64           t1_ms        = 5;  // NTP T1: agent-side send timestamp (ms since epoch)
+}
+
+// Reeve sends this in reply to AgentHandshake to complete the NTP four-timestamp
+// exchange. offset = ((t2 - t1) + (t3 - t4)) / 2.
+message HandshakeAck {
+  int64 t2_ms = 1;  // NTP T2: Reeve receive timestamp
+  int64 t3_ms = 2;  // NTP T3: Reeve send timestamp
+}
+
+// Agent sends this after receiving HandshakeAck to give Reeve the final
+// timestamp needed to compute the clock offset.
+message NtpFollowup {
+  int64 t4_ms = 1;  // NTP T4: agent-side timestamp when HandshakeAck was received
+}
+
+// ------------------------------------------------------------------
+// Heartbeat
+// ------------------------------------------------------------------
+
+message Heartbeat {
+  int64 timestamp_ms = 1;
+}
+
+// ------------------------------------------------------------------
+// Commands and acknowledgments
+// ------------------------------------------------------------------
+
 message InterventionCommand {
-  string command_id = 1;
-  string trace_id   = 2;
-  string span_id    = 3;
-  CommandType type  = 4;
-  string payload    = 5; // JSON — instruction for Redirect, context for InjectContext
+  string      command_id            = 1;
+  string      trace_id              = 2;
+  string      span_id               = 3;  // empty when trace-level
+  CommandType type                  = 4;
+  string      payload               = 5;  // JSON: instruction for Redirect; context for InjectContext
+  string      issued_by             = 6;  // "human" or "policy:<rule_id>"
+  int64       valid_until_ms        = 7;  // discard if received after this unix ms timestamp
+  bool        requires_confirmation = 8;
 }
 
 message CommandAck {
-  string command_id = 1;
-  AckStatus status  = 2;
-  string message    = 3; // optional detail
+  string    command_id = 1;
+  AckStatus status     = 2;
+  string    message    = 3;  // optional detail, e.g. error reason on FAILED
 }
+
+// ------------------------------------------------------------------
+// Enums
+// ------------------------------------------------------------------
 
 enum CommandType {
   COMMAND_TYPE_UNSPECIFIED = 0;
@@ -34,9 +103,16 @@ enum CommandType {
   INJECT_CONTEXT           = 5;
 }
 
+// Wire-level ack lifecycle. The Unspecified zero-value is a proto requirement
+// only; the domain AckStatus in reeve-model deliberately omits it.
+// APPLYING: adapter reached a safe yield point but has not yet suspended.
+// The renderer shows "pause pending · waiting for yield point" during this state.
 enum AckStatus {
   ACK_STATUS_UNSPECIFIED = 0;
-  ACCEPTED               = 1;
-  REJECTED               = 2;
-  COMPLETED              = 3;
+  RECEIVED               = 1;
+  APPLYING               = 2;
+  APPLIED                = 3;
+  FAILED                 = 4;
+  EXPIRED                = 5;
+  CANCELLED              = 6;
 }
