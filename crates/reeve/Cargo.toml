@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 reeve-ingestion = { path = "../reeve-ingestion" }
 reeve-engine = { path = "../reeve-engine" }
+reeve-intervention = { path = "../reeve-intervention" }
 reeve-renderer = { path = "../reeve-renderer" }
 reeve-storage = { path = "../reeve-storage" }
 reeve-model = { path = "../reeve-model" }
