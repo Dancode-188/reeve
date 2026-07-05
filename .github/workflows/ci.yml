@@ -25,3 +25,8 @@ jobs:
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release
+      - name: Python SDK tests
+        working-directory: sdk/python
+        run: |
+          pip install grpcio opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc protobuf pytest pytest-asyncio
+          pytest
