@@ -17,6 +17,7 @@ use reeve_model::ids::{AgentId, EvalId, TraceId};
 use reeve_model::signal::{EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::WarmStore;
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
@@ -41,11 +42,29 @@ pub async fn run(
     });
     let judge = Arc::new(LlmJudge::new(backend));
 
+    let config_path = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".config/reeve/config.toml"))
+        .unwrap_or_else(|_| PathBuf::from(".config/reeve/config.toml"));
+
     let mut fingerprints: HashMap<AgentId, AgentFingerprint> = HashMap::new();
     let mut score_histories: HashMap<AgentId, VecDeque<f64>> = HashMap::new();
     let mut cost_accumulators: HashMap<TraceId, CostAccumulator> = HashMap::new();
     let mut trace_agents: HashMap<TraceId, AgentId> = HashMap::new();
     let mut policy_engine = PolicyEngine::with_defaults();
+
+    {
+        let db_rules = warm.load_policy_rules().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to load policy rules from database");
+            vec![]
+        });
+        let cfg_rules = policy::config::load(&config_path);
+        let mut combined = db_rules;
+        combined.extend(cfg_rules);
+        policy_engine.replace_user_rules(combined);
+    }
+
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .expect("failed to install SIGHUP handler");
 
     let evaluators: Vec<Box<dyn Evaluator>> = vec![
         Box::new(LoopDetector::new(3)),
@@ -56,7 +75,21 @@ pub async fn run(
     ];
 
     loop {
-        match ingestion_rx.recv().await {
+        let event = tokio::select! {
+            _ = sighup.recv() => {
+                let db_rules = warm.load_policy_rules().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to reload policy rules from database");
+                    vec![]
+                });
+                let cfg_rules = policy::config::load(&config_path);
+                let mut combined = db_rules;
+                combined.extend(cfg_rules);
+                policy_engine.replace_user_rules(combined);
+                continue;
+            }
+            ev = ingestion_rx.recv() => ev,
+        };
+        match event {
             Ok(IngestionEvent::TraceCompleted {
                 trace_id,
                 agent_id,

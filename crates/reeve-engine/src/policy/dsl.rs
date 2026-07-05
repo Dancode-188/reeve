@@ -71,6 +71,18 @@ impl PolicyContext {
     }
 }
 
+/// Validates that `condition` is syntactically parseable by evalexpr.
+/// `VariableIdentifierNotFound` is accepted because user-defined rules may
+/// reference custom metric names not present in every evaluation context.
+pub fn validate_condition(condition: &str) -> Result<(), String> {
+    let ctx = PolicyContext::build(0.0, 0.0, 0, false, 0.0, 0.0, &HashMap::new());
+    match eval_boolean_with_context(condition, &ctx.inner) {
+        Ok(_) => Ok(()),
+        Err(evalexpr::EvalexprError::VariableIdentifierNotFound(_)) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
