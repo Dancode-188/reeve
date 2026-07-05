@@ -74,7 +74,11 @@ fn render_menu(
     let title = format!(" INTERVENE: {} ", ov.agent_id);
     let block = Block::default()
         .title(title)
-        .title_style(Style::default().fg(theme.highlight()).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.highlight())
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border_focused()));
 
@@ -104,10 +108,7 @@ fn render_text_input(
 
     let lines = vec![
         Line::raw(""),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(label, text_style),
-        ]),
+        Line::from(vec![Span::raw("  "), Span::styled(label, text_style)]),
         Line::from(vec![
             Span::raw("  "),
             Span::styled(&prompt, Style::default().fg(theme.highlight())),
@@ -127,7 +128,11 @@ fn render_text_input(
     let title = format!(" INTERVENE: {} ", ov.agent_id);
     let block = Block::default()
         .title(title)
-        .title_style(Style::default().fg(theme.highlight()).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.highlight())
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border_focused()));
 
@@ -167,7 +172,11 @@ fn render_kill_confirm(
     let title = format!(" INTERVENE: {} ", ov.agent_id);
     let block = Block::default()
         .title(title)
-        .title_style(Style::default().fg(theme.health_crit()).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.health_crit())
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.health_crit()));
 

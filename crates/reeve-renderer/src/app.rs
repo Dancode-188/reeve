@@ -112,7 +112,10 @@ pub struct FatalError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayMode {
     Menu,
-    TextInput { command: OverlayCommand, buffer: String },
+    TextInput {
+        command: OverlayCommand,
+        buffer: String,
+    },
     KillConfirm,
 }
 
@@ -410,9 +413,7 @@ impl App {
                 agent_id,
                 capabilities,
             } => {
-                self.state
-                    .agent_capabilities
-                    .insert(agent_id, capabilities);
+                self.state.agent_capabilities.insert(agent_id, capabilities);
             }
             EngineEvent::AgentControlDisconnected { agent_id } => {
                 self.state.agent_capabilities.remove(&agent_id);
@@ -614,9 +615,9 @@ impl App {
                     };
                     if let OverlayMode::TextInput { command, buffer } = ov.mode {
                         let cmd_type = match command {
-                            OverlayCommand::Redirect => {
-                                CommandType::Redirect { instruction: buffer }
-                            }
+                            OverlayCommand::Redirect => CommandType::Redirect {
+                                instruction: buffer,
+                            },
                             OverlayCommand::InjectContext => {
                                 CommandType::InjectContext { context: buffer }
                             }
