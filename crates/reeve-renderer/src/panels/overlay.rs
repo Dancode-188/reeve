@@ -1,4 +1,6 @@
-use crate::app::{AppState, InterventionOverlayState, OverlayCommand, OverlayMode};
+use crate::app::{
+    AppState, InterventionOverlayState, OverlayCommand, OverlayMode, SuggestedIntervention,
+};
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -20,7 +22,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .unwrap_or_default();
 
     match &ov.mode {
-        OverlayMode::Menu => render_menu(frame, area, ov, &caps, theme),
+        OverlayMode::Menu => render_menu(
+            frame,
+            area,
+            ov,
+            &caps,
+            state.active_suggestion.as_ref(),
+            theme,
+        ),
         OverlayMode::TextInput { command, buffer } => {
             render_text_input(frame, area, ov, *command, buffer, theme)
         }
@@ -33,9 +42,11 @@ fn render_menu(
     area: Rect,
     ov: &InterventionOverlayState,
     caps: &[String],
+    suggestion: Option<&SuggestedIntervention>,
     theme: &Theme,
 ) {
-    let popup = centered(52, 12, area);
+    let height = if suggestion.is_some() { 17 } else { 12 };
+    let popup = centered(54, height, area);
     let has = |cap: &str| caps.contains(&cap.to_string());
 
     let key_style = Style::default().fg(theme.highlight());
@@ -53,23 +64,65 @@ fn render_menu(
         ])
     };
 
-    let lines = vec![
-        Line::raw(""),
-        cmd_row("p", "Pause / Resume", "pause"),
-        cmd_row("r", "Redirect", "redirect"),
-        cmd_row("c", "Inject Context", "inject_context"),
-        cmd_row("k", "Kill", "kill"),
-        Line::raw(""),
-        Line::from(vec![
+    let mut lines: Vec<Line> = Vec::new();
+
+    if let Some(s) = suggestion {
+        let cmd_label = match s.command {
+            OverlayCommand::Redirect => "Redirect",
+            OverlayCommand::InjectContext => "Inject Context",
+            OverlayCommand::Pause => "Pause",
+            OverlayCommand::Kill => "Kill",
+        };
+        let warn = Style::default().fg(theme.health_warn());
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("SUGGESTED", warn.add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(cmd_label, Style::default().fg(theme.subtext())),
+        ]));
+        // Truncate text to fit popup width (54 - 4 border/padding = 50 chars).
+        let display_text = if s.text.len() > 50 {
+            format!("{}…", &s.text[..49])
+        } else {
+            s.text.clone()
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(display_text, Style::default().fg(theme.text())),
+        ]));
+        lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled("[Enter]", hint),
-            Span::styled(" dispatch", hint),
-            Span::raw("    "),
+            Span::styled(" apply", hint),
+            Span::raw("  "),
+            Span::styled("[Tab]", hint),
+            Span::styled(" edit", hint),
+            Span::raw("  "),
             Span::styled("[Esc]", hint),
-            Span::styled(" cancel", hint),
-        ]),
-        Line::raw(""),
-    ];
+            Span::styled(" skip", hint),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("─".repeat(48), Style::default().fg(theme.surface())),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(cmd_row("p", "Pause / Resume", "pause"));
+    lines.push(cmd_row("r", "Redirect", "redirect"));
+    lines.push(cmd_row("c", "Inject Context", "inject_context"));
+    lines.push(cmd_row("k", "Kill", "kill"));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("[Enter]", hint),
+        Span::styled(" dispatch", hint),
+        Span::raw("    "),
+        Span::styled("[Esc]", hint),
+        Span::styled(" cancel", hint),
+    ]));
+    lines.push(Line::raw(""));
 
     let title = format!(" INTERVENE: {} ", ov.agent_id);
     let block = Block::default()
@@ -94,7 +147,7 @@ fn render_text_input(
     buffer: &str,
     theme: &Theme,
 ) {
-    let popup = centered(52, 10, area);
+    let popup = centered(54, 10, area);
 
     let label = match command {
         OverlayCommand::Redirect => "Redirect instruction:",
@@ -146,7 +199,7 @@ fn render_kill_confirm(
     ov: &InterventionOverlayState,
     theme: &Theme,
 ) {
-    let popup = centered(52, 8, area);
+    let popup = centered(54, 8, area);
 
     let warn = Style::default().fg(theme.health_crit());
     let hint = Style::default().fg(theme.subtext());
