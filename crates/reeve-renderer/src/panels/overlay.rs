@@ -1,5 +1,6 @@
 use crate::app::{
     AppState, InterventionOverlayState, OverlayCommand, OverlayMode, SuggestedIntervention,
+    TEMPLATES,
 };
 use crate::theme::Theme;
 use ratatui::{
@@ -45,7 +46,7 @@ fn render_menu(
     suggestion: Option<&SuggestedIntervention>,
     theme: &Theme,
 ) {
-    let height = if suggestion.is_some() { 17 } else { 12 };
+    let height = if suggestion.is_some() { 20 } else { 15 };
     let popup = centered(54, height, area);
     let has = |cap: &str| caps.contains(&cap.to_string());
 
@@ -113,6 +114,16 @@ fn render_menu(
     lines.push(cmd_row("r", "Redirect", "redirect"));
     lines.push(cmd_row("c", "Inject Context", "inject_context"));
     lines.push(cmd_row("k", "Kill", "kill"));
+    lines.push(Line::raw(""));
+    for t in TEMPLATES {
+        let style = if has("redirect") { active } else { dimmed };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("[{}]", t.key), key_style),
+            Span::raw("  "),
+            Span::styled(t.label, style),
+        ]));
+    }
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         Span::raw("  "),

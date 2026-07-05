@@ -137,6 +137,25 @@ pub struct SuggestedIntervention {
     pub text: String,
 }
 
+pub struct InterventionTemplate {
+    pub key: char,
+    pub label: &'static str,
+    pub text: &'static str,
+}
+
+pub const TEMPLATES: &[InterventionTemplate] = &[
+    InterventionTemplate {
+        key: '1',
+        label: "Summarize progress, then stop",
+        text: "Please summarize what you have accomplished so far and stop.",
+    },
+    InterventionTemplate {
+        key: '2',
+        label: "Refocus on original task",
+        text: "You seem off-track. Refocus on your original task.",
+    },
+];
+
 pub struct AppState {
     pub agents: IndexMap<AgentId, AgentState>,
     pub selected_agent: Option<usize>,
@@ -739,6 +758,23 @@ impl App {
                     Action::VimUp if caps.contains(&"kill".to_string()) => {
                         if let Some(ref mut ov) = self.state.overlay {
                             ov.mode = OverlayMode::KillConfirm;
+                        }
+                    }
+                    // [1] and [2] load templates into the input field.
+                    Action::Char('1') if caps.contains(&"redirect".to_string()) => {
+                        if let Some(ref mut ov) = self.state.overlay {
+                            ov.mode = OverlayMode::TextInput {
+                                command: OverlayCommand::Redirect,
+                                buffer: TEMPLATES[0].text.to_string(),
+                            };
+                        }
+                    }
+                    Action::Char('2') if caps.contains(&"redirect".to_string()) => {
+                        if let Some(ref mut ov) = self.state.overlay {
+                            ov.mode = OverlayMode::TextInput {
+                                command: OverlayCommand::Redirect,
+                                buffer: TEMPLATES[1].text.to_string(),
+                            };
                         }
                     }
                     _ => {}
