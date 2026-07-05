@@ -151,14 +151,20 @@ pub async fn run(
                         now_ms,
                     );
                     for fr in fired {
-                        let (rule_id_str, description, cmd_type, requires_confirmation) =
-                            alert_fields(&fr);
+                        let (
+                            rule_id_str,
+                            description,
+                            cmd_type,
+                            requires_confirmation,
+                            auto_confirm_after_secs,
+                        ) = alert_fields(&fr);
                         let rule_id_owned = rule_id_str.to_string();
                         let _ = engine_tx.send(EngineEvent::PolicyAlert {
                             rule_id: rule_id_owned.clone(),
                             description: description.to_string(),
                             command_type: cmd_type.to_string(),
                             requires_confirmation,
+                            auto_confirm_after_secs,
                         });
                         if let Err(e) = warm.save_intervention_command(fr.command).await {
                             tracing::warn!(
@@ -289,14 +295,20 @@ pub async fn run(
                     now_ms,
                 );
                 for fr in mid_fired {
-                    let (rule_id_str, description, cmd_type, requires_confirmation) =
-                        alert_fields(&fr);
+                    let (
+                        rule_id_str,
+                        description,
+                        cmd_type,
+                        requires_confirmation,
+                        auto_confirm_after_secs,
+                    ) = alert_fields(&fr);
                     let rule_id_owned = rule_id_str.to_string();
                     let _ = engine_tx.send(EngineEvent::PolicyAlert {
                         rule_id: rule_id_owned.clone(),
                         description: description.to_string(),
                         command_type: cmd_type.to_string(),
                         requires_confirmation,
+                        auto_confirm_after_secs,
                     });
                     if let Err(e) = warm.save_intervention_command(fr.command).await {
                         tracing::warn!(
