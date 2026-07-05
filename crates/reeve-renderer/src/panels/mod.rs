@@ -1,4 +1,5 @@
 pub mod center;
+pub mod confirm;
 pub mod degraded;
 pub mod fatal;
 pub mod footer;
@@ -77,4 +78,10 @@ pub fn render_degraded(frame: &mut Frame, area: Rect, state: &AppState, theme: &
 
 pub fn render_intervention_overlay(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     overlay::render(frame, area, state, theme);
+}
+
+pub fn render_confirmation_modal(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if let Some(ref pc) = state.pending_confirmation {
+        confirm::render(frame, area, pc, theme);
+    }
 }

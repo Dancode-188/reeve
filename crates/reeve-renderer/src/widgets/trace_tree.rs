@@ -1,3 +1,4 @@
+use crate::app::OutcomeLine;
 use crate::ascii::AsciiMode;
 use crate::panels::left::health_color;
 use crate::theme::Theme;
@@ -16,6 +17,7 @@ pub struct TraceTree<'a> {
     pub names: &'a HashMap<SpanId, String>,
     pub collapsed: &'a HashSet<SpanId>,
     pub span_health_scores: &'a HashMap<SpanId, f64>,
+    pub outcome_lines: &'a [OutcomeLine],
     pub root: Option<&'a SpanId>,
     pub selected: Option<&'a SpanId>,
     pub scroll: u16,
@@ -129,6 +131,31 @@ impl<'a> TraceTree<'a> {
 
         lines.push(Line::from(spans));
 
+        // Outcome lines for this span (or root-level outcomes when span_id is None and is_root).
+        let outcome_style = Style::default()
+            .fg(self.theme.span_active())
+            .add_modifier(Modifier::ITALIC);
+        for ol in self.outcome_lines {
+            let matches = match &ol.span_id {
+                Some(sid) => sid == id,
+                None => is_root,
+            };
+            if matches {
+                let arrow = if self.ascii.enabled() {
+                    "\\>"
+                } else {
+                    "\u{21B3}"
+                };
+                let indent = format!("{}  ", prefix);
+                lines.push(Line::from(vec![
+                    Span::styled(indent, outcome_style),
+                    Span::styled(arrow, outcome_style),
+                    Span::styled(" ", outcome_style),
+                    Span::styled(ol.text.clone(), outcome_style),
+                ]));
+            }
+        }
+
         if is_collapsed {
             return;
         }
@@ -185,6 +212,7 @@ mod tests {
                     names: &names,
                     collapsed: &collapsed,
                     span_health_scores: &scores,
+                    outcome_lines: &[],
                     root: Some(&root),
                     selected: None,
                     scroll: 0,
@@ -210,6 +238,61 @@ mod tests {
         assert!(
             content.contains('└') || content.contains('├'),
             "tree connector must appear"
+        );
+    }
+
+    #[test]
+    fn outcome_line_renders_below_root_when_span_id_is_none() {
+        let mut children: HashMap<SpanId, Vec<SpanId>> = HashMap::new();
+        let mut names: HashMap<SpanId, String> = HashMap::new();
+        let root: SpanId = "root-span".into();
+        children.insert(root.clone(), vec![]);
+        names.insert(root.clone(), "root-span".to_string());
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let collapsed = HashSet::new();
+        let scores: HashMap<SpanId, f64> = HashMap::new();
+        let outcomes = vec![OutcomeLine {
+            span_id: None,
+            text: "redirect +0.35 quality \u{00B7} 3 spans".to_string(),
+        }];
+
+        terminal
+            .draw(|frame| {
+                let theme = make_theme();
+                let ascii = make_ascii();
+                let widget = TraceTree {
+                    children: &children,
+                    names: &names,
+                    collapsed: &collapsed,
+                    span_health_scores: &scores,
+                    outcome_lines: &outcomes,
+                    root: Some(&root),
+                    selected: None,
+                    scroll: 0,
+                    title: "TRACE",
+                    focused: false,
+                    theme: &theme,
+                    ascii: &ascii,
+                };
+                frame.render_widget(widget, frame.area());
+            })
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect::<String>();
+
+        assert!(content.contains("root-span"), "root span must appear");
+        assert!(
+            content.contains("redirect") && content.contains("+0.35"),
+            "outcome line must appear below root span"
         );
     }
 }

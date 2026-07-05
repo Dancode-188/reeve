@@ -87,6 +87,9 @@ pub enum EngineEvent {
         description: String,
         command_type: String,
         requires_confirmation: bool,
+        /// When set, the renderer shows a countdown bar and auto-dispatches the command
+        /// after this many seconds if the operator does not act first.
+        auto_confirm_after_secs: Option<u64>,
     },
     /// An agent completed the gRPC handshake on the control channel.
     /// `capabilities` lists which command types the adapter supports

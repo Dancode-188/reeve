@@ -97,6 +97,7 @@ async fn run_inner(
                 app.state.streaming.cursor_tick =
                     app.state.streaming.cursor_tick.wrapping_add(1);
                 app.state.advance_flash();
+                app.check_auto_confirm().await;
 
                 terminal.draw(|frame| {
                     if let Some(ref err) = app.state.fatal_error {
@@ -130,6 +131,14 @@ async fn run_inner(
                     }
                     if app.state.overlay.is_some() {
                         panels::render_intervention_overlay(
+                            frame,
+                            frame.area(),
+                            &app.state,
+                            &theme,
+                        );
+                    }
+                    if app.state.pending_confirmation.is_some() {
+                        panels::render_confirmation_modal(
                             frame,
                             frame.area(),
                             &app.state,

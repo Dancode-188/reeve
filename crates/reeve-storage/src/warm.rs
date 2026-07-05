@@ -582,6 +582,20 @@ impl WarmStore {
         .await
     }
 
+    pub async fn get_intervention_outcomes_for_trace(
+        &self,
+        trace_id: &TraceId,
+    ) -> Result<Vec<InterventionOutcome>, StorageError> {
+        let trace_id = trace_id.clone();
+        self.with_conn(move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT * FROM intervention_outcomes WHERE trace_id = ?1")?;
+            let rows = stmt.query_map(params![trace_id.as_str()], row_to_intervention_outcome)?;
+            rows.collect()
+        })
+        .await
+    }
+
     pub async fn list_spans_for_trace(
         &self,
         trace_id: &TraceId,
@@ -881,6 +895,53 @@ mod tests {
         assert_eq!(loaded.id, "out-1");
         assert_eq!(loaded.delta, Some(35.0));
         assert_eq!(loaded.spans_measured, Some(4));
+    }
+
+    #[tokio::test]
+    async fn get_intervention_outcomes_for_trace_filters_by_trace() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t1")).await.unwrap();
+        store.save_trace(trace("t2")).await.unwrap();
+        store
+            .save_intervention_command(make_command("cmd-1", "t1"))
+            .await
+            .unwrap();
+        store
+            .save_intervention_command(make_command("cmd-2", "t2"))
+            .await
+            .unwrap();
+
+        let outcome_t1 = InterventionOutcome {
+            id: "out-1".to_string(),
+            command_id: "cmd-1".into(),
+            trace_id: "t1".into(),
+            pre_intervention_score: Some(40.0),
+            post_intervention_score: Some(75.0),
+            delta: Some(35.0),
+            spans_measured: Some(4),
+            measured_at: 1,
+        };
+        let outcome_t2 = InterventionOutcome {
+            id: "out-2".to_string(),
+            command_id: "cmd-2".into(),
+            trace_id: "t2".into(),
+            pre_intervention_score: Some(50.0),
+            post_intervention_score: Some(60.0),
+            delta: Some(10.0),
+            spans_measured: Some(2),
+            measured_at: 2,
+        };
+        store.save_intervention_outcome(outcome_t1).await.unwrap();
+        store.save_intervention_outcome(outcome_t2).await.unwrap();
+
+        let results = store
+            .get_intervention_outcomes_for_trace(&TraceId::from("t1"))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "out-1");
+        assert_eq!(results[0].trace_id, TraceId::from("t1"));
     }
 
     #[tokio::test]

@@ -75,6 +75,8 @@ pub struct TraceView {
     /// Per-span composite health scores. Populated when HealthScoreUpdated fires
     /// for the trace. Only gen_ai.* operation spans receive a badge.
     pub span_health_scores: HashMap<SpanId, f64>,
+    /// Pre-formatted outcome annotations loaded from the warm store on trace load.
+    pub outcome_lines: Vec<OutcomeLine>,
 }
 
 pub struct StreamingState {
@@ -137,6 +139,23 @@ pub struct SuggestedIntervention {
     pub text: String,
 }
 
+/// Pre-formatted outcome annotation for the trace tree.
+pub struct OutcomeLine {
+    /// The span beneath which the line should appear, or None for root.
+    pub span_id: Option<SpanId>,
+    /// Formatted text, e.g. "redirect +0.58 quality · 4 spans".
+    pub text: String,
+}
+
+pub struct PendingConfirmation {
+    pub agent_id: AgentId,
+    pub rule_id: String,
+    pub description: String,
+    pub command_type: String,
+    pub auto_confirm_after_secs: Option<u64>,
+    pub arrived_at_ms: i64,
+}
+
 pub struct InterventionTemplate {
     pub key: char,
     pub label: &'static str,
@@ -192,6 +211,8 @@ pub struct AppState {
     pub overlay: Option<InterventionOverlayState>,
     /// Pre-written suggestion surfaced by a policy alert or evaluation threshold.
     pub active_suggestion: Option<SuggestedIntervention>,
+    /// Policy-issued command waiting for operator confirmation before dispatch.
+    pub pending_confirmation: Option<PendingConfirmation>,
 }
 
 impl AppState {
@@ -285,6 +306,7 @@ impl App {
                 pending_commands: HashMap::new(),
                 overlay: None,
                 active_suggestion: None,
+                pending_confirmation: None,
             },
         }
     }
@@ -433,20 +455,33 @@ impl App {
                 rule_id,
                 description,
                 command_type,
-                ..
+                requires_confirmation,
+                auto_confirm_after_secs,
             } => {
                 if self.state.policy_alerts.len() >= 5 {
                     self.state.policy_alerts.pop_front();
                 }
                 self.state.policy_alerts.push_back(PolicyAlertEntry {
-                    description,
-                    command_type,
+                    description: description.clone(),
+                    command_type: command_type.clone(),
                 });
                 self.state
                     .flash_targets
                     .insert(FlashTarget::AlertSection, (FlashDirection::Alert, 2));
                 if let Some(s) = suggestion_for_rule(&rule_id) {
                     self.state.active_suggestion = Some(s);
+                }
+                if requires_confirmation {
+                    if let Some(agent_id) = self.state.selected_agent_id().cloned() {
+                        self.state.pending_confirmation = Some(PendingConfirmation {
+                            agent_id,
+                            rule_id,
+                            description,
+                            command_type,
+                            auto_confirm_after_secs,
+                            arrived_at_ms: current_ms(),
+                        });
+                    }
                 }
             }
             EngineEvent::AgentControlConnected {
@@ -494,6 +529,39 @@ impl App {
                     .map(|r| flatten_tree(r, &children, &collapsed))
                     .unwrap_or_default();
 
+                let raw_outcomes = self
+                    .warm
+                    .get_intervention_outcomes_for_trace(&trace_id)
+                    .await
+                    .unwrap_or_default();
+                let mut outcome_lines: Vec<OutcomeLine> = Vec::new();
+                for oc in raw_outcomes {
+                    let (span_id, cmd_label) =
+                        match self.warm.get_intervention_command(&oc.command_id).await {
+                            Ok(Some(cmd)) => {
+                                let label = match &cmd.command_type {
+                                    CommandType::Pause | CommandType::Resume => "pause",
+                                    CommandType::Kill => "kill",
+                                    CommandType::Redirect { .. } => "redirect",
+                                    CommandType::InjectContext { .. } => "inject",
+                                };
+                                (cmd.span_id, label)
+                            }
+                            _ => (None, "intervention"),
+                        };
+                    let delta_str = match oc.delta {
+                        Some(d) => format!("{d:+.2} quality"),
+                        None => "no delta".to_string(),
+                    };
+                    let spans_str = match oc.spans_measured {
+                        Some(n) => format!(" \u{00B7} {n} spans"),
+                        None => String::new(),
+                    };
+                    outcome_lines.push(OutcomeLine {
+                        span_id,
+                        text: format!("{cmd_label} {delta_str}{spans_str}"),
+                    });
+                }
                 self.state.trace = Some(TraceView {
                     trace_id,
                     root,
@@ -505,6 +573,7 @@ impl App {
                     selected: None,
                     collapsed,
                     span_health_scores: HashMap::new(),
+                    outcome_lines,
                 });
             }
             Err(e) => {
@@ -514,6 +583,11 @@ impl App {
     }
 
     pub async fn handle_action(&mut self, action: Action) {
+        // Confirmation modal takes priority over everything else.
+        if self.state.pending_confirmation.is_some() {
+            self.handle_confirmation_action(action).await;
+            return;
+        }
         // When overlay is open, consume most actions before they reach the cockpit.
         if self.state.overlay.is_some() {
             self.handle_overlay_action(action).await;
@@ -783,7 +857,48 @@ impl App {
         }
     }
 
+    async fn handle_confirmation_action(&mut self, action: Action) {
+        match action {
+            Action::Select => {
+                if let Some(pc) = self.state.pending_confirmation.take() {
+                    let issued_by = format!("policy:{}", pc.rule_id);
+                    self.dispatch_confirmation(pc, issued_by).await;
+                }
+            }
+            Action::Dismiss => {
+                self.state.pending_confirmation = None;
+            }
+            _ => {}
+        }
+    }
+
+    async fn dispatch_confirmation(&mut self, pc: PendingConfirmation, issued_by: String) {
+        let cmd_type = match pc.command_type.as_str() {
+            "Pause" => CommandType::Pause,
+            "Kill" => CommandType::Kill,
+            "Redirect" => CommandType::Redirect {
+                instruction: pc.description.clone(),
+            },
+            "InjectContext" => CommandType::InjectContext {
+                context: pc.description.clone(),
+            },
+            _ => return,
+        };
+        self.dispatch_command_with_attribution(pc.agent_id, cmd_type, issued_by)
+            .await;
+    }
+
     async fn dispatch_command(&mut self, agent_id: AgentId, command_type: CommandType) {
+        self.dispatch_command_with_attribution(agent_id, command_type, "human".to_string())
+            .await;
+    }
+
+    async fn dispatch_command_with_attribution(
+        &mut self,
+        agent_id: AgentId,
+        command_type: CommandType,
+        issued_by: String,
+    ) {
         let now_ms = current_ms();
         let command_id = CommandId::from(format!("cmd-{now_ms:x}"));
         let trace_id = self
@@ -803,13 +918,34 @@ impl App {
             requires_confirmation: false,
             issued_at: now_ms,
             acknowledged_at: None,
-            issued_by: "human".to_string(),
+            issued_by,
             valid_until_ms: now_ms + 60_000,
         };
 
         let dispatched = self.dispatcher.dispatch(&agent_id, command).await;
         if dispatched {
             self.state.pending_commands.insert(command_id, agent_id);
+        }
+    }
+
+    /// Called from the tick loop. Dispatches a policy confirmation automatically when
+    /// `auto_confirm_after_secs` has elapsed since the alert arrived.
+    pub async fn check_auto_confirm(&mut self) {
+        let expired = self
+            .state
+            .pending_confirmation
+            .as_ref()
+            .and_then(|pc| pc.auto_confirm_after_secs)
+            .map(|secs| {
+                let pc = self.state.pending_confirmation.as_ref().unwrap();
+                current_ms() >= pc.arrived_at_ms + (secs as i64 * 1000)
+            })
+            .unwrap_or(false);
+        if expired {
+            if let Some(pc) = self.state.pending_confirmation.take() {
+                let issued_by = format!("policy_auto:{}", pc.rule_id);
+                self.dispatch_confirmation(pc, issued_by).await;
+            }
         }
     }
 

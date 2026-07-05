@@ -182,12 +182,13 @@ fn command_type_str(ct: &CommandType) -> &'static str {
     }
 }
 
-pub fn alert_fields(fired: &FiredRule) -> (&str, &str, &'static str, bool) {
+pub fn alert_fields(fired: &FiredRule) -> (&str, &str, &'static str, bool, Option<u64>) {
     (
         fired.rule.id.as_str(),
         &fired.rule.description,
         command_type_str(&fired.rule.command_type),
         fired.rule.requires_confirmation,
+        fired.rule.auto_confirm_after_secs,
     )
 }
 
