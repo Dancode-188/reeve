@@ -19,6 +19,15 @@ struct AgentStreamEntry {
     last_seen: Instant,
 }
 
+/// Resolved NTP clock offsets keyed by agent_id. Shared with reeve-ingestion
+/// so the OTLP receiver can apply the four-timestamp offset instead of the
+/// connection-time approximation.
+pub type NtpOffsets = Arc<Mutex<HashMap<String, i64>>>;
+
+/// Per-agent pending NTP state: (T1, T2, T3) captured during the handshake,
+/// held until T4 arrives in NtpFollowup.
+type NtpPending = Arc<Mutex<HashMap<AgentId, (i64, i64, i64)>>>;
+
 /// Handle to the running control server. Used by the dispatcher to send
 /// commands to connected agents.
 #[derive(Clone)]
@@ -26,14 +35,20 @@ pub struct ControlServer {
     connected: Arc<Mutex<HashMap<AgentId, AgentStreamEntry>>>,
     engine_tx: broadcast::Sender<EngineEvent>,
     ack_sink: Arc<Mutex<Option<mpsc::Sender<AckNotification>>>>,
+    /// (T1, T2, T3) stored per agent after the handshake, until T4 arrives.
+    ntp_pending: NtpPending,
+    /// Completed NTP offsets written here when T4 arrives.
+    ntp_offsets: NtpOffsets,
 }
 
 impl ControlServer {
-    fn new(engine_tx: broadcast::Sender<EngineEvent>) -> Self {
+    fn new(engine_tx: broadcast::Sender<EngineEvent>, ntp_offsets: NtpOffsets) -> Self {
         Self {
             connected: Arc::new(Mutex::new(HashMap::new())),
             engine_tx,
             ack_sink: Arc::new(Mutex::new(None)),
+            ntp_pending: Arc::new(Mutex::new(HashMap::new())),
+            ntp_offsets,
         }
     }
 
@@ -101,12 +116,10 @@ impl ReeveControl for ControlServer {
 
         let agent_id = AgentId::from(handshake.agent_id.as_str());
         let capabilities = handshake.capabilities.clone();
+        let t1_ms = handshake.t1_ms;
 
         let (tx, rx) = mpsc::channel::<Result<proto::ControlMessage, Status>>(32);
 
-        // NTP: record T2 and T3. The formula is applied in reeve-intervention
-        // once issue #7 lands; timestamps are captured here so no handshake
-        // round-trip is needed later.
         let t2_ms = current_ms();
         let t3_ms = current_ms();
         let _ = tx
@@ -116,6 +129,11 @@ impl ReeveControl for ControlServer {
                 )),
             }))
             .await;
+
+        self.ntp_pending
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), (t1_ms, t2_ms, t3_ms));
 
         {
             let mut map = self.connected.lock().unwrap();
@@ -139,6 +157,8 @@ impl ReeveControl for ControlServer {
         let connected = self.connected.clone();
         let engine_tx = self.engine_tx.clone();
         let ack_sink = self.ack_sink.clone();
+        let ntp_pending = self.ntp_pending.clone();
+        let ntp_offsets = self.ntp_offsets.clone();
 
         tokio::spawn(async move {
             while let Ok(Some(msg)) = inbound.message().await {
@@ -167,11 +187,19 @@ impl ReeveControl for ControlServer {
                         }
                     }
                     Some(agent_message::Payload::NtpFollowup(f)) => {
-                        tracing::debug!(
-                            agent_id = %agent_id,
-                            t4_ms = f.t4_ms,
-                            "NTP followup received",
-                        );
+                        let t4_ms = f.t4_ms;
+                        if let Some((t1, t2, t3)) = ntp_pending.lock().unwrap().remove(&agent_id) {
+                            let offset_ms = ((t2 - t1) + (t3 - t4_ms)) / 2;
+                            ntp_offsets
+                                .lock()
+                                .unwrap()
+                                .insert(agent_id.as_str().to_string(), offset_ms);
+                            tracing::debug!(
+                                agent_id = %agent_id,
+                                offset_ms,
+                                "NTP clock offset computed",
+                            );
+                        }
                     }
                     Some(agent_message::Payload::Handshake(_)) | None => {}
                 }
@@ -191,8 +219,11 @@ impl ReeveControl for ControlServer {
 /// Start the gRPC control server on `127.0.0.1:4316` and return a handle
 /// to it. The handle can be used by the dispatcher to send commands to
 /// connected agents.
-pub async fn run(engine_tx: broadcast::Sender<EngineEvent>) -> Arc<ControlServer> {
-    let server = ControlServer::new(engine_tx);
+pub async fn run(
+    engine_tx: broadcast::Sender<EngineEvent>,
+    ntp_offsets: NtpOffsets,
+) -> Arc<ControlServer> {
+    let server = ControlServer::new(engine_tx, ntp_offsets);
     let handle = Arc::new(server.clone());
 
     let addr = "127.0.0.1:4316"
@@ -236,7 +267,10 @@ fn current_ms() -> i64 {
 /// unit tests that need a real server handle but not a live gRPC socket.
 #[cfg(test)]
 pub fn new_for_test(engine_tx: broadcast::Sender<EngineEvent>) -> Arc<ControlServer> {
-    Arc::new(ControlServer::new(engine_tx))
+    Arc::new(ControlServer::new(
+        engine_tx,
+        Arc::new(Mutex::new(HashMap::new())),
+    ))
 }
 
 #[cfg(test)]
@@ -245,7 +279,7 @@ mod tests {
 
     fn make_server() -> ControlServer {
         let (tx, _rx) = broadcast::channel(8);
-        ControlServer::new(tx)
+        ControlServer::new(tx, Arc::new(Mutex::new(HashMap::new())))
     }
 
     #[test]
@@ -269,5 +303,39 @@ mod tests {
         let server = make_server();
         let msg = proto::ControlMessage { payload: None };
         assert!(!server.send_to_agent(&AgentId::from("nobody"), msg).await);
+    }
+
+    #[test]
+    fn ntp_offset_computed_correctly_from_four_timestamps() {
+        // T1=100 (agent send), T2=200 (Reeve receive), T3=210 (Reeve send), T4=320 (agent receive).
+        // offset = ((T2-T1) + (T3-T4)) / 2 = ((200-100) + (210-320)) / 2 = (100 + -110) / 2 = -5.
+        let agent_id = AgentId::from("agent-ntp");
+        let ntp_offsets: NtpOffsets = Arc::new(Mutex::new(HashMap::new()));
+        let server = {
+            let (tx, _rx) = broadcast::channel(8);
+            ControlServer::new(tx, ntp_offsets.clone())
+        };
+
+        server
+            .ntp_pending
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), (100, 200, 210));
+
+        let t4_ms: i64 = 320;
+        let (t1, t2, t3) = server
+            .ntp_pending
+            .lock()
+            .unwrap()
+            .remove(&agent_id)
+            .unwrap();
+        let offset_ms = ((t2 - t1) + (t3 - t4_ms)) / 2;
+        ntp_offsets
+            .lock()
+            .unwrap()
+            .insert(agent_id.as_str().to_string(), offset_ms);
+
+        let stored = *ntp_offsets.lock().unwrap().get("agent-ntp").unwrap();
+        assert_eq!(stored, -5, "NTP offset formula must match expected value");
     }
 }

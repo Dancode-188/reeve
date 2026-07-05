@@ -3,12 +3,17 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse, trace_service_server::TraceService,
 };
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value::Value as OtlpValue};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
+
+/// NTP clock offsets keyed by agent_id. Populated by reeve-intervention when
+/// the four-timestamp exchange completes. When present for a given agent, the
+/// NTP offset takes precedence over the sample-based approximation.
+pub type NtpOffsets = Arc<Mutex<HashMap<String, i64>>>;
 
 const DEDUP_MAX: usize = 10_000;
 const CLOCK_SAMPLES_NEEDED: usize = 10;
@@ -62,16 +67,18 @@ impl AgentClockState {
 
 pub struct OtlpReceiver {
     dedup: Arc<Mutex<Deduplicator>>,
-    clocks: Arc<Mutex<std::collections::HashMap<String, AgentClockState>>>,
+    clocks: Arc<Mutex<HashMap<String, AgentClockState>>>,
     pipeline_tx: mpsc::Sender<PipelineSpan>,
+    ntp_offsets: NtpOffsets,
 }
 
 impl OtlpReceiver {
-    pub fn new(pipeline_tx: mpsc::Sender<PipelineSpan>) -> Self {
+    pub fn new(pipeline_tx: mpsc::Sender<PipelineSpan>, ntp_offsets: NtpOffsets) -> Self {
         Self {
             dedup: Arc::new(Mutex::new(Deduplicator::new())),
-            clocks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            clocks: Arc::new(Mutex::new(HashMap::new())),
             pipeline_tx,
+            ntp_offsets,
         }
     }
 }
@@ -124,15 +131,29 @@ impl TraceService for OtlpReceiver {
                     }
 
                     let clock_offset_ms = {
-                        let mut clocks = self.clocks.lock().expect("clocks mutex poisoned");
-                        let state = clocks
-                            .entry(peer_ip.clone())
-                            .or_insert_with(AgentClockState::new);
-                        let span_end_ms = (span.end_time_unix_nano / 1_000_000) as i64;
-                        if span_end_ms > 0 {
-                            state.record_sample(arrived_at_ms, span_end_ms);
+                        // Prefer the NTP-derived offset when the agent has
+                        // completed the four-timestamp handshake. The NTP map
+                        // is keyed by agent_id, which the SDK sets equal to
+                        // service.instance.id in its OTel resource attributes.
+                        let ntp = self
+                            .ntp_offsets
+                            .lock()
+                            .expect("ntp_offsets mutex poisoned")
+                            .get(&service_instance_id)
+                            .copied();
+                        if let Some(offset) = ntp {
+                            offset
+                        } else {
+                            let mut clocks = self.clocks.lock().expect("clocks mutex poisoned");
+                            let state = clocks
+                                .entry(peer_ip.clone())
+                                .or_insert_with(AgentClockState::new);
+                            let span_end_ms = (span.end_time_unix_nano / 1_000_000) as i64;
+                            if span_end_ms > 0 {
+                                state.record_sample(arrived_at_ms, span_end_ms);
+                            }
+                            state.offset_ms()
                         }
-                        state.offset_ms()
                     };
 
                     let ps = PipelineSpan {
