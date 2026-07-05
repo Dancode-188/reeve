@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing;
 
 /// Configuration for [`ReeveSdk::connect`].
 pub struct SdkConfig {
