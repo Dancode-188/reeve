@@ -1,3 +1,4 @@
+pub mod config;
 pub mod dsl;
 
 use dsl::PolicyContext;
@@ -15,7 +16,7 @@ pub struct FiredRule {
 }
 
 pub struct PolicyEngine {
-    rules: Vec<PolicyRule>,
+    pub(crate) rules: Vec<PolicyRule>,
     cooldowns: HashMap<(AgentId, RuleId), Instant>,
 }
 
@@ -76,6 +77,23 @@ impl PolicyEngine {
             rules,
             cooldowns: HashMap::new(),
         }
+    }
+
+    /// Replaces all non-builtin rules atomically. Called at startup and on SIGHUP.
+    pub fn replace_user_rules(&mut self, user_rules: Vec<PolicyRule>) {
+        self.rules.retain(|r| r.id.as_str().starts_with("builtin_"));
+        let validated: Vec<PolicyRule> = user_rules
+            .into_iter()
+            .filter(|r| match dsl::validate_condition(&r.trigger_condition) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(rule_id = %r.id, error = %e, "policy rule has invalid condition; skipping");
+                    false
+                }
+            })
+            .collect();
+        tracing::info!(count = validated.len(), "loaded user-defined policy rules");
+        self.rules.extend(validated);
     }
 
     /// Evaluate all rules against `ctx` for the given agent and trace.
@@ -355,5 +373,61 @@ mod tests {
                 .iter()
                 .any(|f| f.rule.id.as_str() == "builtin_low_health")
         );
+    }
+
+    fn user_rule(id: &str, condition: &str) -> PolicyRule {
+        PolicyRule {
+            id: RuleId::from(id),
+            name: "test".to_string(),
+            description: "test rule".to_string(),
+            trigger_condition: condition.to_string(),
+            command_type: CommandType::Pause,
+            requires_confirmation: false,
+            cooldown_secs: 0,
+            scope: RuleScope::Global,
+            enabled: true,
+            auto_confirm_after_secs: None,
+        }
+    }
+
+    #[test]
+    fn replace_user_rules_adds_valid_rule() {
+        let mut engine = PolicyEngine::with_defaults();
+        engine.replace_user_rules(vec![user_rule("custom_low_health", "health_score < 50")]);
+        let fired = engine.evaluate(&agent(), &trace(), &ctx(40.0, 1.0, 0.9), Instant::now(), 0);
+        assert!(
+            fired
+                .iter()
+                .any(|f| f.rule.id.as_str() == "custom_low_health")
+        );
+    }
+
+    #[test]
+    fn replace_user_rules_drops_invalid_condition() {
+        let mut engine = PolicyEngine::with_defaults();
+        engine.replace_user_rules(vec![user_rule("bad_rule", "not a valid !!!! expr ???")]);
+        let fired = engine.evaluate(&agent(), &trace(), &ctx(25.0, 1.0, 0.9), Instant::now(), 0);
+        assert!(fired.iter().all(|f| f.rule.id.as_str() != "bad_rule"));
+    }
+
+    #[test]
+    fn replace_user_rules_preserves_builtins() {
+        let mut engine = PolicyEngine::with_defaults();
+        engine.replace_user_rules(vec![user_rule("custom_rule", "health_score < 50")]);
+        let fired = engine.evaluate(&agent(), &trace(), &ctx(25.0, 1.0, 0.9), Instant::now(), 0);
+        assert!(
+            fired
+                .iter()
+                .any(|f| f.rule.id.as_str() == "builtin_low_health")
+        );
+    }
+
+    #[test]
+    fn replace_user_rules_replaces_previous_user_rules() {
+        let mut engine = PolicyEngine::with_defaults();
+        engine.replace_user_rules(vec![user_rule("rule_v1", "health_score < 50")]);
+        engine.replace_user_rules(vec![user_rule("rule_v2", "health_score < 50")]);
+        assert!(engine.rules.iter().all(|r| r.id.as_str() != "rule_v1"));
+        assert!(engine.rules.iter().any(|r| r.id.as_str() == "rule_v2"));
     }
 }

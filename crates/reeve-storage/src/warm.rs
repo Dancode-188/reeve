@@ -1,3 +1,4 @@
+use reeve_model::entity::policy::{PolicyRule, RuleScope};
 use reeve_model::entity::{
     Agent, AgentStatus, CommandStatus, EvaluationResult, EvaluatorType, EventType, IntegrationPath,
     InternalSpan, InterventionCommand, InterventionOutcome, SpanEvent, SpanStatus, TargetType,
@@ -27,6 +28,10 @@ pub enum StorageError {
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../../../migrations/0001_initial.sql")),
     (2, include_str!("../../../migrations/0002_cot_json.sql")),
+    (
+        3,
+        include_str!("../../../migrations/0003_policy_rules_description.sql"),
+    ),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -174,6 +179,30 @@ fn row_to_intervention_outcome(row: &Row) -> rusqlite::Result<InterventionOutcom
         delta: row.get("delta")?,
         spans_measured: row.get("spans_measured")?,
         measured_at: row.get("measured_at")?,
+    })
+}
+
+fn row_to_policy_rule(row: &Row) -> rusqlite::Result<PolicyRule> {
+    let command_type: String = row.get("command_type")?;
+    let scope_raw: String = row.get("scope")?;
+    let scope = match scope_raw.split_once(':') {
+        Some(("agent", id)) => RuleScope::Agent(id.to_string()),
+        Some(("framework", name)) => RuleScope::Framework(name.to_string()),
+        _ => RuleScope::Global,
+    };
+    Ok(PolicyRule {
+        id: row.get::<_, String>("id")?.into(),
+        name: row.get("name")?,
+        description: row.get("description")?,
+        trigger_condition: row.get("trigger_condition")?,
+        command_type: serde_json::from_str(&command_type).map_err(rusqlite_serde_err)?,
+        requires_confirmation: row.get("requires_confirmation")?,
+        cooldown_secs: row.get::<_, i64>("cooldown_secs")? as u64,
+        scope,
+        enabled: row.get("enabled")?,
+        auto_confirm_after_secs: row
+            .get::<_, Option<i64>>("auto_confirm_after_secs")?
+            .map(|v| v as u64),
     })
 }
 
@@ -605,6 +634,55 @@ impl WarmStore {
             conn.prepare("SELECT * FROM spans WHERE trace_id = ?1 ORDER BY start_time")?
                 .query_map(params![trace_id.as_str()], row_to_span)?
                 .collect()
+        })
+        .await
+    }
+
+    pub async fn load_policy_rules(&self) -> Result<Vec<PolicyRule>, StorageError> {
+        self.with_conn(|conn| {
+            conn.prepare("SELECT * FROM policy_rules WHERE enabled = 1")?
+                .query_map([], row_to_policy_rule)?
+                .collect()
+        })
+        .await
+    }
+
+    pub async fn save_policy_rule(&self, rule: PolicyRule) -> Result<(), StorageError> {
+        let scope_text = match &rule.scope {
+            RuleScope::Global => "global".to_string(),
+            RuleScope::Agent(id) => format!("agent:{id}"),
+            RuleScope::Framework(name) => format!("framework:{name}"),
+        };
+        let command_type = serde_json::to_string(&rule.command_type)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_millis() as i64;
+        let id = rule.id.as_str().to_string();
+        let cooldown = rule.cooldown_secs as i64;
+        let auto_confirm = rule.auto_confirm_after_secs.map(|v| v as i64);
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO policy_rules \
+                 (id, name, description, scope, trigger_condition, command_type, \
+                  requires_confirmation, cooldown_secs, auto_confirm_after_secs, \
+                  enabled, created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    id,
+                    rule.name,
+                    rule.description,
+                    scope_text,
+                    rule.trigger_condition,
+                    command_type,
+                    rule.requires_confirmation,
+                    cooldown,
+                    auto_confirm,
+                    rule.enabled,
+                    now,
+                ],
+            )?;
+            Ok(())
         })
         .await
     }
