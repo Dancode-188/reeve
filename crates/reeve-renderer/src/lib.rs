@@ -20,6 +20,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Layout},
 };
+use reeve_intervention::dispatcher::Dispatcher;
 use reeve_model::signal::{EngineEvent, IngestionEvent};
 use reeve_storage::warm::WarmStore;
 use std::sync::Arc;
@@ -31,11 +32,12 @@ pub async fn run(
     engine_event_rx: broadcast::Receiver<EngineEvent>,
     warm: Arc<WarmStore>,
     ascii_mode: bool,
+    dispatcher: Arc<Dispatcher>,
 ) -> Result<(), RendererError> {
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen)?;
 
-    let result = run_inner(ingestion_rx, engine_event_rx, warm, ascii_mode).await;
+    let result = run_inner(ingestion_rx, engine_event_rx, warm, ascii_mode, dispatcher).await;
 
     let _ = disable_raw_mode();
     let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
@@ -48,6 +50,7 @@ async fn run_inner(
     engine_event_rx: broadcast::Receiver<EngineEvent>,
     warm: Arc<WarmStore>,
     ascii_mode: bool,
+    dispatcher: Arc<Dispatcher>,
 ) -> Result<(), RendererError> {
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -55,7 +58,7 @@ async fn run_inner(
 
     let ascii = AsciiMode::new(ascii_mode);
     let theme = Theme::load();
-    let mut app = App::new(ingestion_rx, engine_event_rx, warm).await;
+    let mut app = App::new(ingestion_rx, engine_event_rx, warm, dispatcher).await;
 
     let (action_tx, mut action_rx) = mpsc::channel(64);
     tokio::spawn(async move {
@@ -124,6 +127,14 @@ async fn run_inner(
                     panels::render_footer(frame, full.footer, &theme, right_hidden, left_hidden);
                     if app.state.show_help {
                         panels::render_help_overlay(frame, frame.area(), &theme);
+                    }
+                    if app.state.overlay.is_some() {
+                        panels::render_intervention_overlay(
+                            frame,
+                            frame.area(),
+                            &app.state,
+                            &theme,
+                        );
                     }
                 })?;
 

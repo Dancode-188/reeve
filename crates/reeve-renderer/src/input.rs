@@ -6,6 +6,8 @@ pub enum Action {
     Quit,
     MoveUp,
     MoveDown,
+    VimUp,
+    VimDown,
     Select,
     ScrollUp,
     ScrollDown,
@@ -16,6 +18,10 @@ pub enum Action {
     DismissDegraded,
     Retry,
     Resize(u16, u16),
+    OverlayOpen,
+    QuickPause,
+    Char(char),
+    Backspace,
 }
 
 pub async fn run(tx: mpsc::Sender<Action>) {
@@ -42,8 +48,10 @@ fn map_event(event: Event) -> Option<Action> {
             (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 Some(Action::Quit)
             }
-            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => Some(Action::MoveUp),
-            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => Some(Action::MoveDown),
+            (KeyCode::Up, _) => Some(Action::MoveUp),
+            (KeyCode::Down, _) => Some(Action::MoveDown),
+            (KeyCode::Char('k'), _) => Some(Action::VimUp),
+            (KeyCode::Char('j'), _) => Some(Action::VimDown),
             (KeyCode::Char('l'), _) => Some(Action::NextPanel),
             (KeyCode::Char('h'), _) => Some(Action::PrevPanel),
             (KeyCode::Enter, _) => Some(Action::Select),
@@ -55,6 +63,11 @@ fn map_event(event: Event) -> Option<Action> {
             (KeyCode::Esc, _) => Some(Action::Dismiss),
             (KeyCode::Char('d'), _) => Some(Action::DismissDegraded),
             (KeyCode::Char('r'), _) => Some(Action::Retry),
+            (KeyCode::Char('i'), _) => Some(Action::OverlayOpen),
+            (KeyCode::Char('p'), _) => Some(Action::QuickPause),
+            (KeyCode::Backspace, _) => Some(Action::Backspace),
+            (KeyCode::Char(c), KeyModifiers::NONE) => Some(Action::Char(c)),
+            (KeyCode::Char(c), KeyModifiers::SHIFT) => Some(Action::Char(c)),
             _ => None,
         },
         Event::Resize(w, h) => Some(Action::Resize(w, h)),
