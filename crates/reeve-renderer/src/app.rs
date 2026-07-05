@@ -132,6 +132,11 @@ pub struct InterventionOverlayState {
     pub mode: OverlayMode,
 }
 
+pub struct SuggestedIntervention {
+    pub command: OverlayCommand,
+    pub text: String,
+}
+
 pub struct AppState {
     pub agents: IndexMap<AgentId, AgentState>,
     pub selected_agent: Option<usize>,
@@ -166,6 +171,8 @@ pub struct AppState {
     pub pending_commands: HashMap<CommandId, AgentId>,
     /// Intervention overlay state when the modal is open.
     pub overlay: Option<InterventionOverlayState>,
+    /// Pre-written suggestion surfaced by a policy alert or evaluation threshold.
+    pub active_suggestion: Option<SuggestedIntervention>,
 }
 
 impl AppState {
@@ -258,6 +265,7 @@ impl App {
                 agent_capabilities: HashMap::new(),
                 pending_commands: HashMap::new(),
                 overlay: None,
+                active_suggestion: None,
             },
         }
     }
@@ -301,9 +309,11 @@ impl App {
                     .map(|(id, _)| id == &agent_id)
                     .unwrap_or(false);
                 if is_selected {
+                    self.state.active_suggestion = None;
                     self.state.metric_scores.clear();
                     self.state.health_tier2_pending = false;
                     self.load_trace(trace_id).await;
+                    self.update_ctx_suggestion();
                 }
             }
             IngestionEvent::StreamingUpdate { content, .. } => {
@@ -387,13 +397,21 @@ impl App {
                     entry.confidence = confidence;
                 } else {
                     self.state.metric_scores.push(MetricScore {
-                        name: metric,
+                        name: metric.clone(),
                         score,
                         confidence,
                     });
                 }
+                if metric == "faithfulness" && score < 0.6 {
+                    self.state.active_suggestion = Some(SuggestedIntervention {
+                        command: OverlayCommand::InjectContext,
+                        text: "Please only use retrieved source material.".to_string(),
+                    });
+                }
+                self.update_ctx_suggestion();
             }
             EngineEvent::PolicyAlert {
+                rule_id,
                 description,
                 command_type,
                 ..
@@ -408,6 +426,9 @@ impl App {
                 self.state
                     .flash_targets
                     .insert(FlashTarget::AlertSection, (FlashDirection::Alert, 2));
+                if let Some(s) = suggestion_for_rule(&rule_id) {
+                    self.state.active_suggestion = Some(s);
+                }
             }
             EngineEvent::AgentControlConnected {
                 agent_id,
@@ -656,6 +677,38 @@ impl App {
                     .cloned()
                     .unwrap_or_default();
 
+                // Suggestion keys take priority when a suggestion is active.
+                if self.state.active_suggestion.is_some() {
+                    match action {
+                        // [Enter] dispatches the suggestion immediately.
+                        Action::Select => {
+                            let suggestion = self.state.active_suggestion.take().unwrap();
+                            let cmd_type = suggestion_to_command_type(suggestion);
+                            self.state.overlay = None;
+                            self.dispatch_command(agent_id, cmd_type).await;
+                            return;
+                        }
+                        // [Tab] copies suggestion text into the input field.
+                        Action::NextPanel => {
+                            let suggestion = self.state.active_suggestion.take().unwrap();
+                            let (command, text) = (suggestion.command, suggestion.text);
+                            if let Some(ref mut ov) = self.state.overlay {
+                                ov.mode = OverlayMode::TextInput {
+                                    command,
+                                    buffer: text,
+                                };
+                            }
+                            return;
+                        }
+                        // [Esc] dismisses just the suggestion, keeps overlay open.
+                        Action::Dismiss => {
+                            self.state.active_suggestion = None;
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 match action {
                     Action::Dismiss => {
                         self.state.overlay = None;
@@ -721,6 +774,36 @@ impl App {
         let dispatched = self.dispatcher.dispatch(&agent_id, command).await;
         if dispatched {
             self.state.pending_commands.insert(command_id, agent_id);
+        }
+    }
+
+    fn update_ctx_suggestion(&mut self) {
+        let Some(trace) = self.state.trace.as_ref() else {
+            return;
+        };
+        for span in trace.spans.values() {
+            let Some(tok_in) = span
+                .attributes
+                .get("gen_ai.usage.input_tokens")
+                .and_then(|v| v.as_u64())
+            else {
+                continue;
+            };
+            let model = span
+                .attributes
+                .get("gen_ai.request.model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(max) = crate::context_windows::context_window_for_model(model) {
+                let pct = tok_in as f64 / f64::from(max);
+                if pct >= 0.85 && self.state.active_suggestion.is_none() {
+                    self.state.active_suggestion = Some(SuggestedIntervention {
+                        command: OverlayCommand::InjectContext,
+                        text: "Please complete your current task promptly.".to_string(),
+                    });
+                    return;
+                }
+            }
         }
     }
 
@@ -794,4 +877,29 @@ fn current_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn suggestion_for_rule(rule_id: &str) -> Option<SuggestedIntervention> {
+    match rule_id {
+        "builtin_loop_detected" => Some(SuggestedIntervention {
+            command: OverlayCommand::Redirect,
+            text: "You are in a loop. Try a different approach.".to_string(),
+        }),
+        "builtin_high_cost" | "builtin_predicted_cost" => Some(SuggestedIntervention {
+            command: OverlayCommand::Redirect,
+            text: "Please summarize your findings and stop.".to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn suggestion_to_command_type(s: SuggestedIntervention) -> CommandType {
+    match s.command {
+        OverlayCommand::Redirect => CommandType::Redirect {
+            instruction: s.text,
+        },
+        OverlayCommand::InjectContext => CommandType::InjectContext { context: s.text },
+        OverlayCommand::Pause => CommandType::Pause,
+        OverlayCommand::Kill => CommandType::Kill,
+    }
 }
