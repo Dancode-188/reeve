@@ -57,6 +57,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ntp_offsets: Arc<Mutex<HashMap<String, i64>>> = Arc::new(Mutex::new(HashMap::new()));
 
+    let (dispatch_tx, mut dispatch_rx) = tokio::sync::mpsc::channel::<(
+        reeve_model::ids::AgentId,
+        reeve_model::entity::intervention::InterventionCommand,
+    )>(64);
+
     let engine_ingestion_rx = ingestion_tx.subscribe();
     tokio::spawn(reeve_ingestion::serve(
         addr,
@@ -68,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine_ingestion_rx,
         engine_event_tx.clone(),
         warm.clone(),
+        Some(dispatch_tx),
     ));
     let control_server =
         reeve_intervention::server::run(engine_event_tx.clone(), ntp_offsets).await;
@@ -77,6 +83,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("audit.log");
     let dispatcher =
         reeve_intervention::dispatcher::Dispatcher::new(control_server, warm.clone(), audit_path);
+
+    let engine_dispatcher = dispatcher.clone();
+    tokio::spawn(async move {
+        while let Some((agent_id, command)) = dispatch_rx.recv().await {
+            engine_dispatcher.dispatch(&agent_id, command).await;
+        }
+    });
+
     reeve_renderer::run(ingestion_rx, engine_event_rx, warm, ascii_mode, dispatcher).await?;
 
     Ok(())

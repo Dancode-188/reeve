@@ -12,6 +12,7 @@ use evaluation::llm_judge::{self, LlmJudge};
 use policy::dsl::PolicyContext;
 use policy::{PolicyEngine, alert_fields};
 use reeve_model::entity::evaluation::{EvaluationResult, EvaluatorType, TargetType};
+use reeve_model::entity::intervention::InterventionCommand;
 use reeve_model::entity::span::InternalSpan;
 use reeve_model::ids::{AgentId, EvalId, TraceId};
 use reeve_model::signal::{EngineEvent, EvaluationConfidence, IngestionEvent};
@@ -20,12 +21,15 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
+
+pub type DispatchSender = mpsc::Sender<(AgentId, InterventionCommand)>;
 
 pub async fn run(
     mut ingestion_rx: broadcast::Receiver<IngestionEvent>,
     engine_tx: broadcast::Sender<EngineEvent>,
     warm: Arc<WarmStore>,
+    dispatch_tx: Option<DispatchSender>,
 ) {
     let backend = llm_judge::probe().await;
     let (backend_name, backend_reason) = match &backend {
@@ -199,13 +203,15 @@ pub async fn run(
                             requires_confirmation,
                             auto_confirm_after_secs,
                         });
-                        if let Err(e) = warm.save_intervention_command(fr.command).await {
-                            tracing::warn!(
-                                rule_id = %rule_id_owned,
-                                error = %e,
-                                "failed to persist intervention command"
-                            );
-                        }
+                        dispatch_or_save(
+                            &dispatch_tx,
+                            &warm,
+                            &agent_id,
+                            fr.command,
+                            requires_confirmation,
+                            &rule_id_owned,
+                        )
+                        .await;
                     }
                 }
 
@@ -343,13 +349,15 @@ pub async fn run(
                         requires_confirmation,
                         auto_confirm_after_secs,
                     });
-                    if let Err(e) = warm.save_intervention_command(fr.command).await {
-                        tracing::warn!(
-                            rule_id = %rule_id_owned,
-                            error = %e,
-                            "failed to persist mid-trace intervention command"
-                        );
-                    }
+                    dispatch_or_save(
+                        &dispatch_tx,
+                        &warm,
+                        &agent_id,
+                        fr.command,
+                        requires_confirmation,
+                        &rule_id_owned,
+                    )
+                    .await;
                 }
             }
             Ok(_) => {}
@@ -361,6 +369,25 @@ pub async fn run(
                 break;
             }
         }
+    }
+}
+
+async fn dispatch_or_save(
+    dispatch_tx: &Option<DispatchSender>,
+    warm: &WarmStore,
+    agent_id: &AgentId,
+    command: InterventionCommand,
+    requires_confirmation: bool,
+    rule_id: &str,
+) {
+    if !requires_confirmation {
+        if let Some(tx) = dispatch_tx {
+            if tx.send((agent_id.clone(), command)).await.is_err() {
+                tracing::warn!(rule_id, "dispatch channel closed; command dropped");
+            }
+        }
+    } else if let Err(e) = warm.save_intervention_command(command).await {
+        tracing::warn!(rule_id, error = %e, "failed to persist intervention command");
     }
 }
 
