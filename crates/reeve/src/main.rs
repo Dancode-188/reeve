@@ -1,10 +1,11 @@
 #![deny(clippy::all)]
 
 use reeve_storage::warm::WarmStore;
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 #[tokio::main]
@@ -54,14 +55,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| "127.0.0.1:4317".parse().unwrap());
 
+    let ntp_offsets: Arc<Mutex<HashMap<String, i64>>> = Arc::new(Mutex::new(HashMap::new()));
+
     let engine_ingestion_rx = ingestion_tx.subscribe();
-    tokio::spawn(reeve_ingestion::serve(addr, warm.clone(), ingestion_tx));
+    tokio::spawn(reeve_ingestion::serve(
+        addr,
+        warm.clone(),
+        ingestion_tx,
+        ntp_offsets.clone(),
+    ));
     tokio::spawn(reeve_engine::run(
         engine_ingestion_rx,
         engine_event_tx.clone(),
         warm.clone(),
     ));
-    let control_server = reeve_intervention::server::run(engine_event_tx.clone()).await;
+    let control_server =
+        reeve_intervention::server::run(engine_event_tx.clone(), ntp_offsets).await;
     let audit_path = db_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))

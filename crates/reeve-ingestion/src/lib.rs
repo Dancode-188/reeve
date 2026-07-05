@@ -18,6 +18,7 @@ pub async fn serve(
     addr: SocketAddr,
     warm: Arc<WarmStore>,
     signal_tx: broadcast::Sender<IngestionEvent>,
+    ntp_offsets: receive::NtpOffsets,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let hot = Arc::new(Mutex::new(HotStore::new(10_000)));
 
@@ -38,7 +39,10 @@ pub async fn serve(
 
     Server::builder()
         .add_service(health_service)
-        .add_service(TraceServiceServer::new(OtlpReceiver::new(pipeline_tx)))
+        .add_service(TraceServiceServer::new(OtlpReceiver::new(
+            pipeline_tx,
+            ntp_offsets,
+        )))
         .serve(addr)
         .await?;
 
