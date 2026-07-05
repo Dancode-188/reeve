@@ -1,12 +1,15 @@
 use crate::input::Action;
 use indexmap::IndexMap;
+use reeve_intervention::dispatcher::Dispatcher;
 use reeve_model::entity::agent::Agent;
+use reeve_model::entity::intervention::{CommandStatus, CommandType, InterventionCommand};
 use reeve_model::entity::span::InternalSpan;
-use reeve_model::ids::{AgentId, SpanId, TraceId};
+use reeve_model::ids::{AgentId, CommandId, SpanId, TraceId};
 use reeve_model::signal::{CostTrend, EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::WarmStore;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 pub struct MetricScore {
@@ -105,6 +108,30 @@ pub struct FatalError {
     pub hint: Option<String>,
 }
 
+/// What the overlay is currently waiting for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OverlayMode {
+    Menu,
+    TextInput {
+        command: OverlayCommand,
+        buffer: String,
+    },
+    KillConfirm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayCommand {
+    Pause,
+    Redirect,
+    InjectContext,
+    Kill,
+}
+
+pub struct InterventionOverlayState {
+    pub agent_id: AgentId,
+    pub mode: OverlayMode,
+}
+
 pub struct AppState {
     pub agents: IndexMap<AgentId, AgentState>,
     pub selected_agent: Option<usize>,
@@ -133,6 +160,12 @@ pub struct AppState {
     pub fatal_error: Option<FatalError>,
     /// True when the user has dimmed the degraded-backend banner with [d].
     pub degraded_dismissed: bool,
+    /// Capabilities reported by each connected agent during the control handshake.
+    pub agent_capabilities: HashMap<AgentId, Vec<String>>,
+    /// Commands dispatched from the UI that have not yet been acknowledged.
+    pub pending_commands: HashMap<CommandId, AgentId>,
+    /// Intervention overlay state when the modal is open.
+    pub overlay: Option<InterventionOverlayState>,
 }
 
 impl AppState {
@@ -156,12 +189,19 @@ impl AppState {
             FlashDirection::Alert => theme.health_warn(),
         })
     }
+
+    pub fn selected_agent_id(&self) -> Option<&AgentId> {
+        self.selected_agent
+            .and_then(|i| self.agents.get_index(i))
+            .map(|(id, _)| id)
+    }
 }
 
 pub struct App {
     pub ingestion_rx: broadcast::Receiver<IngestionEvent>,
     pub engine_event_rx: broadcast::Receiver<EngineEvent>,
     pub warm: Arc<WarmStore>,
+    pub dispatcher: Arc<Dispatcher>,
     pub should_quit: bool,
     pub state: AppState,
 }
@@ -171,6 +211,7 @@ impl App {
         ingestion_rx: broadcast::Receiver<IngestionEvent>,
         engine_event_rx: broadcast::Receiver<EngineEvent>,
         warm: Arc<WarmStore>,
+        dispatcher: Arc<Dispatcher>,
     ) -> Self {
         let mut agents: IndexMap<AgentId, AgentState> = IndexMap::new();
         match warm.list_agents().await {
@@ -192,6 +233,7 @@ impl App {
             ingestion_rx,
             engine_event_rx,
             warm,
+            dispatcher,
             should_quit: false,
             state: AppState {
                 agents,
@@ -213,6 +255,9 @@ impl App {
                 errors: Vec::new(),
                 fatal_error: None,
                 degraded_dismissed: false,
+                agent_capabilities: HashMap::new(),
+                pending_commands: HashMap::new(),
+                overlay: None,
             },
         }
     }
@@ -364,9 +409,20 @@ impl App {
                     .flash_targets
                     .insert(FlashTarget::AlertSection, (FlashDirection::Alert, 2));
             }
-            EngineEvent::AgentControlConnected { .. }
-            | EngineEvent::AgentControlDisconnected { .. } => {
-                // Intervention overlay state is not yet wired (#61).
+            EngineEvent::AgentControlConnected {
+                agent_id,
+                capabilities,
+            } => {
+                self.state.agent_capabilities.insert(agent_id, capabilities);
+            }
+            EngineEvent::AgentControlDisconnected { agent_id } => {
+                self.state.agent_capabilities.remove(&agent_id);
+                // Close overlay if open for the disconnecting agent.
+                if let Some(ref ov) = self.state.overlay {
+                    if ov.agent_id == agent_id {
+                        self.state.overlay = None;
+                    }
+                }
             }
         }
     }
@@ -418,9 +474,15 @@ impl App {
     }
 
     pub async fn handle_action(&mut self, action: Action) {
+        // When overlay is open, consume most actions before they reach the cockpit.
+        if self.state.overlay.is_some() {
+            self.handle_overlay_action(action).await;
+            return;
+        }
+
         match action {
             Action::Quit => self.should_quit = true,
-            Action::MoveUp => match self.state.panel_focus {
+            Action::MoveUp | Action::VimUp => match self.state.panel_focus {
                 PanelFocus::Left => {
                     self.move_selection(-1);
                     self.load_trace_for_selected().await;
@@ -428,7 +490,7 @@ impl App {
                 PanelFocus::Center => self.move_center_selection(-1),
                 _ => {}
             },
-            Action::MoveDown => match self.state.panel_focus {
+            Action::MoveDown | Action::VimDown => match self.state.panel_focus {
                 PanelFocus::Left => {
                     self.move_selection(1);
                     self.load_trace_for_selected().await;
@@ -510,7 +572,155 @@ impl App {
                     self.state.degraded_dismissed = false;
                 }
             }
-            Action::Resize(_, _) => {}
+            Action::OverlayOpen => {
+                if let Some(agent_id) = self.state.selected_agent_id().cloned() {
+                    self.state.overlay = Some(InterventionOverlayState {
+                        agent_id,
+                        mode: OverlayMode::Menu,
+                    });
+                }
+            }
+            Action::QuickPause => {
+                if let Some(agent_id) = self.state.selected_agent_id().cloned() {
+                    self.dispatch_command(agent_id, CommandType::Pause).await;
+                }
+            }
+            Action::Resize(_, _) | Action::Char(_) | Action::Backspace => {}
+        }
+    }
+
+    async fn handle_overlay_action(&mut self, action: Action) {
+        let Some(overlay) = self.state.overlay.as_mut() else {
+            return;
+        };
+
+        match &overlay.mode {
+            OverlayMode::KillConfirm => match action {
+                Action::Char('y') => {
+                    let agent_id = overlay.agent_id.clone();
+                    self.state.overlay = None;
+                    self.dispatch_command(agent_id, CommandType::Kill).await;
+                }
+                Action::Char('n') | Action::Dismiss => {
+                    if let Some(ref mut ov) = self.state.overlay {
+                        ov.mode = OverlayMode::Menu;
+                    }
+                }
+                _ => {}
+            },
+            OverlayMode::TextInput { .. } => match action {
+                Action::Select => {
+                    let Some(ov) = self.state.overlay.take() else {
+                        return;
+                    };
+                    if let OverlayMode::TextInput { command, buffer } = ov.mode {
+                        let cmd_type = match command {
+                            OverlayCommand::Redirect => CommandType::Redirect {
+                                instruction: buffer,
+                            },
+                            OverlayCommand::InjectContext => {
+                                CommandType::InjectContext { context: buffer }
+                            }
+                            _ => return,
+                        };
+                        self.dispatch_command(ov.agent_id, cmd_type).await;
+                    }
+                }
+                Action::Dismiss => {
+                    if let Some(ref mut ov) = self.state.overlay {
+                        ov.mode = OverlayMode::Menu;
+                    }
+                }
+                Action::Backspace => {
+                    if let Some(ref mut ov) = self.state.overlay {
+                        if let OverlayMode::TextInput { ref mut buffer, .. } = ov.mode {
+                            buffer.pop();
+                        }
+                    }
+                }
+                Action::Char(c) => {
+                    if let Some(ref mut ov) = self.state.overlay {
+                        if let OverlayMode::TextInput { ref mut buffer, .. } = ov.mode {
+                            buffer.push(c);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            OverlayMode::Menu => {
+                let agent_id = overlay.agent_id.clone();
+                let caps = self
+                    .state
+                    .agent_capabilities
+                    .get(&agent_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                match action {
+                    Action::Dismiss => {
+                        self.state.overlay = None;
+                    }
+                    // [p] in overlay = pause
+                    Action::QuickPause if caps.contains(&"pause".to_string()) => {
+                        self.state.overlay = None;
+                        self.dispatch_command(agent_id, CommandType::Pause).await;
+                    }
+                    // [r] in overlay = redirect
+                    Action::Retry if caps.contains(&"redirect".to_string()) => {
+                        if let Some(ref mut ov) = self.state.overlay {
+                            ov.mode = OverlayMode::TextInput {
+                                command: OverlayCommand::Redirect,
+                                buffer: String::new(),
+                            };
+                        }
+                    }
+                    Action::Char('c') if caps.contains(&"inject_context".to_string()) => {
+                        if let Some(ref mut ov) = self.state.overlay {
+                            ov.mode = OverlayMode::TextInput {
+                                command: OverlayCommand::InjectContext,
+                                buffer: String::new(),
+                            };
+                        }
+                    }
+                    // [k] in overlay = kill
+                    Action::VimUp if caps.contains(&"kill".to_string()) => {
+                        if let Some(ref mut ov) = self.state.overlay {
+                            ov.mode = OverlayMode::KillConfirm;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    async fn dispatch_command(&mut self, agent_id: AgentId, command_type: CommandType) {
+        let now_ms = current_ms();
+        let command_id = CommandId::from(format!("cmd-{now_ms:x}"));
+        let trace_id = self
+            .state
+            .agents
+            .get(&agent_id)
+            .and_then(|s| s.last_trace_id.clone())
+            .unwrap_or_else(|| TraceId::from(""));
+
+        let command = InterventionCommand {
+            id: command_id.clone(),
+            trace_id,
+            span_id: None,
+            policy_id: None,
+            command_type,
+            status: CommandStatus::Pending,
+            requires_confirmation: false,
+            issued_at: now_ms,
+            acknowledged_at: None,
+            issued_by: "human".to_string(),
+            valid_until_ms: now_ms + 60_000,
+        };
+
+        let dispatched = self.dispatcher.dispatch(&agent_id, command).await;
+        if dispatched {
+            self.state.pending_commands.insert(command_id, agent_id);
         }
     }
 
@@ -577,4 +787,11 @@ fn flatten_tree(
         }
     }
     order
+}
+
+fn current_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }

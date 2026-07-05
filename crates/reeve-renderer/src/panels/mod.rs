@@ -5,6 +5,7 @@ pub mod footer;
 pub mod header;
 pub mod help;
 pub mod left;
+pub mod overlay;
 pub mod right;
 
 use crate::{app::AppState, ascii::AsciiMode, layout::Panels, theme::Theme};
@@ -72,4 +73,8 @@ pub fn render_fatal(frame: &mut Frame, area: Rect, err: &crate::app::FatalError,
 
 pub fn render_degraded(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     degraded::render(frame, area, state, theme);
+}
+
+pub fn render_intervention_overlay(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    overlay::render(frame, area, state, theme);
 }

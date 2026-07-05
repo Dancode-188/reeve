@@ -66,9 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("audit.log");
-    let _dispatcher =
+    let dispatcher =
         reeve_intervention::dispatcher::Dispatcher::new(control_server, warm.clone(), audit_path);
-    reeve_renderer::run(ingestion_rx, engine_event_rx, warm, ascii_mode).await?;
+    reeve_renderer::run(ingestion_rx, engine_event_rx, warm, ascii_mode, dispatcher).await?;
 
     Ok(())
 }
