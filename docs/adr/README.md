@@ -30,6 +30,8 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0023](./0023-grpc-control-channel-protocol.md) | gRPC Control Channel Protocol | Accepted | 2026-07-04 |
 | [0024](./0024-command-expiry-via-valid-until-ms.md) | Command Expiry via `valid_until_ms` | Accepted | 2026-07-04 |
 | [0025](./0025-audit-trail-format-and-attribution.md) | Audit Trail Format and `issued_by` Attribution | Accepted | 2026-07-04 |
+| [0027](./0027-checkpoint-as-polling-primitive.md) | `checkpoint()` as a Pull-Based Polling Primitive | Accepted | 2026-07-05 |
+| [0028](./0028-python-sdk-adapter-via-framework-callbacks.md) | Python SDK Adapter via Framework Callback Handlers | Accepted | 2026-07-05 |
 
 ## Format
 
