@@ -371,7 +371,7 @@ fn current_ms() -> i64 {
 mod tests {
     use super::*;
     use reeve_model::entity::intervention::CommandType;
-    use reeve_model::ids::{CommandId, RuleId, SpanId, TraceId};
+    use reeve_model::ids::{CommandId, TraceId};
     use tokio::sync::broadcast;
 
     fn make_dispatcher() -> Arc<Dispatcher> {
