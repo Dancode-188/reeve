@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-06
+
+### Added
+
+- gRPC control channel on `127.0.0.1:4316`: a bidirectional `ControlStream`
+  carrying commands to agents and acknowledgments back. The first message
+  must be an `AgentHandshake` declaring the agent's identity, framework, and
+  capabilities; the server refuses anything else.
+- `checkpoint()` primitive in the Rust SDK (`reeve-sdk`). Agents call it at
+  safe yield points; it returns `Continue`, `Redirect(instruction)`, or
+  `Context(json)`, blocks in place on Pause until Resume, and surfaces Kill
+  as an error so the `?` operator propagates it.
+- Python SDK (`sdk/python`) with the same checkpoint contract, an OTel
+  exporter wired to port 4317, and adapters for LangChain callbacks, OpenAI
+  Agents SDK hooks, and the Claude Agent SDK.
+- Command dispatcher with a safety layer: duplicate command IDs are dropped,
+  commands past `valid_until_ms` are discarded, an unacknowledged command is
+  retried once after 30 seconds and then expired. Every dispatch, ack,
+  retry, and expiry is appended to `~/.local/share/reeve/audit.log` with
+  `issued_by` attribution (`human`, `policy:<rule_id>`, or
+  `policy_auto:<rule_id>`).
+- Intervention overlay on `i`: pause/resume, redirect, inject context, and
+  kill (with confirmation), gated by the capabilities the agent declared.
+  Numbered templates load canned instructions into the input; suggested
+  interventions appear per failure mode and dispatch on Enter.
+- `p` is a pause/resume toggle. Pause state flips on the agent's applied
+  ack, the agents panel shows a paused indicator, and a paused agent's
+  in-flight traces are exempt from the idle timeout.
+- Confirmation modal for policy rules with `requires_confirmation`. Enter
+  dispatches with policy attribution, Esc dismisses, and rules with
+  `auto_confirm_after_secs` auto-execute when the countdown expires.
+- User-defined policy rules loaded from the `policy_rules` table and
+  `~/.config/reeve/config.toml` at startup and on `SIGUSR1`. Conditions get
+  a dry-run evaluation before entering the live set; invalid ones are
+  skipped with a warning.
+- Policy rule cooldowns persist across restarts in a `policy_cooldowns`
+  table, so a restart no longer resets every cooldown window.
+- Policy commands that need no confirmation dispatch straight to the agent
+  through the control channel.
+- Canonical agent identity: the handshake carries `service_name` and
+  `service_instance_id`, and both channels derive the same
+  `name:instance` id from them, so commands aimed at an observed agent
+  reach its control stream by construction.
+- NTP-style clock offset from the handshake's four-timestamp exchange,
+  replacing the connection-time approximation for agents that complete it.
+- Mid-trace cost prediction with a `predicted_cost` policy primitive and a
+  built-in rule that fires before an expensive trace finishes.
+- Adaptive Tier 2 sampling driven by the health score trend.
+- Structured chain-of-thought output from the LLM judge, stored per
+  evaluation for inspection.
+- CTX WINDOW section in the right panel with a saturation gauge; left and
+  right panels restructured to the final section layout.
+- Fatal error screen (full-screen card with retry/quit) and degraded state
+  banner (amber, dismissible) for unrecoverable and reduced-capability
+  startup conditions.
+
+### Changed
+
+- Policy rule reload moved from `SIGHUP` to `SIGUSR1`. `SIGHUP` keeps its
+  default disposition so closing the terminal terminates Reeve.
+- Rust SDK configuration takes an agent name plus an optional instance id
+  instead of a single `agent_id`, and sets the OTel resource identity from
+  them. Agents that need a stable identity across restarts should pass the
+  instance id explicitly.
+
+### Fixed
+
+- Pausing an agent for longer than 30 seconds no longer destroys its
+  in-flight trace and orphans the spans that arrive after Resume.
+- An unopenable audit log shows the fatal error screen instead of taking
+  the process down with a panic.
+- The Python SDK acks Pause as applied when the agent reaches the yield
+  point rather than at resume time, acks Redirect and InjectContext as
+  applied at all, deduplicates retried command IDs instead of re-applying
+  them, and processes Kill while paused instead of deadlocking.
+- Typing into the redirect and inject-context inputs no longer drops
+  characters whose keys double as global bindings.
+- Reeve no longer survives terminal close as an invisible process holding
+  both ports.
+- Confirming a policy alert now dispatches the command; the confirmation
+  path matched differently-cased command strings and silently did nothing.
+- The release workflow no longer fails when rerun against an existing
+  GitHub release.
+
 ## [0.2.0] - 2026-07-01
 
 ### Added

@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange.svg)](https://www.rust-lang.org)
 
-<!-- Demo GIF goes here before v0.3.0 ships.
+<!-- Demo GIF goes here before v1.0.0 ships.
      Record: agent connects, trace tree grows in real time, streaming
      cursor appears, health score drops, policy fires, redirect sent,
      quality recovers. Eight seconds. That clip is the whole pitch.    -->
@@ -35,7 +35,7 @@ Reeve is for that moment.
 ---
 
 ```
-┌─ REEVE v0.2.0 ──────────────────────── ● research-bot  ◆72 CAUTION  $0.047 ──┐
+┌─ REEVE v0.3.0 ──────────────────────── ● research-bot  ◆72 CAUTION  $0.047 ──┐
 │ AGENTS          │ TRACE ── task-0047 ── 12.4s                   │ SPAN DETAIL│
 │                 │                                               │            │
 │ ● research-bot  │ ▾ agent.execute  ◷ 12.4s  ●                   │ gen_ai.chat│
@@ -54,7 +54,7 @@ Reeve is for that moment.
 │ ▁▂▃▄▅▆▇  ↑      │                                               │SCORE   ██72│
 │ predicted $0.11 │                                               │ 2/3 metrics│
 └─────────────────┴───────────────────────────────────────────────┴────────────┘
- [j/k] nav  [i] intervene  [p] pause/resume  [n] note  [?] help  [q] quit
+ [j/k] nav  [i] intervene  [p] pause/resume  [?] help  [q] quit
 ```
 
 The trace tree grows as spans arrive. The LLM response appears token by token with
@@ -66,13 +66,14 @@ a blinking cursor. The health score tells you whether the agent is doing well. P
 ## Quick start
 
 ```bash
-cargo install reeve
+cargo install --git https://github.com/Dancode-188/reeve reeve
 reeve
 ```
 
-Reeve listens on `:4317` for OTel and `:4318` as an HTTP proxy. Connect your agent
-and it shows up. If Ollama is running with phi4-mini available, quality scoring starts
-immediately at zero cost. No account, no API key, no setup wizard.
+Reeve listens on `:4317` for OTel spans and `:4316` for the control channel.
+Connect your agent and it shows up. If Ollama is running with phi4-mini
+available, quality scoring starts immediately at zero cost. No account, no API
+key, no setup wizard.
 
 ---
 
@@ -97,10 +98,11 @@ automatically. You can write predicted thresholds that fire before a limit is hi
 not after.
 
 **Intervene.** Press `i`. Pause the agent, redirect it with a new instruction, inject
-context, or kill the trace. When the agent continues, Reeve measures whether the
-intervention improved quality. If you redirect a drifting agent and the health score
-goes from 0.31 to 0.89 over the next four spans, that shows up inline in the trace
-tree. You know it worked.
+context, or kill the trace. The agent applies the command at its next safe yield
+point and acknowledges every step back to the cockpit, so you watch the command
+land instead of hoping it did. Measuring whether the intervention improved quality
+and showing the delta inline in the trace tree is next on the
+[roadmap](ROADMAP.md) (v0.4.0).
 
 ---
 
@@ -110,62 +112,64 @@ tree. You know it worked.
 
 **LangChain**
 ```python
-from reeve import ReeveCallbacks
+from reeve import ReeveSdk
+from reeve.adapters.langchain import ReeveCallbacks
 
-agent = create_agent(
-    llm=llm, tools=tools,
-    callbacks=[ReeveCallbacks(endpoint="http://localhost:4317")]
-)
-```
-
-**OpenAI Agents SDK**
-```python
-from reeve.adapters.openai import ReeveHooks
-
-agent = Agent(name="...", model="gpt-4o", tools=[...],
-              hooks=ReeveHooks(endpoint="http://localhost:4317"))
+sdk = await ReeveSdk.connect("research-bot")
+agent = create_agent(llm=llm, tools=tools, callbacks=[ReeveCallbacks(sdk)])
 ```
 
 **Custom Python**
 ```python
-from reeve import ReeveSdk
+from reeve import CheckpointResult, ReeveSdk
 
-reeve = ReeveSdk(endpoint="http://localhost:4317", agent_name="my-agent")
+sdk = await ReeveSdk.connect("my-agent")
 
-@reeve.trace()
+@sdk.trace()
 async def run():
     while not done:
-        await reeve.checkpoint()  # pauses here if you command it to
-        with reeve.llm_span() as span:
-            response = await llm.invoke(messages)
-            span.record_usage(response.usage)
-        await reeve.checkpoint()
+        result = await sdk.checkpoint()  # pauses here if you command it to
+        if isinstance(result, CheckpointResult.Redirect):
+            steer_toward(result.instruction)
+        response = await llm.invoke(messages)
+        await sdk.checkpoint()
 ```
+
+**Rust**
+```rust
+let reeve = ReeveSdk::connect(SdkConfig::new("my-agent")).await?;
+loop {
+    reeve.checkpoint().await?;  // returns Err(AgentError::Killed) on kill
+    let mut span = reeve.llm_span();
+    let response = llm.invoke(&messages).await?;
+    span.set_token_usage(response.usage.total_tokens);
+}
+```
+
+Adapters for the OpenAI Agents SDK and the Claude Agent SDK are planned for
+v1.0.0.
 
 Any OTel-instrumented agent can point directly at Reeve:
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 python your_agent.py
 ```
 
-### HTTP proxy (no SDK required)
+### HTTP proxy (no SDK required, planned)
 
-For Claude Code and similar tools that call the API directly:
-```bash
-ANTHROPIC_BASE_URL=http://localhost:4318 claude
-```
-
-Redirect and inject context work fully. Clean pause and kill do not. See
-[proxy path docs](docs/guides/proxy-path.md) for what works and what does not.
+The proxy path is v0.5.0 on the [roadmap](ROADMAP.md): point
+`ANTHROPIC_BASE_URL` at Reeve and watch Claude Code appear in the cockpit with
+zero integration work. Redirect and inject context will work cleanly through
+the proxy; pause and kill are fragile without an SDK and will say so honestly.
 
 ---
 
 ## A few things worth saying upfront
 
-**Nothing leaves your machine by default.** Quality evaluation runs locally via
-Ollama. If Ollama is available, the status bar shows `quality evaluation: local
-(phi4-mini)`. Cloud evaluation is opt-in with a cost cap you set. Reeve will not
-send your agent's data anywhere without you explicitly configuring it. This matters
-if your agents handle anything sensitive. Also just on principle.
+**Nothing leaves your machine.** Quality evaluation runs locally via Ollama. If
+Ollama is available, the status bar shows the local backend; if not, Tier 2
+evaluation turns itself off and says so. There is no cloud path, no telemetry,
+no account. This matters if your agents handle anything sensitive. Also just on
+principle.
 
 **Steer, don't block.** Most guardrail systems stop execution when something goes
 wrong. Reeve biases toward redirecting the agent and letting it self-correct. A good
@@ -191,26 +195,28 @@ something is going wrong right now.
 | Framework | Integration | Observation | Pause/Resume | Redirect |
 |-----------|-------------|-------------|--------------|----------|
 | LangChain | SDK | Full | Yes | Yes |
-| OpenAI Agents SDK | SDK | Full | Yes | Yes |
-| Claude Agent SDK | SDK | Full | Yes | Yes |
 | Custom Python | SDK | Full | Yes | Yes |
 | Rust agents | SDK | Full | Yes | Yes |
-| Claude Code | Proxy | Full | Limited | Yes |
+| OpenAI Agents SDK | SDK | Planned (v1.0.0) | — | — |
+| Claude Agent SDK | SDK | Planned (v1.0.0) | — | — |
+| Claude Code | Proxy | Planned (v0.5.0) | — | — |
 | Any OTel agent | OTel | Full | No | No |
 
 ---
 
 ## Install
 
-```bash
-cargo install reeve
-```
-
-Or from source:
+From source:
 ```bash
 git clone https://github.com/Dancode-188/reeve
 cd reeve
 cargo build --release
+./target/release/reeve
+```
+
+Or straight from the repository:
+```bash
+cargo install --git https://github.com/Dancode-188/reeve reeve
 ```
 
 Requires Rust 1.78+. Linux and macOS. On Windows, Windows Terminal works fine. Use
@@ -220,46 +226,38 @@ Requires Rust 1.78+. Linux and macOS. On Windows, Windows Terminal works fine. U
 
 ## Configuration
 
-Works without any config file. When you want to change something:
+Works without any config file. When you want your own policy rules:
 
 ```toml
 # ~/.config/reeve/config.toml
 
-[evaluation.tier2]
-backend = "auto"       # auto | local | cloud | off
-sample_rate = 0.20
-
-[evaluation.tier2.local]
-model = "phi4-mini"
-
-[evaluation.tier2.cloud]
-provider = "anthropic"
-model = "claude-haiku-4-5"
-api_key_env = "ANTHROPIC_API_KEY"
-max_cost_per_session_usd = 1.00   # hard cap. it will not go over this.
-
-[[intervention.templates]]
-name = "summarize and stop"
-type = "Redirect"
-instruction = "Please summarize what you have accomplished so far and stop."
+[[rules]]
+id = "my_cost_ceiling"
+name = "cost ceiling"
+description = "Trace crossed two dollars"
+trigger_condition = "cost_usd > 2.0"
+command_type = "pause"            # pause | resume | kill
+requires_confirmation = true      # default true
+cooldown_secs = 300               # default 300
+auto_confirm_after_secs = 30      # optional: auto-execute countdown
 ```
 
-Full reference at [docs/guides/configuration.md](docs/guides/configuration.md).
+Rules load at startup and reload on `SIGUSR1` without a restart. Conditions
+use the same primitives as the built-in rules: `health_score`, `cost_usd`,
+`span_count`, `predicted_cost`, and any evaluation metric by name.
 
 ---
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md): how the five layers fit together
 - [Architecture Decision Records](docs/adr/README.md): every significant design
   decision documented with context, alternatives considered, and consequences.
   Why a 2-second straggler window and not 30 seconds. Why phi4-mini. Why the
   control channel is separate from the OTel channel. Most projects lose this
   reasoning the moment a decision is made. It is all in here.
-- [Getting started](docs/guides/getting-started.md)
-- [Framework integration guides](docs/guides/)
-- [Configuration](docs/guides/configuration.md)
 - [Roadmap](ROADMAP.md)
+- [Architecture](docs/ARCHITECTURE.md) and getting-started guides land with
+  v1.0.0.
 
 ---
 

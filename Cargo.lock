@@ -1547,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "reeve"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "reeve-engine",
  "reeve-ingestion",
@@ -1562,7 +1562,7 @@ dependencies = [
 
 [[package]]
 name = "reeve-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "evalexpr",
  "rand 0.8.6",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "reeve-ingestion"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "opentelemetry-proto 0.32.0",
  "reeve-model",
@@ -1593,7 +1593,7 @@ dependencies = [
 
 [[package]]
 name = "reeve-intervention"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "prost 0.14.4",
  "reeve-model",
@@ -1608,7 +1608,7 @@ dependencies = [
 
 [[package]]
 name = "reeve-model"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1617,7 +1617,7 @@ dependencies = [
 
 [[package]]
 name = "reeve-renderer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crossterm",
  "indexmap 2.14.0",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "reeve-sdk"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "opentelemetry 0.27.1",
  "opentelemetry-otlp",
@@ -1651,7 +1651,7 @@ dependencies = [
 
 [[package]]
 name = "reeve-storage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "reeve-model",
  "rusqlite",
