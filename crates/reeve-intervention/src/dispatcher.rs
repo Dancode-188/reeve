@@ -79,6 +79,13 @@ impl Dispatcher {
         Ok(dispatcher)
     }
 
+    /// Whether the agent is currently paused, as confirmed by an applied
+    /// Pause ack that no applied Resume or Kill has since cleared. The UI
+    /// uses this to make the pause key a toggle.
+    pub fn is_paused(&self, agent_id: &AgentId) -> bool {
+        self.paused.lock().unwrap().contains(agent_id)
+    }
+
     /// Route a command to the agent that owns the trace. Returns `true` if the
     /// command was sent on the wire. Returns `false` if the agent is not
     /// connected, the command is already past its `valid_until_ms`, or the
@@ -583,6 +590,18 @@ mod tests {
             !d.paused.lock().unwrap().contains(&agent_id),
             "a killed agent is not paused; its traces must be allowed to finalize"
         );
+    }
+
+    #[tokio::test]
+    async fn is_paused_tracks_pause_resume_cycle() {
+        let d = make_dispatcher();
+        let agent_id = AgentId::from("agent-toggle");
+
+        assert!(!d.is_paused(&agent_id), "fresh agent is not paused");
+        ack_applied(&d, &agent_id, CommandType::Pause).await;
+        assert!(d.is_paused(&agent_id), "applied pause must be visible");
+        ack_applied(&d, &agent_id, CommandType::Resume).await;
+        assert!(!d.is_paused(&agent_id), "applied resume must clear it");
     }
 
     #[tokio::test]

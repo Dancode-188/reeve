@@ -148,6 +148,7 @@ async fn run_inner(
                 app.state.streaming.cursor_tick =
                     app.state.streaming.cursor_tick.wrapping_add(1);
                 app.state.advance_flash();
+                app.sync_pause_status();
                 app.check_auto_confirm().await;
 
                 terminal.draw(|frame| {
