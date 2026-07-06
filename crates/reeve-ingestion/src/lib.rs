@@ -19,6 +19,7 @@ pub async fn serve(
     warm: Arc<WarmStore>,
     signal_tx: broadcast::Sender<IngestionEvent>,
     ntp_offsets: receive::NtpOffsets,
+    paused: assemble::PausedAgents,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let hot = Arc::new(Mutex::new(HotStore::new(10_000)));
 
@@ -27,7 +28,7 @@ pub async fn serve(
     let (route_tx, route_rx) = tokio::sync::mpsc::channel(1024);
 
     tokio::spawn(normalize::run(pipeline_rx, false, assemble_tx));
-    tokio::spawn(assemble::run(assemble_rx, 500, route_tx));
+    tokio::spawn(assemble::run(assemble_rx, 500, route_tx, paused));
     tokio::spawn(route::run(route_rx, hot, warm, signal_tx));
 
     let (health_reporter, health_service) = health_reporter();

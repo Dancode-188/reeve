@@ -57,6 +57,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ntp_offsets: Arc<Mutex<HashMap<String, i64>>> = Arc::new(Mutex::new(HashMap::new()));
 
+    // Paused-agent state shared between the intervention layer (writer) and
+    // the ingestion assembler (reader), so a paused agent's silence is not
+    // finalized as an interrupted trace.
+    let paused_agents: Arc<Mutex<std::collections::HashSet<reeve_model::ids::AgentId>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
+
     let (dispatch_tx, mut dispatch_rx) = tokio::sync::mpsc::channel::<(
         reeve_model::ids::AgentId,
         reeve_model::entity::intervention::InterventionCommand,
@@ -68,6 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warm.clone(),
         ingestion_tx,
         ntp_offsets.clone(),
+        paused_agents.clone(),
     ));
     tokio::spawn(reeve_engine::run(
         engine_ingestion_rx,
@@ -75,14 +82,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warm.clone(),
         Some(dispatch_tx),
     ));
-    let control_server =
-        reeve_intervention::server::run(engine_event_tx.clone(), ntp_offsets).await;
+    let control_server = reeve_intervention::server::run(
+        engine_event_tx.clone(),
+        ntp_offsets,
+        paused_agents.clone(),
+    )
+    .await;
     let audit_path = db_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("audit.log");
-    let dispatcher =
-        reeve_intervention::dispatcher::Dispatcher::new(control_server, warm.clone(), audit_path);
+    let dispatcher = reeve_intervention::dispatcher::Dispatcher::new(
+        control_server,
+        warm.clone(),
+        audit_path,
+        paused_agents,
+    );
 
     let engine_dispatcher = dispatcher.clone();
     tokio::spawn(async move {
