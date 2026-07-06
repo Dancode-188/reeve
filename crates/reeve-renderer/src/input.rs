@@ -24,15 +24,16 @@ pub enum Action {
     Backspace,
 }
 
-pub async fn run(tx: mpsc::Sender<Action>) {
+/// Forwards raw terminal events to the app. The raw-key-to-action mapping
+/// happens on the receiving side via [`map_event`], because it depends on
+/// whether a text input is active and only the app knows that.
+pub async fn run(tx: mpsc::Sender<Event>) {
     loop {
         let result = tokio::task::spawn_blocking(crossterm::event::read).await;
         match result {
             Ok(Ok(event)) => {
-                if let Some(action) = map_event(event) {
-                    if tx.send(action).await.is_err() {
-                        return;
-                    }
+                if tx.send(event).await.is_err() {
+                    return;
                 }
             }
             _ => return,
@@ -40,7 +41,29 @@ pub async fn run(tx: mpsc::Sender<Action>) {
     }
 }
 
-fn map_event(event: Event) -> Option<Action> {
+/// Maps a terminal event to an action. When `text_input` is true every plain
+/// character is literal text: the global single-key bindings (q, r, i, p,
+/// j/k/h/l, d, ?) must not fire while the developer is typing an instruction,
+/// or those characters silently vanish from the input. Only Esc, Enter,
+/// Backspace, and Ctrl+C keep special meaning inside a text field.
+pub fn map_event(event: Event, text_input: bool) -> Option<Action> {
+    if text_input {
+        return match event {
+            Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) => match (code, modifiers) {
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Action::Quit),
+                (KeyCode::Esc, _) => Some(Action::Dismiss),
+                (KeyCode::Enter, _) => Some(Action::Select),
+                (KeyCode::Backspace, _) => Some(Action::Backspace),
+                (KeyCode::Char(c), KeyModifiers::NONE) => Some(Action::Char(c)),
+                (KeyCode::Char(c), KeyModifiers::SHIFT) => Some(Action::Char(c)),
+                _ => None,
+            },
+            Event::Resize(w, h) => Some(Action::Resize(w, h)),
+            _ => None,
+        };
+    }
     match event {
         Event::Key(KeyEvent {
             code, modifiers, ..
@@ -72,5 +95,85 @@ fn map_event(event: Event) -> Option<Action> {
         },
         Event::Resize(w, h) => Some(Action::Resize(w, h)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(c: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn text_input_mode_maps_global_keys_to_chars() {
+        // Every one of these is a global binding that must become literal
+        // text while typing. "summarize" contains r, i, and m; "wrap up"
+        // contains r and p.
+        for c in ['q', 'r', 'i', 'p', 'j', 'k', 'h', 'l', 'd', '?'] {
+            match map_event(key(c), true) {
+                Some(Action::Char(mapped)) => assert_eq!(mapped, c),
+                other => panic!("{c:?} must map to Char in text input, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn text_input_mode_keeps_control_keys() {
+        assert!(matches!(
+            map_event(
+                Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                true
+            ),
+            Some(Action::Dismiss)
+        ));
+        assert!(matches!(
+            map_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                true
+            ),
+            Some(Action::Select)
+        ));
+        assert!(matches!(
+            map_event(
+                Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+                true
+            ),
+            Some(Action::Backspace)
+        ));
+        assert!(matches!(
+            map_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                true
+            ),
+            Some(Action::Quit)
+        ));
+    }
+
+    #[test]
+    fn normal_mode_keeps_global_bindings() {
+        assert!(matches!(map_event(key('q'), false), Some(Action::Quit)));
+        assert!(matches!(map_event(key('r'), false), Some(Action::Retry)));
+        assert!(matches!(
+            map_event(key('i'), false),
+            Some(Action::OverlayOpen)
+        ));
+        assert!(matches!(
+            map_event(key('p'), false),
+            Some(Action::QuickPause)
+        ));
+    }
+
+    #[test]
+    fn tab_is_not_text_in_text_input() {
+        assert!(
+            map_event(
+                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                true
+            )
+            .is_none(),
+            "tab has no meaning inside a text field and must not leak a panel switch"
+        );
     }
 }
