@@ -168,7 +168,7 @@ impl AttributeTranslator for V1AttributeTranslator {
         // Agent is always produced from resource metadata. The route stage handles
         // "if not exists, insert" when storage is wired up.
         let agent = Agent {
-            id: format!("{}:{}", ps.service_name, ps.service_instance_id).into(),
+            id: reeve_model::ids::agent_id_from_service(&ps.service_name, &ps.service_instance_id),
             name: ps.service_name,
             framework: ps.framework,
             integration: IntegrationPath::Sdk,

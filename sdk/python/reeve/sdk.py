@@ -9,6 +9,7 @@ import grpc
 import grpc.aio
 from opentelemetry import trace as otel_trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
@@ -48,16 +49,30 @@ class ReeveSdk:
     @classmethod
     async def connect(
         cls,
-        agent_id: str,
+        agent_name: str,
         *,
+        instance_id: str | None = None,
         framework: str = "custom",
         capabilities: list[str] | None = None,
         host: str = "127.0.0.1",
     ) -> "ReeveSdk":
         sdk = cls()
 
+        # The OTel Resource and the handshake must carry the same identity.
+        # Reeve derives the agent id from these two values on both channels;
+        # if they differ, commands can never route back to this connection.
+        if instance_id is None:
+            instance_id = format(time.time_ns(), "x")
+
         exporter = OTLPSpanExporter(endpoint=f"http://{host}:4317", insecure=True)
-        provider = TracerProvider()
+        provider = TracerProvider(
+            resource=Resource.create(
+                {
+                    "service.name": agent_name,
+                    "service.instance.id": instance_id,
+                }
+            )
+        )
         provider.add_span_processor(BatchSpanProcessor(exporter))
         otel_trace.set_tracer_provider(provider)
         sdk._tracer = otel_trace.get_tracer("reeve-sdk")
@@ -69,12 +84,14 @@ class ReeveSdk:
         await sdk._queue.put(
             reeve_pb2.AgentMessage(
                 handshake=reeve_pb2.AgentHandshake(
-                    agent_id=agent_id,
+                    agent_id=f"{agent_name}:{instance_id}",
                     framework=framework,
                     sdk_version="0.1.0",
                     capabilities=capabilities
                     or ["pause", "redirect", "inject_context", "kill"],
                     t1_ms=t1_ms,
+                    service_name=agent_name,
+                    service_instance_id=instance_id,
                 )
             )
         )
