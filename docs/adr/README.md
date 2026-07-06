@@ -33,6 +33,8 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0026](./0026-ntp-style-clock-sync-via-control-handshake.md) | NTP-Style Clock Synchronization via the Control Handshake | Accepted | 2026-07-06 |
 | [0027](./0027-checkpoint-as-polling-primitive.md) | `checkpoint()` as a Pull-Based Polling Primitive | Accepted | 2026-07-05 |
 | [0028](./0028-python-sdk-adapter-via-framework-callbacks.md) | Python SDK Adapter via Framework Callback Handlers | Accepted | 2026-07-05 |
+| [0029](./0029-engine-to-dispatcher-channel.md) | Engine-to-Dispatcher Channel to Preserve the `reeve-engine` Dependency Boundary | Accepted | 2026-07-06 |
+| [0030](./0030-instant-reconstitution-from-wall-clock-timestamps.md) | Reconstituting `Instant` Values from Wall-Clock Timestamps for Cooldown Persistence | Accepted | 2026-07-06 |
 
 ## Format
 
