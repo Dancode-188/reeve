@@ -79,6 +79,21 @@ impl PolicyEngine {
         }
     }
 
+    /// Reconstitutes cooldown state from DB records loaded at startup.
+    /// Only non-expired records are passed in; `now_ms` is the current unix
+    /// timestamp used to convert wall-clock `last_fired_at` to an `Instant`.
+    pub fn load_cooldowns(&mut self, records: &[(AgentId, RuleId, i64)], now_ms: i64) {
+        let now = Instant::now();
+        for (agent_id, rule_id, last_fired_at_ms) in records {
+            let elapsed_ms = (now_ms - last_fired_at_ms).clamp(0, 86_400_000) as u64;
+            let last_fired = now
+                .checked_sub(Duration::from_millis(elapsed_ms))
+                .unwrap_or(now);
+            self.cooldowns
+                .insert((agent_id.clone(), rule_id.clone()), last_fired);
+        }
+    }
+
     /// Replaces all non-builtin rules atomically. Called at startup and on SIGHUP.
     pub fn replace_user_rules(&mut self, user_rules: Vec<PolicyRule>) {
         self.rules.retain(|r| r.id.as_str().starts_with("builtin_"));
@@ -429,5 +444,46 @@ mod tests {
         engine.replace_user_rules(vec![user_rule("rule_v2", "health_score < 50")]);
         assert!(engine.rules.iter().all(|r| r.id.as_str() != "rule_v1"));
         assert!(engine.rules.iter().any(|r| r.id.as_str() == "rule_v2"));
+    }
+
+    #[test]
+    fn load_cooldowns_blocks_immediate_refire() {
+        let mut engine = PolicyEngine::with_defaults();
+        let now_ms: i64 = 1_000_000;
+        // Simulate a cooldown that fired 10 seconds ago with a 300s window.
+        let last_fired_ms = now_ms - 10_000;
+        let records = vec![(agent(), RuleId::from("builtin_low_health"), last_fired_ms)];
+        engine.load_cooldowns(&records, now_ms);
+        // Evaluate at the same instant: cooldown should suppress the rule.
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(25.0, 1.0, 0.9),
+            Instant::now(),
+            now_ms,
+        );
+        assert!(
+            fired
+                .iter()
+                .all(|f| f.rule.id.as_str() != "builtin_low_health")
+        );
+    }
+
+    #[test]
+    fn load_cooldowns_allows_fire_after_expiry() {
+        let mut engine = PolicyEngine::with_defaults();
+        let now_ms: i64 = 1_000_000;
+        // Simulate a cooldown that fired 301 seconds ago (past the 300s window).
+        let last_fired_ms = now_ms - 301_000;
+        let records = vec![(agent(), RuleId::from("builtin_low_health"), last_fired_ms)];
+        engine.load_cooldowns(&records, now_ms);
+        // Evaluate 301s after last fire; cooldown should be expired.
+        let later = Instant::now() + Duration::from_secs(1);
+        let fired = engine.evaluate(&agent(), &trace(), &ctx(25.0, 1.0, 0.9), later, now_ms);
+        assert!(
+            fired
+                .iter()
+                .any(|f| f.rule.id.as_str() == "builtin_low_health")
+        );
     }
 }

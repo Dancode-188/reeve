@@ -4,7 +4,7 @@ use reeve_model::entity::{
     InternalSpan, InterventionCommand, InterventionOutcome, SpanEvent, SpanStatus, TargetType,
     Trace, TraceStatus,
 };
-use reeve_model::ids::{AgentId, CommandId, EvalId, SpanId, TraceId};
+use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, SpanId, TraceId};
 use rusqlite::{Connection, Row, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -31,6 +31,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         3,
         include_str!("../../../migrations/0003_policy_rules_description.sql"),
+    ),
+    (
+        4,
+        include_str!("../../../migrations/0004_policy_cooldowns.sql"),
     ),
 ];
 
@@ -686,6 +690,52 @@ impl WarmStore {
         })
         .await
     }
+
+    pub async fn save_policy_cooldown(
+        &self,
+        agent_id: &AgentId,
+        rule_id: &RuleId,
+        last_fired_ms: i64,
+        cooldown_secs: u64,
+    ) -> Result<(), StorageError> {
+        let expires_at = last_fired_ms + (cooldown_secs as i64) * 1000;
+        let agent_id = agent_id.as_str().to_string();
+        let rule_id = rule_id.as_str().to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO policy_cooldowns \
+                 (agent_id, rule_id, last_fired_at, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![agent_id, rule_id, last_fired_ms, expires_at],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn load_active_policy_cooldowns(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<(AgentId, RuleId, i64)>, StorageError> {
+        self.with_conn(move |conn| {
+            conn.prepare(
+                "SELECT agent_id, rule_id, last_fired_at FROM policy_cooldowns \
+                 WHERE expires_at > ?1",
+            )?
+            .query_map(params![now_ms], |row| {
+                let agent_id: String = row.get(0)?;
+                let rule_id: String = row.get(1)?;
+                let last_fired_at: i64 = row.get(2)?;
+                Ok((
+                    AgentId::from(agent_id.as_str()),
+                    RuleId::from(rule_id.as_str()),
+                    last_fired_at,
+                ))
+            })?
+            .collect()
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -1030,5 +1080,43 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn save_and_load_active_policy_cooldown() {
+        let store = WarmStore::open_in_memory().unwrap();
+        let agent_id = AgentId::from("agent-1");
+        let rule_id = RuleId::from("builtin_low_health");
+        let now_ms: i64 = 1_000_000;
+        store
+            .save_policy_cooldown(&agent_id, &rule_id, now_ms, 300)
+            .await
+            .unwrap();
+        let rows = store
+            .load_active_policy_cooldowns(now_ms + 1)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, agent_id);
+        assert_eq!(rows[0].1, rule_id);
+        assert_eq!(rows[0].2, now_ms);
+    }
+
+    #[tokio::test]
+    async fn load_active_policy_cooldowns_excludes_expired() {
+        let store = WarmStore::open_in_memory().unwrap();
+        let agent_id = AgentId::from("agent-1");
+        let rule_id = RuleId::from("builtin_low_health");
+        let now_ms: i64 = 1_000_000;
+        store
+            .save_policy_cooldown(&agent_id, &rule_id, now_ms, 300)
+            .await
+            .unwrap();
+        // Query with a time well past the cooldown window.
+        let rows = store
+            .load_active_policy_cooldowns(now_ms + 400_000)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
     }
 }

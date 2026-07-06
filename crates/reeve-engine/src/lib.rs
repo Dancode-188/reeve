@@ -14,7 +14,7 @@ use policy::{PolicyEngine, alert_fields};
 use reeve_model::entity::evaluation::{EvaluationResult, EvaluatorType, TargetType};
 use reeve_model::entity::intervention::InterventionCommand;
 use reeve_model::entity::span::InternalSpan;
-use reeve_model::ids::{AgentId, EvalId, TraceId};
+use reeve_model::ids::{AgentId, EvalId, RuleId, TraceId};
 use reeve_model::signal::{EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::WarmStore;
 use std::collections::{HashMap, VecDeque};
@@ -65,6 +65,21 @@ pub async fn run(
         let mut combined = db_rules;
         combined.extend(cfg_rules);
         policy_engine.replace_user_rules(combined);
+    }
+
+    {
+        let startup_ms = current_ms();
+        let cooldowns = warm
+            .load_active_policy_cooldowns(startup_ms)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to load cooldown state from database");
+                vec![]
+            });
+        if !cooldowns.is_empty() {
+            tracing::info!(count = cooldowns.len(), "restored active policy cooldowns");
+        }
+        policy_engine.load_cooldowns(&cooldowns, startup_ms);
     }
 
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
@@ -203,6 +218,14 @@ pub async fn run(
                             requires_confirmation,
                             auto_confirm_after_secs,
                         });
+                        persist_cooldown(
+                            &warm,
+                            &agent_id,
+                            &fr.rule.id,
+                            now_ms,
+                            fr.rule.cooldown_secs,
+                        )
+                        .await;
                         dispatch_or_save(
                             &dispatch_tx,
                             &warm,
@@ -349,6 +372,8 @@ pub async fn run(
                         requires_confirmation,
                         auto_confirm_after_secs,
                     });
+                    persist_cooldown(&warm, &agent_id, &fr.rule.id, now_ms, fr.rule.cooldown_secs)
+                        .await;
                     dispatch_or_save(
                         &dispatch_tx,
                         &warm,
@@ -369,6 +394,21 @@ pub async fn run(
                 break;
             }
         }
+    }
+}
+
+async fn persist_cooldown(
+    warm: &WarmStore,
+    agent_id: &AgentId,
+    rule_id: &RuleId,
+    now_ms: i64,
+    cooldown_secs: u64,
+) {
+    if let Err(e) = warm
+        .save_policy_cooldown(agent_id, rule_id, now_ms, cooldown_secs)
+        .await
+    {
+        tracing::warn!(rule_id = %rule_id, error = %e, "failed to persist cooldown");
     }
 }
 
