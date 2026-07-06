@@ -2,10 +2,18 @@ use crate::normalize::NormalizedSpan;
 use reeve_model::entity::agent::Agent;
 use reeve_model::entity::span::InternalSpan;
 use reeve_model::entity::span_event::SpanEvent;
-use reeve_model::ids::{SpanId, TraceId};
-use std::collections::HashMap;
+use reeve_model::ids::{AgentId, SpanId, TraceId};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// Agents currently paused by an intervention command. Written by the
+/// intervention layer when a Pause is acknowledged as applied, cleared on
+/// Resume, Kill, or control-channel disconnect. The assembler reads it to
+/// suspend the idle timeout: a paused agent emits no spans by design, and
+/// that silence must not be mistaken for an interrupted trace.
+pub type PausedAgents = Arc<Mutex<HashSet<AgentId>>>;
 
 const STRAGGLER_WINDOW: Duration = Duration::from_secs(2);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -146,12 +154,14 @@ impl InFlightTrace {
 
 pub struct Assembler {
     traces: HashMap<TraceId, InFlightTrace>,
+    paused: PausedAgents,
 }
 
 impl Assembler {
-    pub fn new() -> Self {
+    pub fn new(paused: PausedAgents) -> Self {
         Self {
             traces: HashMap::new(),
+            paused,
         }
     }
 
@@ -167,6 +177,22 @@ impl Assembler {
     /// Returns all traces that have completed or been interrupted, removing
     /// them from the in-flight map.
     pub fn tick(&mut self) -> Vec<(InFlightTrace, CompletionState)> {
+        // A paused agent's silence is intentional. Refreshing last_updated
+        // while the pause holds keeps the idle timeout from firing, and gives
+        // the agent a full idle window after Resume before its next span is
+        // due. The straggler-window path is untouched: a trace whose root
+        // already arrived is complete regardless of pause state.
+        {
+            let paused = self.paused.lock().unwrap();
+            if !paused.is_empty() {
+                for trace in self.traces.values_mut() {
+                    if paused.contains(&trace.agent.id) {
+                        trace.last_updated = Instant::now();
+                    }
+                }
+            }
+        }
+
         let to_finalize: Vec<TraceId> = self
             .traces
             .keys()
@@ -192,7 +218,7 @@ impl Assembler {
 
 impl Default for Assembler {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(Mutex::new(HashSet::new())))
     }
 }
 
@@ -200,8 +226,9 @@ pub async fn run(
     mut rx: mpsc::Receiver<NormalizedSpan>,
     tick_ms: u64,
     tx: mpsc::Sender<(InFlightTrace, CompletionState)>,
+    paused: PausedAgents,
 ) {
-    let mut assembler = Assembler::new();
+    let mut assembler = Assembler::new(paused);
     let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
 
     loop {
@@ -408,6 +435,98 @@ mod tests {
             (trace.cost_accumulator - 0.0035).abs() < 1e-9,
             "cost should sum across spans, got {}",
             trace.cost_accumulator
+        );
+    }
+
+    /// Backdates a trace's last activity so the idle timeout is already due.
+    fn make_idle(assembler: &mut Assembler, trace_id: &str) {
+        let trace = assembler.traces.get_mut(trace_id).unwrap();
+        trace.last_updated = Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+    }
+
+    #[test]
+    fn idle_trace_without_root_is_interrupted() {
+        let mut assembler = Assembler::default();
+        assembler.receive(
+            make_span("child-1", "trace-1", Some("never-arrives")),
+            vec![],
+            make_agent(),
+        );
+        make_idle(&mut assembler, "trace-1");
+
+        let finalized = assembler.tick();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].1, CompletionState::Interrupted);
+    }
+
+    #[test]
+    fn paused_agent_trace_survives_idle_timeout() {
+        let paused: PausedAgents = Arc::new(Mutex::new(HashSet::new()));
+        paused.lock().unwrap().insert("agent-1".into());
+
+        let mut assembler = Assembler::new(paused);
+        assembler.receive(
+            make_span("child-1", "trace-1", Some("never-arrives")),
+            vec![],
+            make_agent(),
+        );
+        make_idle(&mut assembler, "trace-1");
+
+        assert!(
+            assembler.tick().is_empty(),
+            "paused agent's trace must not be finalized by the idle timeout"
+        );
+    }
+
+    #[test]
+    fn resumed_agent_gets_full_idle_window() {
+        let paused: PausedAgents = Arc::new(Mutex::new(HashSet::new()));
+        paused.lock().unwrap().insert("agent-1".into());
+
+        let mut assembler = Assembler::new(paused.clone());
+        assembler.receive(
+            make_span("child-1", "trace-1", Some("never-arrives")),
+            vec![],
+            make_agent(),
+        );
+        make_idle(&mut assembler, "trace-1");
+
+        // While paused, the tick refreshes last_updated.
+        assert!(assembler.tick().is_empty());
+
+        // Immediately after resume the trace must still be in flight: the
+        // refresh during the pause restarted the idle window.
+        paused.lock().unwrap().clear();
+        assert!(
+            assembler.tick().is_empty(),
+            "resumed agent must get a fresh idle window, not an instant interrupt"
+        );
+
+        // Once the fresh window elapses with no spans, interruption is correct.
+        make_idle(&mut assembler, "trace-1");
+        let finalized = assembler.tick();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].1, CompletionState::Interrupted);
+    }
+
+    #[test]
+    fn pause_does_not_hold_open_a_trace_whose_root_arrived() {
+        let paused: PausedAgents = Arc::new(Mutex::new(HashSet::new()));
+        paused.lock().unwrap().insert("agent-1".into());
+
+        let mut assembler = Assembler::new(paused);
+        assembler.receive(make_span("root-1", "trace-1", None), vec![], make_agent());
+
+        // Backdate the straggler window so the trace is due for completion.
+        let trace = assembler.traces.get_mut("trace-1").unwrap();
+        trace.completion_timer = Some(Instant::now() - STRAGGLER_WINDOW - Duration::from_secs(1));
+
+        let finalized = assembler.tick();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(
+            finalized[0].1,
+            CompletionState::Completed,
+            "a trace whose root arrived completes regardless of pause state"
         );
     }
 }

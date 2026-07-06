@@ -1,3 +1,4 @@
+use crate::dispatcher::PausedAgents;
 use crate::proto::{
     self, agent_message, control_message, reeve_control_server::ReeveControl,
     reeve_control_server::ReeveControlServer,
@@ -39,16 +40,24 @@ pub struct ControlServer {
     ntp_pending: NtpPending,
     /// Completed NTP offsets written here when T4 arrives.
     ntp_offsets: NtpOffsets,
+    /// Cleared for an agent when its control stream drops, so a paused agent
+    /// that crashes or disconnects does not hold its traces in flight forever.
+    paused: PausedAgents,
 }
 
 impl ControlServer {
-    fn new(engine_tx: broadcast::Sender<EngineEvent>, ntp_offsets: NtpOffsets) -> Self {
+    fn new(
+        engine_tx: broadcast::Sender<EngineEvent>,
+        ntp_offsets: NtpOffsets,
+        paused: PausedAgents,
+    ) -> Self {
         Self {
             connected: Arc::new(Mutex::new(HashMap::new())),
             engine_tx,
             ack_sink: Arc::new(Mutex::new(None)),
             ntp_pending: Arc::new(Mutex::new(HashMap::new())),
             ntp_offsets,
+            paused,
         }
     }
 
@@ -159,6 +168,7 @@ impl ReeveControl for ControlServer {
         let ack_sink = self.ack_sink.clone();
         let ntp_pending = self.ntp_pending.clone();
         let ntp_offsets = self.ntp_offsets.clone();
+        let paused = self.paused.clone();
 
         tokio::spawn(async move {
             while let Ok(Some(msg)) = inbound.message().await {
@@ -206,6 +216,10 @@ impl ReeveControl for ControlServer {
             }
 
             connected.lock().unwrap().remove(&agent_id);
+            // A paused agent that disconnects is gone, not paused. Clearing
+            // here lets the assembler's idle timeout finalize its traces
+            // instead of holding them in flight indefinitely.
+            paused.lock().unwrap().remove(&agent_id);
             let _ = engine_tx.send(EngineEvent::AgentControlDisconnected {
                 agent_id: agent_id.clone(),
             });
@@ -222,8 +236,9 @@ impl ReeveControl for ControlServer {
 pub async fn run(
     engine_tx: broadcast::Sender<EngineEvent>,
     ntp_offsets: NtpOffsets,
+    paused: PausedAgents,
 ) -> Arc<ControlServer> {
-    let server = ControlServer::new(engine_tx, ntp_offsets);
+    let server = ControlServer::new(engine_tx, ntp_offsets, paused);
     let handle = Arc::new(server.clone());
 
     let addr = "127.0.0.1:4316"
@@ -270,6 +285,7 @@ pub fn new_for_test(engine_tx: broadcast::Sender<EngineEvent>) -> Arc<ControlSer
     Arc::new(ControlServer::new(
         engine_tx,
         Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(Mutex::new(std::collections::HashSet::new())),
     ))
 }
 
@@ -279,7 +295,11 @@ mod tests {
 
     fn make_server() -> ControlServer {
         let (tx, _rx) = broadcast::channel(8);
-        ControlServer::new(tx, Arc::new(Mutex::new(HashMap::new())))
+        ControlServer::new(
+            tx,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashSet::new())),
+        )
     }
 
     #[test]
@@ -313,7 +333,11 @@ mod tests {
         let ntp_offsets: NtpOffsets = Arc::new(Mutex::new(HashMap::new()));
         let server = {
             let (tx, _rx) = broadcast::channel(8);
-            ControlServer::new(tx, ntp_offsets.clone())
+            ControlServer::new(
+                tx,
+                ntp_offsets.clone(),
+                Arc::new(Mutex::new(std::collections::HashSet::new())),
+            )
         };
 
         server

@@ -18,6 +18,11 @@ use tokio::time;
 /// An ack has not arrived within this window: retry once, then expire.
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Agents currently paused by an applied Pause command. Shared with the
+/// ingestion assembler, which suspends its idle timeout for these agents so
+/// a paused agent's silence is not finalized as an interrupted trace.
+pub type PausedAgents = Arc<Mutex<HashSet<AgentId>>>;
+
 struct PendingEntry {
     command: InterventionCommand,
     agent_id: AgentId,
@@ -34,10 +39,16 @@ pub struct Dispatcher {
     applied: Arc<Mutex<HashSet<CommandId>>>,
     warm: Arc<WarmStore>,
     audit_log: Arc<Mutex<File>>,
+    paused: PausedAgents,
 }
 
 impl Dispatcher {
-    pub fn new(server: Arc<ControlServer>, warm: Arc<WarmStore>, audit_path: PathBuf) -> Arc<Self> {
+    pub fn new(
+        server: Arc<ControlServer>,
+        warm: Arc<WarmStore>,
+        audit_path: PathBuf,
+        paused: PausedAgents,
+    ) -> Arc<Self> {
         let audit_log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -55,6 +66,7 @@ impl Dispatcher {
             applied: Arc::new(Mutex::new(HashSet::new())),
             warm,
             audit_log: Arc::new(Mutex::new(audit_log)),
+            paused,
         });
 
         let d = dispatcher.clone();
@@ -183,6 +195,22 @@ impl Dispatcher {
                 }
             }
         };
+
+        // Pause state flips only on Applied: the agent has confirmed it is
+        // actually holding at a checkpoint, not merely that the command was
+        // received. Kill clears it too, since a killed agent is no longer
+        // paused and its trace should be allowed to finalize.
+        if status == AckStatus::Applied {
+            match command.command_type {
+                CommandType::Pause => {
+                    self.paused.lock().unwrap().insert(agent_id.clone());
+                }
+                CommandType::Resume | CommandType::Kill => {
+                    self.paused.lock().unwrap().remove(&agent_id);
+                }
+                _ => {}
+            }
+        }
 
         command.status = ack_to_command_status(status);
         command.acknowledged_at = Some(now_ms);
@@ -379,7 +407,46 @@ mod tests {
         let server = crate::server::new_for_test(engine_tx);
         let warm = Arc::new(WarmStore::open_in_memory().unwrap());
         let audit_path = std::env::temp_dir().join("reeve_test_audit.log");
-        Dispatcher::new(server, warm, audit_path)
+        let paused = Arc::new(Mutex::new(HashSet::new()));
+        Dispatcher::new(server, warm, audit_path, paused)
+    }
+
+    fn pending_command(command_type: CommandType) -> InterventionCommand {
+        InterventionCommand {
+            id: CommandId::from("cmd-pending"),
+            trace_id: TraceId::from("trace-1"),
+            span_id: None,
+            policy_id: None,
+            command_type,
+            status: CommandStatus::Delivered,
+            requires_confirmation: false,
+            issued_at: 0,
+            acknowledged_at: None,
+            issued_by: "human".to_string(),
+            valid_until_ms: i64::MAX,
+        }
+    }
+
+    async fn ack_applied(d: &Dispatcher, agent_id: &AgentId, command_type: CommandType) {
+        let command = pending_command(command_type);
+        d.pending.lock().unwrap().insert(
+            command.id.clone(),
+            PendingEntry {
+                command: command.clone(),
+                agent_id: agent_id.clone(),
+                queued_at: Instant::now(),
+                retry_count: 0,
+            },
+        );
+        d.handle_ack(AckNotification {
+            command_id: command.id,
+            agent_id: agent_id.clone(),
+            status: AckStatus::Applied,
+        })
+        .await;
+        // The applied set carries over between calls in a test; clear it so
+        // a subsequent command with the same ID is not treated as a dup.
+        d.applied.lock().unwrap().clear();
     }
 
     fn expired_command() -> (AgentId, InterventionCommand) {
@@ -458,5 +525,74 @@ mod tests {
             valid_until_ms: i64::MAX,
         };
         assert!(!d.dispatch(&agent_id, command).await);
+    }
+
+    #[tokio::test]
+    async fn applied_pause_marks_agent_paused() {
+        let d = make_dispatcher();
+        let agent_id = AgentId::from("agent-pause");
+
+        ack_applied(&d, &agent_id, CommandType::Pause).await;
+
+        assert!(
+            d.paused.lock().unwrap().contains(&agent_id),
+            "agent must be marked paused after an applied Pause ack"
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_resume_clears_pause_state() {
+        let d = make_dispatcher();
+        let agent_id = AgentId::from("agent-resume");
+
+        ack_applied(&d, &agent_id, CommandType::Pause).await;
+        ack_applied(&d, &agent_id, CommandType::Resume).await;
+
+        assert!(
+            !d.paused.lock().unwrap().contains(&agent_id),
+            "applied Resume must clear the pause state"
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_kill_clears_pause_state() {
+        let d = make_dispatcher();
+        let agent_id = AgentId::from("agent-kill");
+
+        ack_applied(&d, &agent_id, CommandType::Pause).await;
+        ack_applied(&d, &agent_id, CommandType::Kill).await;
+
+        assert!(
+            !d.paused.lock().unwrap().contains(&agent_id),
+            "a killed agent is not paused; its traces must be allowed to finalize"
+        );
+    }
+
+    #[tokio::test]
+    async fn received_ack_does_not_mark_paused() {
+        let d = make_dispatcher();
+        let agent_id = AgentId::from("agent-received");
+        let command = pending_command(CommandType::Pause);
+
+        d.pending.lock().unwrap().insert(
+            command.id.clone(),
+            PendingEntry {
+                command: command.clone(),
+                agent_id: agent_id.clone(),
+                queued_at: Instant::now(),
+                retry_count: 0,
+            },
+        );
+        d.handle_ack(AckNotification {
+            command_id: command.id,
+            agent_id: agent_id.clone(),
+            status: AckStatus::Received,
+        })
+        .await;
+
+        assert!(
+            !d.paused.lock().unwrap().contains(&agent_id),
+            "pause state flips on Applied, not on Received"
+        );
     }
 }
