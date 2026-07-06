@@ -90,6 +90,21 @@ works in under 90 seconds.
 
 Nothing committed. Ideas being considered:
 
+- Control protocol spec: the wire contract between Reeve and its agents
+  (handshake, capability declaration, command and ack lifecycle, checkpoint
+  semantics) written up as a versioned document that anyone could implement
+  against without reading Reeve's source. The read path out of agents has a
+  standard; the write path into them does not.
+- Intervention effectiveness dataset: v0.4.0 starts recording what each
+  intervention did to quality. Accumulated, that becomes something nobody
+  has: measured evidence of which interventions fix which failure modes.
+  Guardrail products block on predictions and never learn whether they were
+  right. This would.
+- Rewind: scrub back to an earlier checkpoint, edit the context the agent
+  had, and re-execute from there. Branches for agent execution. The honest
+  caveat is that re-running past tool calls against the real world is only
+  safe when the tools are read-only or mocked, so this needs a tool
+  isolation story before it needs a scrubber.
 - Fleet mode: observe multiple agents across machines from one terminal
 - Config server: push policy rule updates to a running Reeve instance
   without restart
