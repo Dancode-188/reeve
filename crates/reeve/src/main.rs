@@ -63,6 +63,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paused_agents: Arc<Mutex<std::collections::HashSet<reeve_model::ids::AgentId>>> =
         Arc::new(Mutex::new(std::collections::HashSet::new()));
 
+    // Applied-command feed from the dispatcher (writer) to the engine
+    // (reader), which measures whether each intervention improved quality.
+    let applied_commands: Arc<Mutex<Vec<reeve_model::entity::intervention::AppliedCommand>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
     let (dispatch_tx, mut dispatch_rx) = tokio::sync::mpsc::channel::<(
         reeve_model::ids::AgentId,
         reeve_model::entity::intervention::InterventionCommand,
@@ -81,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine_event_tx.clone(),
         warm.clone(),
         Some(dispatch_tx),
+        Some(applied_commands.clone()),
     ));
     let control_server = reeve_intervention::server::run(
         engine_event_tx.clone(),
@@ -103,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             warm.clone(),
             audit_path.clone(),
             paused_agents.clone(),
+            applied_commands.clone(),
         ) {
             Ok(d) => break d,
             Err(e) => {

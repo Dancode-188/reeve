@@ -2,7 +2,7 @@ use crate::proto::{self, CommandType as ProtoCommandType, control_message};
 use crate::server::ControlServer;
 use crate::types::AckNotification;
 use reeve_model::entity::intervention::{
-    AckStatus, CommandStatus, CommandType, InterventionCommand,
+    AckStatus, AppliedCommand, CommandStatus, CommandType, InterventionCommand,
 };
 use reeve_model::ids::{AgentId, CommandId};
 use reeve_storage::warm::WarmStore;
@@ -23,6 +23,11 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 /// a paused agent's silence is not finalized as an interrupted trace.
 pub type PausedAgents = Arc<Mutex<HashSet<AgentId>>>;
 
+/// Commands confirmed applied, awaiting pickup by the engine's outcome
+/// measurement. The dispatcher appends on every applied ack; the engine
+/// drains on every completed trace.
+pub type AppliedFeed = Arc<Mutex<Vec<AppliedCommand>>>;
+
 struct PendingEntry {
     command: InterventionCommand,
     agent_id: AgentId,
@@ -40,6 +45,7 @@ pub struct Dispatcher {
     warm: Arc<WarmStore>,
     audit_log: Arc<Mutex<File>>,
     paused: PausedAgents,
+    applied_feed: AppliedFeed,
 }
 
 impl Dispatcher {
@@ -52,6 +58,7 @@ impl Dispatcher {
         warm: Arc<WarmStore>,
         audit_path: PathBuf,
         paused: PausedAgents,
+        applied_feed: AppliedFeed,
     ) -> Result<Arc<Self>, std::io::Error> {
         let audit_log = OpenOptions::new()
             .create(true)
@@ -68,6 +75,7 @@ impl Dispatcher {
             warm,
             audit_log: Arc::new(Mutex::new(audit_log)),
             paused,
+            applied_feed,
         });
 
         let d = dispatcher.clone();
@@ -218,6 +226,13 @@ impl Dispatcher {
                 }
                 _ => {}
             }
+            self.applied_feed.lock().unwrap().push(AppliedCommand {
+                command_id: command_id.clone(),
+                trace_id: command.trace_id.clone(),
+                agent_id: agent_id.clone(),
+                command_type: command.command_type.clone(),
+                applied_at_ms: now_ms,
+            });
         }
 
         command.status = ack_to_command_status(status);
@@ -416,7 +431,8 @@ mod tests {
         let warm = Arc::new(WarmStore::open_in_memory().unwrap());
         let audit_path = std::env::temp_dir().join("reeve_test_audit.log");
         let paused = Arc::new(Mutex::new(HashSet::new()));
-        Dispatcher::new(server, warm, audit_path, paused).unwrap()
+        let applied_feed = Arc::new(Mutex::new(Vec::new()));
+        Dispatcher::new(server, warm, audit_path, paused, applied_feed).unwrap()
     }
 
     fn pending_command(command_type: CommandType) -> InterventionCommand {
@@ -543,8 +559,9 @@ mod tests {
         // Parent directory does not exist, so the open must fail.
         let audit_path = std::env::temp_dir().join("reeve_no_such_dir/audit.log");
         let paused = Arc::new(Mutex::new(HashSet::new()));
+        let applied_feed = Arc::new(Mutex::new(Vec::new()));
 
-        let result = Dispatcher::new(server, warm, audit_path, paused);
+        let result = Dispatcher::new(server, warm, audit_path, paused, applied_feed);
         assert!(
             result.is_err(),
             "an unopenable audit log must be an error, not a panic"
@@ -589,6 +606,54 @@ mod tests {
         assert!(
             !d.paused.lock().unwrap().contains(&agent_id),
             "a killed agent is not paused; its traces must be allowed to finalize"
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_ack_lands_in_applied_feed() {
+        let d = make_dispatcher();
+        let agent_id = AgentId::from("agent-feed");
+
+        ack_applied(
+            &d,
+            &agent_id,
+            CommandType::Redirect {
+                instruction: "steer".to_string(),
+            },
+        )
+        .await;
+
+        let feed = d.applied_feed.lock().unwrap();
+        assert_eq!(feed.len(), 1, "applied command must reach the feed");
+        assert_eq!(feed[0].agent_id, agent_id);
+        assert_eq!(feed[0].trace_id.as_str(), "trace-1");
+    }
+
+    #[tokio::test]
+    async fn received_ack_does_not_reach_applied_feed() {
+        let d = make_dispatcher();
+        let agent_id = AgentId::from("agent-feed-recv");
+        let command = pending_command(CommandType::Pause);
+
+        d.pending.lock().unwrap().insert(
+            command.id.clone(),
+            PendingEntry {
+                command: command.clone(),
+                agent_id: agent_id.clone(),
+                queued_at: Instant::now(),
+                retry_count: 0,
+            },
+        );
+        d.handle_ack(AckNotification {
+            command_id: command.id,
+            agent_id,
+            status: AckStatus::Received,
+        })
+        .await;
+
+        assert!(
+            d.applied_feed.lock().unwrap().is_empty(),
+            "only applied acks feed outcome measurement"
         );
     }
 
