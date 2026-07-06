@@ -696,7 +696,8 @@ impl App {
             }
             Action::QuickPause => {
                 if let Some(agent_id) = self.state.selected_agent_id().cloned() {
-                    self.dispatch_command(agent_id, CommandType::Pause).await;
+                    let cmd = self.pause_or_resume(&agent_id);
+                    self.dispatch_command(agent_id, cmd).await;
                 }
             }
             Action::Resize(_, _) | Action::Char(_) | Action::Backspace => {}
@@ -806,10 +807,11 @@ impl App {
                     Action::Dismiss => {
                         self.state.overlay = None;
                     }
-                    // [p] in overlay = pause
+                    // [p] in overlay = pause/resume toggle
                     Action::QuickPause if caps.contains(&"pause".to_string()) => {
                         self.state.overlay = None;
-                        self.dispatch_command(agent_id, CommandType::Pause).await;
+                        let cmd = self.pause_or_resume(&agent_id);
+                        self.dispatch_command(agent_id, cmd).await;
                     }
                     // [r] in overlay = redirect
                     Action::Retry if caps.contains(&"redirect".to_string()) => {
@@ -893,6 +895,18 @@ impl App {
             .await;
     }
 
+    /// The pause key is a toggle: Resume when the dispatcher has a confirmed
+    /// applied Pause for this agent, Pause otherwise. The dispatcher's set is
+    /// the only state that reflects what the agent actually acknowledged, as
+    /// opposed to what was merely sent.
+    fn pause_or_resume(&self, agent_id: &AgentId) -> CommandType {
+        if self.dispatcher.is_paused(agent_id) {
+            CommandType::Resume
+        } else {
+            CommandType::Pause
+        }
+    }
+
     async fn dispatch_command_with_attribution(
         &mut self,
         agent_id: AgentId,
@@ -925,6 +939,22 @@ impl App {
         let dispatched = self.dispatcher.dispatch(&agent_id, command).await;
         if dispatched {
             self.state.pending_commands.insert(command_id, agent_id);
+        }
+    }
+
+    /// Called from the tick loop. Overlays the dispatcher's confirmed pause
+    /// state onto agent display status. The dispatcher is authoritative for
+    /// pause because it processes the applied acks; ingestion events cannot
+    /// carry pause state since a paused agent emits no spans.
+    pub fn sync_pause_status(&mut self) {
+        use reeve_model::entity::agent::AgentStatus;
+        for (agent_id, s) in self.state.agents.iter_mut() {
+            let paused = self.dispatcher.is_paused(agent_id);
+            if paused && s.agent.status != AgentStatus::Paused {
+                s.agent.status = AgentStatus::Paused;
+            } else if !paused && s.agent.status == AgentStatus::Paused {
+                s.agent.status = AgentStatus::Idle;
+            }
         }
     }
 
