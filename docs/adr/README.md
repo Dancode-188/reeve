@@ -35,6 +35,7 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0028](./0028-python-sdk-adapter-via-framework-callbacks.md) | Python SDK Adapter via Framework Callback Handlers | Accepted | 2026-07-05 |
 | [0029](./0029-engine-to-dispatcher-channel.md) | Engine-to-Dispatcher Channel to Preserve the `reeve-engine` Dependency Boundary | Accepted | 2026-07-06 |
 | [0030](./0030-instant-reconstitution-from-wall-clock-timestamps.md) | Reconstituting `Instant` Values from Wall-Clock Timestamps for Cooldown Persistence | Accepted | 2026-07-06 |
+| [0031](./0031-canonical-agent-identity-across-channels.md) | Canonical Agent Identity Composed by One Function Across Both Channels | Accepted | 2026-07-06 |
 
 ## Format
 
