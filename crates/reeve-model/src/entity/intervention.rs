@@ -1,4 +1,4 @@
-use crate::ids::{CommandId, RuleId, SpanId, Timestamp, TraceId};
+use crate::ids::{AgentId, CommandId, RuleId, SpanId, Timestamp, TraceId};
 use serde::{Deserialize, Serialize};
 
 /// The domain-level command shape. Carries its data inline, unlike the
@@ -59,4 +59,18 @@ pub struct InterventionCommand {
     /// "human" or "policy:rule_id".
     pub issued_by: String,
     pub valid_until_ms: Timestamp,
+}
+
+/// A command the agent confirmed it applied. The dispatcher records these
+/// for the engine's outcome measurement, which compares quality before and
+/// after the intervention. Lives in `reeve-model` because the engine must
+/// not depend on `reeve-intervention` (see ADR-0029); the shared feed is
+/// the same pattern as the NTP offset map and the paused-agents set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppliedCommand {
+    pub command_id: CommandId,
+    pub trace_id: TraceId,
+    pub agent_id: AgentId,
+    pub command_type: CommandType,
+    pub applied_at_ms: Timestamp,
 }

@@ -13,7 +13,9 @@ pub mod trace;
 pub use agent::{Agent, AgentStatus, IntegrationPath};
 pub use cost::{CostEntityType, CostLedger};
 pub use evaluation::{EvaluationResult, EvaluatorType, TargetType};
-pub use intervention::{AckStatus, CommandStatus, CommandType, InterventionCommand};
+pub use intervention::{
+    AckStatus, AppliedCommand, CommandStatus, CommandType, InterventionCommand,
+};
 pub use outcome::InterventionOutcome;
 pub use policy::{PolicyRule, RuleScope};
 pub use replay::ReplayRecord;

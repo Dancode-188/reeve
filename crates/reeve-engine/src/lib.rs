@@ -1,4 +1,5 @@
 pub mod evaluation;
+pub mod outcome;
 pub mod policy;
 
 use evaluation::TraceContext;
@@ -9,10 +10,11 @@ use evaluation::heuristic::{
     IntentActionDivergenceEvaluator, LatencyNormalityEvaluator, LoopDetector,
 };
 use evaluation::llm_judge::{self, LlmJudge};
+use outcome::OutcomeTracker;
 use policy::dsl::PolicyContext;
 use policy::{PolicyEngine, alert_fields};
 use reeve_model::entity::evaluation::{EvaluationResult, EvaluatorType, TargetType};
-use reeve_model::entity::intervention::InterventionCommand;
+use reeve_model::entity::intervention::{AppliedCommand, InterventionCommand};
 use reeve_model::entity::span::InternalSpan;
 use reeve_model::ids::{AgentId, EvalId, RuleId, TraceId};
 use reeve_model::signal::{EngineEvent, EvaluationConfidence, IngestionEvent};
@@ -25,11 +27,17 @@ use tokio::sync::{broadcast, mpsc};
 
 pub type DispatchSender = mpsc::Sender<(AgentId, InterventionCommand)>;
 
+/// Commands the agents confirmed applied, written by the intervention
+/// dispatcher and drained here for outcome measurement. Same shared-state
+/// pattern as the NTP offset map and the paused-agents set.
+pub type AppliedCommands = Arc<std::sync::Mutex<Vec<AppliedCommand>>>;
+
 pub async fn run(
     mut ingestion_rx: broadcast::Receiver<IngestionEvent>,
     engine_tx: broadcast::Sender<EngineEvent>,
     warm: Arc<WarmStore>,
     dispatch_tx: Option<DispatchSender>,
+    applied_commands: Option<AppliedCommands>,
 ) {
     let backend = llm_judge::probe().await;
     let (backend_name, backend_reason) = match &backend {
@@ -55,6 +63,7 @@ pub async fn run(
     let mut cost_accumulators: HashMap<TraceId, CostAccumulator> = HashMap::new();
     let mut trace_agents: HashMap<TraceId, AgentId> = HashMap::new();
     let mut policy_engine = PolicyEngine::with_defaults();
+    let mut outcome_tracker = OutcomeTracker::default();
 
     {
         let db_rules = warm.load_policy_rules().await.unwrap_or_else(|e| {
@@ -249,6 +258,19 @@ pub async fn run(
                     duration_secs,
                 );
 
+                // Pick up newly applied commands before this trace's score
+                // enters the history: the last recorded score at pickup time
+                // is the honest before-picture for the intervention.
+                if let Some(feed) = &applied_commands {
+                    let drained: Vec<AppliedCommand> = feed.lock().unwrap().drain(..).collect();
+                    for record in drained {
+                        let pre = score_histories
+                            .get(&record.agent_id)
+                            .and_then(|h| h.back().copied());
+                        outcome_tracker.command_applied(record, pre);
+                    }
+                }
+
                 // Update per-agent health score history and compute Tier 2 rate.
                 let history = score_histories.entry(agent_id.clone()).or_default();
                 if let Some(score) = tier1_health {
@@ -258,6 +280,22 @@ pub async fn run(
                     }
                 }
                 let rate = tier2_sample_rate(history);
+
+                if let Some(score) = tier1_health {
+                    let now_ms = current_ms();
+                    for outcome in
+                        outcome_tracker.trace_scored(&agent_id, score, span_count as u32, now_ms)
+                    {
+                        tracing::info!(
+                            command_id = %outcome.command_id,
+                            delta = ?outcome.delta,
+                            "intervention outcome measured"
+                        );
+                        if let Err(e) = warm.save_intervention_outcome(outcome).await {
+                            tracing::warn!(error = %e, "failed to persist intervention outcome");
+                        }
+                    }
+                }
 
                 // Tier 2 runs asynchronously after Tier 1 completes. Tier 1
                 // always runs; only the Tier 2 spawn is gated by the sample rate.
