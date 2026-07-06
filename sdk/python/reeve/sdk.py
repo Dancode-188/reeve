@@ -35,7 +35,12 @@ class CheckpointResult:
 class ReeveSdk:
     def __init__(self) -> None:
         self._pending: dict[str, Any] | None = None
+        # Set means running, cleared means holding at a paused checkpoint.
+        # Starts set so is_set() doubles as the pause-state check.
         self._pause_event: asyncio.Event = asyncio.Event()
+        self._pause_event.set()
+        self._resume_pending: str | None = None
+        self._seen_commands: set[str] = set()
         self._queue: asyncio.Queue = asyncio.Queue()
         self._call: Any = None
         self._tracer: otel_trace.Tracer | None = None
@@ -94,18 +99,33 @@ class ReeveSdk:
 
             if cmd_type == reeve_pb2.KILL:
                 await self._ack(command_id, reeve_pb2.APPLIED)
+                # The ack sits in the send queue; raising immediately tears
+                # down the event loop before the sender task can put it on
+                # the wire, and the kill then shows as expired in the audit
+                # trail instead of applied. One short yield lets it flush.
+                await asyncio.sleep(0.1)
                 raise AgentKilled()
             elif cmd_type == reeve_pb2.PAUSE:
                 await self._ack(command_id, reeve_pb2.APPLYING)
                 self._pause_event.clear()
-                await self._pause_event.wait()
+                # Applied means the agent has confirmed it is holding at a
+                # yield point, which is true from this moment. Reeve's pause
+                # tracking flips on this ack; sending it after resume instead
+                # makes every pause look like a command that timed out.
                 await self._ack(command_id, reeve_pb2.APPLIED)
+                await self._pause_event.wait()
+                if self._resume_pending is not None:
+                    resume_id = self._resume_pending
+                    self._resume_pending = None
+                    await self._ack(resume_id, reeve_pb2.APPLIED)
                 # loop back: another command may have arrived while paused
             elif cmd_type == reeve_pb2.REDIRECT:
                 await self._ack(command_id, reeve_pb2.APPLYING)
+                await self._ack(command_id, reeve_pb2.APPLIED)
                 return CheckpointResult.Redirect(cmd["payload"])
             elif cmd_type == reeve_pb2.INJECT_CONTEXT:
                 await self._ack(command_id, reeve_pb2.APPLYING)
+                await self._ack(command_id, reeve_pb2.APPLIED)
                 return CheckpointResult.Context(cmd["payload"])
 
     def trace(self, func: Callable | None = None, *, name: str | None = None) -> Any:
@@ -138,14 +158,33 @@ class ReeveSdk:
                 )
             elif kind == "command":
                 cmd = msg.command
+                if cmd.command_id in self._seen_commands:
+                    # A network retry of a command already handled. Discard
+                    # silently with a RECEIVED ack; re-applying it is worse
+                    # than the retry (a redirect would land twice).
+                    await self._ack(cmd.command_id, reeve_pb2.RECEIVED)
+                    continue
                 if cmd.valid_until_ms > 0 and _now_ms() > cmd.valid_until_ms:
                     await self._ack(cmd.command_id, reeve_pb2.EXPIRED)
                     continue
+                self._seen_commands.add(cmd.command_id)
                 await self._ack(cmd.command_id, reeve_pb2.RECEIVED)
                 if cmd.type == reeve_pb2.RESUME:
-                    self._pending = None
+                    if self._pause_event.is_set():
+                        # Not paused; refuse the invalid transition.
+                        await self._ack(cmd.command_id, reeve_pb2.FAILED)
+                    else:
+                        # The woken checkpoint acks this applied once the
+                        # agent is actually running again.
+                        self._resume_pending = cmd.command_id
+                        self._pause_event.set()
+                elif cmd.type == reeve_pb2.KILL:
+                    self._pending = {"command_id": cmd.command_id, "type": cmd.type}
+                    # A paused checkpoint is blocked on the pause event and
+                    # only processes commands when awake. Kill must release
+                    # the block or a paused agent can never be killed.
                     self._pause_event.set()
-                elif cmd.type in (reeve_pb2.KILL, reeve_pb2.PAUSE):
+                elif cmd.type == reeve_pb2.PAUSE:
                     self._pending = {"command_id": cmd.command_id, "type": cmd.type}
                 elif cmd.type in (reeve_pb2.REDIRECT, reeve_pb2.INJECT_CONTEXT):
                     self._pending = {
