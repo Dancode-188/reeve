@@ -111,9 +111,9 @@ async fn run_inner(
     let theme = Theme::load();
     let mut app = App::new(ingestion_rx, engine_event_rx, warm, dispatcher).await;
 
-    let (action_tx, mut action_rx) = mpsc::channel(64);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
     tokio::spawn(async move {
-        input::run(action_tx).await;
+        input::run(event_tx).await;
     });
 
     // 15fps: live enough to feel responsive, low enough to not burn CPU on a monitoring tool.
@@ -203,8 +203,12 @@ async fn run_inner(
                     break;
                 }
             }
-            Some(action) = action_rx.recv() => {
-                app.handle_action(action).await;
+            Some(event) = event_rx.recv() => {
+                // Mapping happens here, not in the input task, because it
+                // depends on whether a text input is active right now.
+                if let Some(action) = input::map_event(event, app.text_input_active()) {
+                    app.handle_action(action).await;
+                }
                 if app.should_quit {
                     break;
                 }

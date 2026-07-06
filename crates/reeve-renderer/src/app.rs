@@ -942,6 +942,18 @@ impl App {
         }
     }
 
+    /// Whether keystrokes are currently text rather than commands. Drives the
+    /// mode-aware key mapping in `input::map_event`.
+    pub fn text_input_active(&self) -> bool {
+        matches!(
+            self.state.overlay,
+            Some(InterventionOverlayState {
+                mode: OverlayMode::TextInput { .. },
+                ..
+            })
+        )
+    }
+
     /// Called from the tick loop. Overlays the dispatcher's confirmed pause
     /// state onto agent display status. The dispatcher is authoritative for
     /// pause because it processes the applied acks; ingestion events cannot
