@@ -27,6 +27,57 @@ use std::sync::Arc;
 use theme::Theme;
 use tokio::sync::{broadcast, mpsc};
 
+/// What the developer chose on the pre-cockpit fatal error screen.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FatalOutcome {
+    Retry,
+    Quit,
+}
+
+/// Show the full-screen fatal error card and block until the developer
+/// chooses retry or quit. For startup failures that happen before the
+/// cockpit exists: the main render loop owns `AppState.fatal_error`, but a
+/// dispatcher or store that failed to construct means there is no App to
+/// carry that state yet.
+pub fn show_fatal(err: &app::FatalError) -> Result<FatalOutcome, RendererError> {
+    enable_raw_mode()?;
+    execute!(std::io::stdout(), EnterAlternateScreen)?;
+
+    let result = show_fatal_inner(err);
+
+    let _ = disable_raw_mode();
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+
+    result
+}
+
+fn show_fatal_inner(err: &app::FatalError) -> Result<FatalOutcome, RendererError> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};
+
+    let backend = CrosstermBackend::new(std::io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+    let theme = Theme::load();
+
+    loop {
+        terminal.draw(|frame| panels::render_fatal(frame, frame.area(), err, &theme))?;
+        if let Event::Key(key) = read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('r') => return Ok(FatalOutcome::Retry),
+                KeyCode::Char('q') => return Ok(FatalOutcome::Quit),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(FatalOutcome::Quit);
+                }
+                _ => {}
+            }
+        }
+        // Any other event (resize, focus) falls through to a redraw.
+    }
+}
+
 pub async fn run(
     ingestion_rx: broadcast::Receiver<IngestionEvent>,
     engine_event_rx: broadcast::Receiver<EngineEvent>,
