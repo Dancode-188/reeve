@@ -82,8 +82,13 @@ pub async fn run(
         policy_engine.load_cooldowns(&cooldowns, startup_ms);
     }
 
-    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .expect("failed to install SIGHUP handler");
+    // SIGUSR1 triggers a policy rule reload. SIGHUP deliberately keeps its
+    // default disposition (terminate): for a terminal app, hangup means the
+    // terminal went away. An earlier SIGHUP-based reload made Reeve swallow
+    // its own hangup and survive every terminal close, holding both ports.
+    let mut reload_signal =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+            .expect("failed to install SIGUSR1 handler");
 
     let evaluators: Vec<Box<dyn Evaluator>> = vec![
         Box::new(LoopDetector::new(3)),
@@ -95,7 +100,7 @@ pub async fn run(
 
     loop {
         let event = tokio::select! {
-            _ = sighup.recv() => {
+            _ = reload_signal.recv() => {
                 let db_rules = warm.load_policy_rules().await.unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "failed to reload policy rules from database");
                     vec![]

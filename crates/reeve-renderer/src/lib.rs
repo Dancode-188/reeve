@@ -203,14 +203,24 @@ async fn run_inner(
                     break;
                 }
             }
-            Some(event) = event_rx.recv() => {
-                // Mapping happens here, not in the input task, because it
-                // depends on whether a text input is active right now.
-                if let Some(action) = input::map_event(event, app.text_input_active()) {
-                    app.handle_action(action).await;
-                }
-                if app.should_quit {
-                    break;
+            event = event_rx.recv() => {
+                match event {
+                    Some(event) => {
+                        // Mapping happens here, not in the input task, because it
+                        // depends on whether a text input is active right now.
+                        if let Some(action) = input::map_event(event, app.text_input_active()) {
+                            app.handle_action(action).await;
+                        }
+                        if app.should_quit {
+                            break;
+                        }
+                    }
+                    // The input task exits when the terminal goes away (its
+                    // blocking read errors), and the engine's SIGHUP handler
+                    // means the hangup signal no longer kills the process. A
+                    // cockpit that can never receive input again must quit,
+                    // or it lives on invisibly holding both ports.
+                    None => break,
                 }
             }
         }
