@@ -57,6 +57,23 @@ Replay actually works.
 
 ---
 
+## v0.5.0: Transparent
+
+Point `ANTHROPIC_BASE_URL` at Reeve. Watch Claude Code appear in the cockpit.
+No SDK, no instrumentation, no code changes.
+
+The HTTP proxy intercepts request/response pairs and synthesizes spans from
+them, streaming SSE included, with zero added latency to the tool being
+proxied. Redirect and inject-context work cleanly through the proxy by
+modifying the buffered request before forwarding. Pause and kill are fragile
+without an SDK, so proxy-connected agents carry a `[proxy]` indicator and
+their reduced capabilities are stated plainly rather than papered over.
+
+**What this proves:** Reeve is useful with tools you already run, before you
+write a single line of integration code.
+
+---
+
 ## v1.0.0: Production
 
 All adapters. Full docs. Stable APIs. `cargo install reeve` actually works.
