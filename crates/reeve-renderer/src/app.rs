@@ -875,16 +875,13 @@ impl App {
     }
 
     async fn dispatch_confirmation(&mut self, pc: PendingConfirmation, issued_by: String) {
-        let cmd_type = match pc.command_type.as_str() {
-            "Pause" => CommandType::Pause,
-            "Kill" => CommandType::Kill,
-            "Redirect" => CommandType::Redirect {
-                instruction: pc.description.clone(),
-            },
-            "InjectContext" => CommandType::InjectContext {
-                context: pc.description.clone(),
-            },
-            _ => return,
+        let Some(cmd_type) = confirmation_command_type(&pc.command_type, &pc.description) else {
+            tracing::warn!(
+                command_type = %pc.command_type,
+                rule_id = %pc.rule_id,
+                "confirmed policy command has unknown type; nothing dispatched"
+            );
+            return;
         };
         self.dispatch_command_with_attribution(pc.agent_id, cmd_type, issued_by)
             .await;
@@ -1115,5 +1112,68 @@ fn suggestion_to_command_type(s: SuggestedIntervention) -> CommandType {
         OverlayCommand::InjectContext => CommandType::InjectContext { context: s.text },
         OverlayCommand::Pause => CommandType::Pause,
         OverlayCommand::Kill => CommandType::Kill,
+    }
+}
+
+/// Maps a `PolicyAlert` command type string to a dispatchable command. The
+/// strings here must match what the engine's `command_type_str` emits in
+/// `reeve-engine/src/policy/mod.rs`; the two crates share no type for this,
+/// only the wire string. A mismatch is not an error the developer can see:
+/// the confirmation modal accepts the keypress and nothing happens.
+fn confirmation_command_type(command_type: &str, description: &str) -> Option<CommandType> {
+    match command_type {
+        "pause" => Some(CommandType::Pause),
+        "resume" => Some(CommandType::Resume),
+        "kill" => Some(CommandType::Kill),
+        "redirect" => Some(CommandType::Redirect {
+            instruction: description.to_string(),
+        }),
+        "inject_context" => Some(CommandType::InjectContext {
+            context: description.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins this matcher to the exact strings `command_type_str` in
+    /// reeve-engine emits. If a variant is added or renamed there, this
+    /// test is the tripwire; without it the confirmation flow fails as a
+    /// silent no-op, which is how the original mismatch shipped.
+    #[test]
+    fn confirmation_matches_every_engine_command_string() {
+        assert!(matches!(
+            confirmation_command_type("pause", ""),
+            Some(CommandType::Pause)
+        ));
+        assert!(matches!(
+            confirmation_command_type("resume", ""),
+            Some(CommandType::Resume)
+        ));
+        assert!(matches!(
+            confirmation_command_type("kill", ""),
+            Some(CommandType::Kill)
+        ));
+        match confirmation_command_type("redirect", "go elsewhere") {
+            Some(CommandType::Redirect { instruction }) => {
+                assert_eq!(instruction, "go elsewhere")
+            }
+            other => panic!("redirect must map with its instruction, got {other:?}"),
+        }
+        match confirmation_command_type("inject_context", "extra facts") {
+            Some(CommandType::InjectContext { context }) => assert_eq!(context, "extra facts"),
+            other => panic!("inject_context must map with its context, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirmation_rejects_unknown_and_capitalized_strings() {
+        assert!(confirmation_command_type("Pause", "").is_none());
+        assert!(confirmation_command_type("PAUSE", "").is_none());
+        assert!(confirmation_command_type("", "").is_none());
+        assert!(confirmation_command_type("shutdown", "").is_none());
     }
 }
