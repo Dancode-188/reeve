@@ -94,7 +94,7 @@ impl PolicyEngine {
         }
     }
 
-    /// Replaces all non-builtin rules atomically. Called at startup and on SIGHUP.
+    /// Replaces all non-builtin rules atomically. Called at startup and on SIGUSR1.
     pub fn replace_user_rules(&mut self, user_rules: Vec<PolicyRule>) {
         self.rules.retain(|r| r.id.as_str().starts_with("builtin_"));
         let validated: Vec<PolicyRule> = user_rules
