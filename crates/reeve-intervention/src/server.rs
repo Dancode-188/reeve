@@ -123,7 +123,7 @@ impl ReeveControl for ControlServer {
             }
         };
 
-        let agent_id = AgentId::from(handshake.agent_id.as_str());
+        let agent_id = registration_key(&handshake);
         let capabilities = handshake.capabilities.clone();
         let t1_ms = handshake.t1_ms;
 
@@ -259,6 +259,23 @@ pub async fn run(
     handle
 }
 
+/// Derives the id this connection is registered under. When the handshake
+/// carries the OTel resource identity, the key is composed exactly the way
+/// the ingestion pipeline composes it from span resources, so commands
+/// routed by observed agent id land on this stream. The bare agent_id
+/// fallback keeps older SDKs connected, but their observed and control
+/// identities will not match and interventions will not route to them.
+fn registration_key(handshake: &proto::AgentHandshake) -> AgentId {
+    if !handshake.service_name.is_empty() && !handshake.service_instance_id.is_empty() {
+        reeve_model::ids::agent_id_from_service(
+            &handshake.service_name,
+            &handshake.service_instance_id,
+        )
+    } else {
+        AgentId::from(handshake.agent_id.as_str())
+    }
+}
+
 fn proto_ack_to_domain(status: i32) -> Option<AckStatus> {
     match status {
         1 => Some(AckStatus::Received),
@@ -306,6 +323,44 @@ mod tests {
     fn no_agents_connected_initially() {
         let server = make_server();
         assert!(server.connected_agent_ids().is_empty());
+    }
+
+    #[test]
+    fn registration_key_composes_service_identity() {
+        let handshake = proto::AgentHandshake {
+            agent_id: "display-name".to_string(),
+            service_name: "research-bot".to_string(),
+            service_instance_id: "pod-7".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            registration_key(&handshake).as_str(),
+            "research-bot:pod-7",
+            "must match the id ingestion derives from span resources"
+        );
+    }
+
+    #[test]
+    fn registration_key_falls_back_to_agent_id() {
+        let handshake = proto::AgentHandshake {
+            agent_id: "legacy-agent".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(registration_key(&handshake).as_str(), "legacy-agent");
+    }
+
+    #[test]
+    fn registration_key_requires_both_service_fields() {
+        let handshake = proto::AgentHandshake {
+            agent_id: "half-configured".to_string(),
+            service_name: "research-bot".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            registration_key(&handshake).as_str(),
+            "half-configured",
+            "a name without an instance id must not produce a partial key"
+        );
     }
 
     #[test]

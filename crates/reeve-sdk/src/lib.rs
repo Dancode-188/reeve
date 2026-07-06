@@ -16,7 +16,13 @@ use tokio_stream::wrappers::ReceiverStream;
 
 /// Configuration for [`ReeveSdk::connect`].
 pub struct SdkConfig {
-    pub agent_id: String,
+    /// Becomes the OTel `service.name` and the first half of the agent's
+    /// identity on both channels.
+    pub agent_name: String,
+    /// Distinguishes concurrent instances of the same agent. Defaults to a
+    /// value derived from the connect time; set it explicitly when an agent
+    /// must keep its identity across restarts.
+    pub instance_id: String,
     pub framework: String,
     pub capabilities: Vec<String>,
     /// Host running Reeve. Defaults to `"127.0.0.1"`.
@@ -24,9 +30,10 @@ pub struct SdkConfig {
 }
 
 impl SdkConfig {
-    pub fn new(agent_id: impl Into<String>) -> Self {
+    pub fn new(agent_name: impl Into<String>) -> Self {
         Self {
-            agent_id: agent_id.into(),
+            agent_name: agent_name.into(),
+            instance_id: format!("{:x}", now_nanos()),
             framework: "custom".to_string(),
             capabilities: vec![
                 "pause".to_string(),
@@ -72,7 +79,8 @@ impl ReeveSdk {
     /// and install an OTel OTLP exporter pointing at port 4317. Returns an
     /// `Arc<ReeveSdk>` so the handle can be shared across async tasks.
     pub async fn connect(config: SdkConfig) -> Result<Arc<Self>, SdkError> {
-        setup_otel(&config.host).map_err(|e| SdkError::Telemetry(e.to_string()))?;
+        setup_otel(&config.host, &config.agent_name, &config.instance_id)
+            .map_err(|e| SdkError::Telemetry(e.to_string()))?;
 
         let control_endpoint = format!("http://{}:4316", config.host);
         let mut client =
@@ -83,16 +91,21 @@ impl ReeveSdk {
 
         // Queue the handshake before the stream is consumed by the RPC call.
         // The channel buffer guarantees it arrives as the first message.
+        // The service fields must carry exactly what setup_otel put in the
+        // Resource; they are the only thing that makes commands routable
+        // back to this connection.
         let t1 = now_ms();
         let _ = outbound_tx
             .send(proto::AgentMessage {
                 payload: Some(proto::agent_message::Payload::Handshake(
                     proto::AgentHandshake {
-                        agent_id: config.agent_id.clone(),
+                        agent_id: format!("{}:{}", config.agent_name, config.instance_id),
                         framework: config.framework.clone(),
                         sdk_version: env!("CARGO_PKG_VERSION").to_string(),
                         capabilities: config.capabilities.clone(),
                         t1_ms: t1,
+                        service_name: config.agent_name.clone(),
+                        service_instance_id: config.instance_id.clone(),
                     },
                 )),
             })
@@ -290,14 +303,32 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn setup_otel(host: &str) -> Result<(), opentelemetry::trace::TraceError> {
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn setup_otel(
+    host: &str,
+    service_name: &str,
+    instance_id: &str,
+) -> Result<(), opentelemetry::trace::TraceError> {
     let endpoint = format!("http://{}:4317", host);
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
         .build()?;
+    // Without these attributes every span arrives as unknown_service and the
+    // observed identity can never match the control channel registration.
+    let resource = opentelemetry_sdk::Resource::new(vec![
+        opentelemetry::KeyValue::new("service.name", service_name.to_string()),
+        opentelemetry::KeyValue::new("service.instance.id", instance_id.to_string()),
+    ]);
     let provider = opentelemetry_sdk::trace::TracerProvider::builder()
         .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        .with_resource(resource)
         .build();
     opentelemetry::global::set_tracer_provider(provider);
     Ok(())
@@ -326,7 +357,11 @@ mod tests {
     #[test]
     fn sdk_config_defaults() {
         let cfg = SdkConfig::new("my-agent");
-        assert_eq!(cfg.agent_id, "my-agent");
+        assert_eq!(cfg.agent_name, "my-agent");
+        assert!(
+            !cfg.instance_id.is_empty(),
+            "instance id must default to a generated value"
+        );
         assert_eq!(cfg.host, "127.0.0.1");
         assert!(cfg.capabilities.contains(&"pause".to_string()));
         assert!(cfg.capabilities.contains(&"kill".to_string()));

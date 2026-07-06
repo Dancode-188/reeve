@@ -202,6 +202,19 @@ async def test_resume_while_running_acks_failed():
     assert sdk._pending is None
 
 
+def test_handshake_proto_carries_service_identity():
+    handshake = reeve_pb2.AgentHandshake(
+        agent_id="research-bot:pod-7",
+        service_name="research-bot",
+        service_instance_id="pod-7",
+    )
+    assert handshake.service_name == "research-bot"
+    assert handshake.service_instance_id == "pod-7"
+    assert handshake.agent_id == f"{handshake.service_name}:{handshake.service_instance_id}", (
+        "agent_id must be the composed form so older servers register the same identity"
+    )
+
+
 @pytest.mark.asyncio
 async def test_resume_while_paused_releases_and_stores_id():
     sdk = _sdk_with_pending(reeve_pb2.PAUSE)

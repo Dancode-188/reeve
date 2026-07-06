@@ -46,6 +46,14 @@ message AgentHandshake {
   string          sdk_version  = 3;
   repeated string capabilities = 4;  // e.g. ["pause", "redirect", "inject_context", "kill"]
   int64           t1_ms        = 5;  // NTP T1: agent-side send timestamp (ms since epoch)
+  // OTel resource identity. When both are set, Reeve registers this control
+  // connection under the same derived id the ingestion pipeline builds from
+  // span resource attributes ("service_name:service_instance_id"), so the
+  // observation and control channels agree on who the agent is. SDKs must
+  // send the same two values here and in the OTel Resource. When absent,
+  // Reeve falls back to registering under agent_id verbatim.
+  string          service_name        = 6;
+  string          service_instance_id = 7;
 }
 
 // Reeve sends this in reply to AgentHandshake to complete the NTP four-timestamp
