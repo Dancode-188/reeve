@@ -43,19 +43,20 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
+    /// Fails when the audit log cannot be created or opened. The audit trail
+    /// is the permanent record of every intervention; running without one is
+    /// not an acceptable degraded mode, so the caller must treat this as a
+    /// fatal startup condition rather than pressing on.
     pub fn new(
         server: Arc<ControlServer>,
         warm: Arc<WarmStore>,
         audit_path: PathBuf,
         paused: PausedAgents,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, std::io::Error> {
         let audit_log = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&audit_path)
-            .unwrap_or_else(|e| {
-                panic!("failed to open audit log at {}: {e}", audit_path.display())
-            });
+            .open(&audit_path)?;
 
         let (ack_tx, ack_rx) = mpsc::channel::<AckNotification>(64);
         server.register_ack_sink(ack_tx);
@@ -75,7 +76,7 @@ impl Dispatcher {
         let d = dispatcher.clone();
         tokio::spawn(async move { d.expiry_loop().await });
 
-        dispatcher
+        Ok(dispatcher)
     }
 
     /// Route a command to the agent that owns the trace. Returns `true` if the
@@ -408,7 +409,7 @@ mod tests {
         let warm = Arc::new(WarmStore::open_in_memory().unwrap());
         let audit_path = std::env::temp_dir().join("reeve_test_audit.log");
         let paused = Arc::new(Mutex::new(HashSet::new()));
-        Dispatcher::new(server, warm, audit_path, paused)
+        Dispatcher::new(server, warm, audit_path, paused).unwrap()
     }
 
     fn pending_command(command_type: CommandType) -> InterventionCommand {
@@ -525,6 +526,22 @@ mod tests {
             valid_until_ms: i64::MAX,
         };
         assert!(!d.dispatch(&agent_id, command).await);
+    }
+
+    #[tokio::test]
+    async fn new_fails_when_audit_path_is_unwritable() {
+        let (engine_tx, _rx) = broadcast::channel(8);
+        let server = crate::server::new_for_test(engine_tx);
+        let warm = Arc::new(WarmStore::open_in_memory().unwrap());
+        // Parent directory does not exist, so the open must fail.
+        let audit_path = std::env::temp_dir().join("reeve_no_such_dir/audit.log");
+        let paused = Arc::new(Mutex::new(HashSet::new()));
+
+        let result = Dispatcher::new(server, warm, audit_path, paused);
+        assert!(
+            result.is_err(),
+            "an unopenable audit log must be an error, not a panic"
+        );
     }
 
     #[tokio::test]

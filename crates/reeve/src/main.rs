@@ -92,12 +92,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("audit.log");
-    let dispatcher = reeve_intervention::dispatcher::Dispatcher::new(
-        control_server,
-        warm.clone(),
-        audit_path,
-        paused_agents,
-    );
+    // The audit trail is the permanent record of every intervention, so a
+    // dispatcher that cannot write it is a fatal condition, not a degraded
+    // mode. The retry path exists because the common cause is a permissions
+    // problem the developer can fix in another terminal without losing the
+    // already-running ingestion and engine tasks.
+    let dispatcher = loop {
+        match reeve_intervention::dispatcher::Dispatcher::new(
+            control_server.clone(),
+            warm.clone(),
+            audit_path.clone(),
+            paused_agents.clone(),
+        ) {
+            Ok(d) => break d,
+            Err(e) => {
+                let err = reeve_renderer::app::FatalError {
+                    message: format!("cannot open audit log: {e}"),
+                    hint: Some(format!("check permissions on {}", audit_path.display())),
+                };
+                match reeve_renderer::show_fatal(&err)? {
+                    reeve_renderer::FatalOutcome::Retry => continue,
+                    reeve_renderer::FatalOutcome::Quit => return Ok(()),
+                }
+            }
+        }
+    };
 
     let engine_dispatcher = dispatcher.clone();
     tokio::spawn(async move {
