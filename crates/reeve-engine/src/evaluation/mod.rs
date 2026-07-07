@@ -1,5 +1,8 @@
 pub mod fingerprint;
-pub mod health_score;
+/// The composite scoring arithmetic lives in reeve-model so replay can
+/// recompute scores exactly as the engine computed them live. Re-exported
+/// here to keep the engine-internal path stable.
+pub use reeve_model::scoring as health_score;
 pub mod heuristic;
 pub mod llm_judge;
 

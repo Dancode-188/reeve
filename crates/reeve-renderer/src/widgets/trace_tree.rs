@@ -19,6 +19,10 @@ pub struct TraceTree<'a> {
     pub span_health_scores: &'a HashMap<SpanId, f64>,
     pub outcome_lines: &'a [OutcomeLine],
     pub root: Option<&'a SpanId>,
+    /// Spans not reachable from the root: arrived before their parent. They
+    /// render as flat rows labeled as awaiting it, per the live-view rule
+    /// that an arrived span is never invisible.
+    pub orphans: &'a [SpanId],
     pub selected: Option<&'a SpanId>,
     pub scroll: u16,
     pub title: &'a str,
@@ -46,11 +50,21 @@ impl<'a> Widget for TraceTree<'a> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         if let Some(root) = self.root {
             self.build_lines(root, "", true, true, &mut lines);
-        } else {
+        } else if self.orphans.is_empty() {
             lines.push(Line::from(Span::styled(
                 " no trace selected",
                 Style::default().fg(self.theme.subtext()),
             )));
+        }
+        for orphan in self.orphans {
+            let name = self.names.get(orphan).map(String::as_str).unwrap_or("span");
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {name} "), Style::default().fg(self.theme.text())),
+                Span::styled(
+                    "awaiting parent span",
+                    Style::default().fg(self.theme.subtext()),
+                ),
+            ]));
         }
 
         Widget::render(Paragraph::new(lines).scroll((self.scroll, 0)), inner, buf);
@@ -214,6 +228,7 @@ mod tests {
                     span_health_scores: &scores,
                     outcome_lines: &[],
                     root: Some(&root),
+                    orphans: &[],
                     selected: None,
                     scroll: 0,
                     title: "TRACE",
@@ -270,6 +285,7 @@ mod tests {
                     span_health_scores: &scores,
                     outcome_lines: &outcomes,
                     root: Some(&root),
+                    orphans: &[],
                     selected: None,
                     scroll: 0,
                     title: "TRACE",
@@ -293,6 +309,64 @@ mod tests {
         assert!(
             content.contains("redirect") && content.contains("+0.35"),
             "outcome line must appear below root span"
+        );
+    }
+
+    #[test]
+    fn orphans_render_without_a_root() {
+        // Mid-replay reality: children arrive before their parent, so spans
+        // exist with no root. They must render as flat awaiting rows, not
+        // vanish behind "no trace selected".
+        let children: HashMap<SpanId, Vec<SpanId>> = HashMap::new();
+        let mut names: HashMap<SpanId, String> = HashMap::new();
+        let orphan: SpanId = "tool-span".into();
+        names.insert(orphan.clone(), "gen_ai.tool:search".to_string());
+        let orphans = vec![orphan];
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let collapsed = HashSet::new();
+        let scores: HashMap<SpanId, f64> = HashMap::new();
+        terminal
+            .draw(|frame| {
+                let theme = make_theme();
+                let ascii = make_ascii();
+                let widget = TraceTree {
+                    children: &children,
+                    names: &names,
+                    collapsed: &collapsed,
+                    span_health_scores: &scores,
+                    outcome_lines: &[],
+                    root: None,
+                    orphans: &orphans,
+                    selected: None,
+                    scroll: 0,
+                    title: "TRACE",
+                    focused: false,
+                    theme: &theme,
+                    ascii: &ascii,
+                };
+                frame.render_widget(widget, frame.area());
+            })
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect::<String>();
+
+        assert!(content.contains("gen_ai.tool:search"), "orphan must appear");
+        assert!(
+            content.contains("awaiting parent span"),
+            "orphan must be labeled as awaiting its parent"
+        );
+        assert!(
+            !content.contains("no trace selected"),
+            "arrived spans mean the empty-state message is wrong"
         );
     }
 }
