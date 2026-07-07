@@ -5,6 +5,7 @@ pub mod errors;
 pub mod impact;
 pub mod input;
 pub mod layout;
+pub mod mouse;
 pub mod panels;
 pub mod replay;
 pub mod theme;
@@ -13,6 +14,7 @@ pub mod widgets;
 use app::App;
 use ascii::AsciiMode;
 use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -88,12 +90,12 @@ pub async fn run(
     dispatcher: Arc<Dispatcher>,
 ) -> Result<(), RendererError> {
     enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen)?;
+    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
 
     let result = run_inner(ingestion_rx, engine_event_rx, warm, ascii_mode, dispatcher).await;
 
     let _ = disable_raw_mode();
-    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 
     result
 }
@@ -120,6 +122,7 @@ async fn run_inner(
 
     // 15fps: live enough to feel responsive, low enough to not burn CPU on a monitoring tool.
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(66));
+    let mut mouse_captured = true;
 
     loop {
         tokio::select! {
@@ -154,6 +157,18 @@ async fn run_inner(
                 app.check_auto_confirm().await;
                 // 66ms of wall time per tick, matching the render interval.
                 app.advance_replay(66.0);
+
+                // Reconcile the terminal's capture state with the m toggle.
+                if app.state.mouse_enabled != mouse_captured {
+                    let result = if app.state.mouse_enabled {
+                        execute!(std::io::stdout(), EnableMouseCapture)
+                    } else {
+                        execute!(std::io::stdout(), DisableMouseCapture)
+                    };
+                    if result.is_ok() {
+                        mouse_captured = app.state.mouse_enabled;
+                    }
+                }
 
                 terminal.draw(|frame| {
                     if let Some(ref err) = app.state.fatal_error {
@@ -225,6 +240,53 @@ async fn run_inner(
             }
             event = event_rx.recv() => {
                 match event {
+                    Some(crossterm::event::Event::Mouse(mouse)) => {
+                        // Hit-testing needs the same layout the draw used;
+                        // recompute it from the terminal size, which is
+                        // deterministic and cheap.
+                        if let Ok(size) = terminal.size() {
+                            let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                            let full = layout::compute_full(area);
+                            // Mirror the draw path exactly, including the
+                            // two rows the degraded banner takes.
+                            let is_degraded = app.state.eval_backend.as_deref() == Some("disabled")
+                                && !app.state.degraded_dismissed;
+                            let body = if is_degraded && full.body.height >= 3 {
+                                ratatui::layout::Rect {
+                                    y: full.body.y + 2,
+                                    height: full.body.height - 2,
+                                    ..full.body
+                                }
+                            } else {
+                                full.body
+                            };
+                            let panels = if app.state.view_mode == app::ViewMode::Focus {
+                                layout::compute_focus(body)
+                            } else {
+                                layout::compute(body)
+                            };
+                            use crossterm::event::MouseEventKind;
+                            let target = match mouse.kind {
+                                MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                                    mouse::click_target(
+                                        &app.state,
+                                        &panels,
+                                        full.footer.y,
+                                        mouse.column,
+                                        mouse.row,
+                                    )
+                                }
+                                MouseEventKind::ScrollUp => {
+                                    mouse::scroll_target(&panels, mouse.column, mouse.row, true)
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    mouse::scroll_target(&panels, mouse.column, mouse.row, false)
+                                }
+                                _ => mouse::MouseTarget::None,
+                            };
+                            app.apply_mouse_target(target).await;
+                        }
+                    }
                     Some(event) => {
                         // Mapping happens here, not in the input task, because it
                         // depends on whether a text input is active right now.
