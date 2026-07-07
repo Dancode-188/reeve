@@ -7,7 +7,14 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, right_hidden: bool, left_hidden: bool) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    right_hidden: bool,
+    left_hidden: bool,
+    focus_mode: bool,
+) {
     if area.height == 0 {
         return;
     }
@@ -22,7 +29,15 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, right_hidden: bool, 
     let bracket = Style::default().fg(theme.subtext());
     let warn = Style::default().fg(theme.health_warn());
 
-    let groups: Vec<Line> = if left_hidden {
+    let groups: Vec<Line> = if focus_mode {
+        vec![
+            key_group("[\u{5B}/\u{5D}]", "traces", &kb, &action, &bracket),
+            key_group("[j/k]", "nav", &kb, &action, &bracket),
+            key_group("[1]", "fleet", &kb, &action, &bracket),
+            key_group("[?]", "help", &kb, &action, &bracket),
+            key_group("[q]", "quit", &kb, &action, &bracket),
+        ]
+    } else if left_hidden {
         vec![
             key_group("[j/k]", "nav", &kb, &action, &bracket),
             key_group("[?]", "help", &kb, &action, &bracket),
@@ -33,6 +48,7 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, right_hidden: bool, 
             key_group("[j/k]", "nav", &kb, &action, &bracket),
             key_group("[h/l]", "panels", &kb, &action, &bracket),
             key_group("[Enter]", "fold", &kb, &action, &bracket),
+            key_group("[2]", "focus", &kb, &action, &bracket),
             key_group("[?]", "help", &kb, &action, &bracket),
             key_group("[q]", "quit", &kb, &action, &bracket),
         ];

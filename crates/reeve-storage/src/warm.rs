@@ -394,6 +394,26 @@ impl WarmStore {
         .await
     }
 
+    /// Most recent traces first, for stepping backwards through an agent's
+    /// history. `list_traces_for_agent` keeps its ascending order for
+    /// callers that replay chronologically.
+    pub async fn list_recent_traces_for_agent(
+        &self,
+        agent_id: &AgentId,
+        limit: u32,
+    ) -> Result<Vec<Trace>, StorageError> {
+        let agent_id = agent_id.clone();
+        self.with_conn(move |conn| {
+            conn.prepare(
+                "SELECT * FROM traces WHERE agent_id = ?1
+                 ORDER BY started_at DESC LIMIT ?2",
+            )?
+            .query_map(params![agent_id.as_str(), limit], row_to_trace)?
+            .collect()
+        })
+        .await
+    }
+
     pub async fn save_span(&self, span: InternalSpan) -> Result<(), StorageError> {
         let status = enum_to_text(&span.status)?;
         let attributes = serde_json::to_string(&span.attributes)?;

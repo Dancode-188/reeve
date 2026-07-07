@@ -2,6 +2,7 @@ pub mod center;
 pub mod confirm;
 pub mod degraded;
 pub mod fatal;
+pub mod focus_list;
 pub mod footer;
 pub mod header;
 pub mod help;
@@ -9,6 +10,7 @@ pub mod left;
 pub mod overlay;
 pub mod right;
 
+use crate::app::ViewMode;
 use crate::{app::AppState, ascii::AsciiMode, layout::Panels, theme::Theme};
 use ratatui::{
     Frame,
@@ -35,7 +37,11 @@ pub fn render(
             .border_style(divider_style);
         let inner = border.inner(panels.left);
         frame.render_widget(border, panels.left);
-        left::render(frame, inner, state, theme);
+        if state.view_mode == ViewMode::Focus {
+            focus_list::render(frame, inner, state, theme);
+        } else {
+            left::render(frame, inner, state, theme);
+        }
     }
 
     center::render(frame, panels.center, state, theme, ascii, right_hidden);
@@ -60,8 +66,9 @@ pub fn render_footer(
     theme: &Theme,
     right_hidden: bool,
     left_hidden: bool,
+    focus_mode: bool,
 ) {
-    footer::render(frame, area, theme, right_hidden, left_hidden);
+    footer::render(frame, area, theme, right_hidden, left_hidden, focus_mode);
 }
 
 pub fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
