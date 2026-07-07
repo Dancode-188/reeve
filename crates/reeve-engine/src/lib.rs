@@ -225,12 +225,14 @@ pub async fn run(
                             auto_confirm_after_secs,
                         ) = alert_fields(&fr);
                         let rule_id_owned = rule_id_str.to_string();
+                        let effectiveness = effectiveness_hint(&warm, &fr.rule.id, &agent_id).await;
                         let _ = engine_tx.send(EngineEvent::PolicyAlert {
                             rule_id: rule_id_owned.clone(),
                             description: description.to_string(),
                             command_type: cmd_type.to_string(),
                             requires_confirmation,
                             auto_confirm_after_secs,
+                            effectiveness,
                         });
                         persist_cooldown(
                             &warm,
@@ -408,12 +410,14 @@ pub async fn run(
                         auto_confirm_after_secs,
                     ) = alert_fields(&fr);
                     let rule_id_owned = rule_id_str.to_string();
+                    let effectiveness = effectiveness_hint(&warm, &fr.rule.id, &agent_id).await;
                     let _ = engine_tx.send(EngineEvent::PolicyAlert {
                         rule_id: rule_id_owned.clone(),
                         description: description.to_string(),
                         command_type: cmd_type.to_string(),
                         requires_confirmation,
                         auto_confirm_after_secs,
+                        effectiveness,
                     });
                     persist_cooldown(&warm, &agent_id, &fr.rule.id, now_ms, fr.rule.cooldown_secs)
                         .await;
@@ -436,6 +440,32 @@ pub async fn run(
                 tracing::info!("ingestion channel closed, engine shutting down");
                 break;
             }
+        }
+    }
+}
+
+/// What has historically worked for this rule on this agent, from the
+/// measured-outcome aggregation. A minimum of three samples guards against
+/// suggesting from noise; below it the alert simply carries no hint. Query
+/// failure degrades the same way: an alert without a hint beats no alert.
+async fn effectiveness_hint(
+    warm: &WarmStore,
+    rule_id: &RuleId,
+    agent_id: &AgentId,
+) -> Option<reeve_model::signal::EffectivenessHint> {
+    match warm.best_intervention_for_rule(rule_id, agent_id, 3).await {
+        Ok(best) => {
+            best.map(
+                |(command, avg_delta, sample_count)| reeve_model::signal::EffectivenessHint {
+                    command,
+                    avg_delta,
+                    sample_count,
+                },
+            )
+        }
+        Err(e) => {
+            tracing::warn!(rule_id = %rule_id, error = %e, "effectiveness lookup failed");
+            None
         }
     }
 }

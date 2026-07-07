@@ -51,6 +51,18 @@ pub enum CostTrend {
     Decelerating,
 }
 
+/// The best-performing intervention for a firing rule, from the SQL
+/// aggregation over measured outcomes. Carried on PolicyAlert so the
+/// renderer can show what has historically worked without querying.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectivenessHint {
+    /// Lowercase command tag, e.g. "redirect".
+    pub command: String,
+    /// Average measured quality delta across the samples. Positive = helped.
+    pub avg_delta: f64,
+    pub sample_count: u32,
+}
+
 /// Produced by the evaluation engine. Consumer: renderer.
 #[derive(Clone, Debug)]
 pub enum EngineEvent {
@@ -90,6 +102,12 @@ pub enum EngineEvent {
         /// When set, the renderer shows a countdown bar and auto-dispatches the command
         /// after this many seconds if the operator does not act first.
         auto_confirm_after_secs: Option<u64>,
+        /// What has historically worked when this rule fired: the command type
+        /// with the best measured average quality delta, from the effectiveness
+        /// aggregation over intervention outcomes. None until enough outcomes
+        /// exist. Owned by the engine like `description`; the renderer only
+        /// formats it.
+        effectiveness: Option<EffectivenessHint>,
     },
     /// An agent completed the gRPC handshake on the control channel.
     /// `capabilities` lists which command types the adapter supports
