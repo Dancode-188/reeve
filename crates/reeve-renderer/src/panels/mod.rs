@@ -1,5 +1,6 @@
 pub mod center;
 pub mod confirm;
+pub mod cost_view;
 pub mod degraded;
 pub mod fatal;
 pub mod focus_list;
@@ -52,6 +53,8 @@ pub fn render(
     // returns when they exit.
     if let Some(ref impact) = state.impact {
         impact_view::render(frame, panels.center, impact, theme);
+    } else if state.view_mode == ViewMode::Cost {
+        cost_view::render(frame, panels.center, &state.cost_summary, theme);
     } else if state.view_mode == ViewMode::History && state.replay.is_none() {
         history::render(frame, panels.center, state, theme);
     } else {

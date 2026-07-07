@@ -38,6 +38,13 @@ pub fn render(
             key_group("[?]", "help", &kb, &action, &bracket),
             key_group("[q]", "quit", &kb, &action, &bracket),
         ]
+    } else if view_mode == ViewMode::Cost {
+        vec![
+            key_group("[1]", "fleet", &kb, &action, &bracket),
+            key_group("[3]", "history", &kb, &action, &bracket),
+            key_group("[?]", "help", &kb, &action, &bracket),
+            key_group("[q]", "quit", &kb, &action, &bracket),
+        ]
     } else if view_mode == ViewMode::History {
         vec![
             key_group("[j/k]", "nav", &kb, &action, &bracket),
@@ -62,6 +69,7 @@ pub fn render(
             key_group("[Enter]", "fold", &kb, &action, &bracket),
             key_group("[2]", "focus", &kb, &action, &bracket),
             key_group("[3]", "history", &kb, &action, &bracket),
+            key_group("[4]", "cost", &kb, &action, &bracket),
             key_group("[?]", "help", &kb, &action, &bracket),
             key_group("[q]", "quit", &kb, &action, &bracket),
         ];
