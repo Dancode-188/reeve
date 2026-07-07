@@ -55,6 +55,9 @@ pub fn map_event(event: Event, text_input: bool) -> Option<Action> {
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Action::Quit),
                 (KeyCode::Esc, _) => Some(Action::Dismiss),
                 (KeyCode::Enter, _) => Some(Action::Select),
+                // Completion cycling in the command palette; the overlay
+                // text inputs ignore it.
+                (KeyCode::Tab, _) => Some(Action::NextPanel),
                 (KeyCode::Backspace, _) => Some(Action::Backspace),
                 (KeyCode::Char(c), KeyModifiers::NONE) => Some(Action::Char(c)),
                 (KeyCode::Char(c), KeyModifiers::SHIFT) => Some(Action::Char(c)),
@@ -166,14 +169,15 @@ mod tests {
     }
 
     #[test]
-    fn tab_is_not_text_in_text_input() {
-        assert!(
+    fn tab_cycles_completion_not_text_in_text_input() {
+        // Tab drives the palette's completion cycling. It must never become
+        // a literal character in any text field.
+        assert!(matches!(
             map_event(
                 Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
                 true
-            )
-            .is_none(),
-            "tab has no meaning inside a text field and must not leak a panel switch"
-        );
+            ),
+            Some(Action::NextPanel)
+        ));
     }
 }

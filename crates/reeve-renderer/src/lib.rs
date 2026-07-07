@@ -112,7 +112,7 @@ async fn run_inner(
     terminal.clear()?;
 
     let ascii = AsciiMode::new(ascii_mode);
-    let theme = Theme::load();
+    let mut theme = Theme::load();
     let mut app = App::new(ingestion_rx, engine_event_rx, warm, dispatcher).await;
 
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -158,6 +158,16 @@ async fn run_inner(
                 // 66ms of wall time per tick, matching the render interval.
                 app.advance_replay(66.0);
 
+                // Apply a theme chosen via the palette or T. pending_theme
+                // stays set so T keeps cycling from the current position.
+                if let Some(name) = app.state.pending_theme.clone() {
+                    if name != theme.name {
+                        if let Some(new_theme) = Theme::load_named(&name) {
+                            theme = new_theme;
+                        }
+                    }
+                }
+
                 // Reconcile the terminal's capture state with the m toggle.
                 if app.state.mouse_enabled != mouse_captured {
                     let result = if app.state.mouse_enabled {
@@ -201,6 +211,24 @@ async fn run_inner(
                     }
 
                     panels::render(frame, &panels, &app.state, &theme, &ascii);
+                    if let Some(ref buffer) = app.state.palette {
+                        let row = ratatui::layout::Rect {
+                            y: full.footer.y.saturating_sub(1),
+                            height: 1,
+                            x: 0,
+                            width: frame.area().width,
+                        };
+                        let matches = app.palette_matches();
+                        panels::palette::render(
+                            frame,
+                            row,
+                            buffer,
+                            &matches,
+                            app.state.palette_match,
+                            app.state.palette_confirm_kill,
+                            &theme,
+                        );
+                    }
                     if let Some(ref replay) = app.state.replay {
                         panels::scrubber::render(frame, full.footer, replay, &theme);
                     } else {

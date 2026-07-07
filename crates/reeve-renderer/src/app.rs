@@ -240,6 +240,15 @@ pub struct AppState {
     pub impact: Option<ImpactState>,
     /// Spending analytics, loaded from the warm store when Cost view opens.
     pub cost_summary: CostSummary,
+    /// Command palette input buffer. Some = the palette row is open above
+    /// the footer and owns the keyboard.
+    pub palette: Option<String>,
+    /// Index into the palette's current completion matches.
+    pub palette_match: usize,
+    /// True while `kill all` waits for its y/n confirmation.
+    pub palette_confirm_kill: bool,
+    /// Theme name the palette or T selected; the render loop applies it.
+    pub pending_theme: Option<String>,
     /// Mouse capture wanted. The render loop reconciles the terminal's
     /// actual capture state with this; m toggles it, and the header shows
     /// a dim indicator while off so text selection visibly works again.
@@ -355,6 +364,10 @@ impl App {
                 replay: None,
                 impact: None,
                 cost_summary: CostSummary::default(),
+                palette: None,
+                palette_match: 0,
+                palette_confirm_kill: false,
+                pending_theme: None,
                 mouse_enabled: true,
                 show_help: false,
                 errors: Vec::new(),
@@ -659,6 +672,11 @@ impl App {
             self.handle_overlay_action(action).await;
             return;
         }
+        // The palette owns the keyboard while open.
+        if self.state.palette.is_some() {
+            self.handle_palette_action(action).await;
+            return;
+        }
         // Replay owns the keyboard while active: h/l become stepping keys,
         // and Esc exits back to History.
         if self.state.replay.is_some() && self.handle_replay_action(&action) {
@@ -796,6 +814,21 @@ impl App {
             }
             Action::Char('m') => {
                 self.state.mouse_enabled = !self.state.mouse_enabled;
+            }
+            Action::Char(':') => {
+                self.state.palette = Some(String::new());
+                self.state.palette_match = 0;
+                self.state.palette_confirm_kill = false;
+            }
+            Action::Char('T') => {
+                let current = self.state.pending_theme.as_deref().unwrap_or("");
+                let idx = crate::theme::BUILTIN_THEMES
+                    .iter()
+                    .position(|t| *t == current)
+                    .unwrap_or(0);
+                let next =
+                    crate::theme::BUILTIN_THEMES[(idx + 1) % crate::theme::BUILTIN_THEMES.len()];
+                self.state.pending_theme = Some(next.to_string());
             }
             Action::Char('4') => match self.warm.cost_summary().await {
                 Ok(summary) => {
@@ -1056,13 +1089,14 @@ impl App {
     /// Whether keystrokes are currently text rather than commands. Drives the
     /// mode-aware key mapping in `input::map_event`.
     pub fn text_input_active(&self) -> bool {
-        matches!(
-            self.state.overlay,
-            Some(InterventionOverlayState {
-                mode: OverlayMode::TextInput { .. },
-                ..
-            })
-        )
+        self.state.palette.is_some()
+            || matches!(
+                self.state.overlay,
+                Some(InterventionOverlayState {
+                    mode: OverlayMode::TextInput { .. },
+                    ..
+                })
+            )
     }
 
     /// Called from the tick loop. Overlays the dispatcher's confirmed pause
@@ -1263,6 +1297,148 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// Static palette commands. Agent- and theme-parameterized entries are
+    /// generated against live names at match time.
+    const PALETTE_COMMANDS: &'static [&'static str] =
+        &["pause all", "resume all", "kill all", "replay last"];
+
+    /// The commands matching the current palette buffer, in display order.
+    pub fn palette_matches(&self) -> Vec<String> {
+        let Some(buffer) = self.state.palette.as_deref() else {
+            return Vec::new();
+        };
+        let mut candidates: Vec<String> = Self::PALETTE_COMMANDS
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        for state in self.state.agents.values() {
+            candidates.push(format!("pause agent {}", state.agent.name));
+            candidates.push(format!("resume agent {}", state.agent.name));
+        }
+        for theme in crate::theme::BUILTIN_THEMES {
+            candidates.push(format!("theme {theme}"));
+        }
+        candidates.retain(|c| c.starts_with(buffer));
+        candidates
+    }
+
+    async fn handle_palette_action(&mut self, action: Action) {
+        if self.state.palette_confirm_kill {
+            if let Action::Char('y') = action {
+                let ids: Vec<AgentId> = self.state.agents.keys().cloned().collect();
+                for id in ids {
+                    self.dispatch_command(id, CommandType::Kill).await;
+                }
+            }
+            self.state.palette_confirm_kill = false;
+            self.state.palette = None;
+            return;
+        }
+        match action {
+            Action::Dismiss => {
+                self.state.palette = None;
+            }
+            Action::Char(c) => {
+                if let Some(ref mut buffer) = self.state.palette {
+                    buffer.push(c);
+                    self.state.palette_match = 0;
+                }
+            }
+            Action::Backspace => {
+                if let Some(ref mut buffer) = self.state.palette {
+                    buffer.pop();
+                    self.state.palette_match = 0;
+                }
+            }
+            // Tab cycles the completion matches.
+            Action::NextPanel => {
+                let count = self.palette_matches().len();
+                if count > 0 {
+                    self.state.palette_match = (self.state.palette_match + 1) % count;
+                }
+            }
+            Action::Select => {
+                let matches = self.palette_matches();
+                let chosen = matches
+                    .get(self.state.palette_match)
+                    .cloned()
+                    .or_else(|| self.state.palette.clone());
+                if let Some(command) = chosen {
+                    self.execute_palette_command(&command).await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn execute_palette_command(&mut self, command: &str) {
+        match command {
+            "kill all" => {
+                // The one palette command that cannot be walked back.
+                self.state.palette_confirm_kill = true;
+                return;
+            }
+            "pause all" => {
+                let ids: Vec<AgentId> = self
+                    .state
+                    .agents
+                    .keys()
+                    .filter(|id| !self.dispatcher.is_paused(id))
+                    .cloned()
+                    .collect();
+                for id in ids {
+                    self.dispatch_command(id, CommandType::Pause).await;
+                }
+            }
+            "resume all" => {
+                let ids: Vec<AgentId> = self
+                    .state
+                    .agents
+                    .keys()
+                    .filter(|id| self.dispatcher.is_paused(id))
+                    .cloned()
+                    .collect();
+                for id in ids {
+                    self.dispatch_command(id, CommandType::Resume).await;
+                }
+            }
+            "replay last" => {
+                if let Ok(entries) = self.warm.list_history(None, 1).await {
+                    if let Some((trace, _)) = entries.first() {
+                        let id = trace.id.clone();
+                        self.state.palette = None;
+                        self.enter_replay(id).await;
+                        return;
+                    }
+                }
+            }
+            other => {
+                if let Some(name) = other.strip_prefix("theme ") {
+                    if crate::theme::BUILTIN_THEMES.contains(&name) {
+                        self.state.pending_theme = Some(name.to_string());
+                    }
+                } else if let Some(name) = other.strip_prefix("pause agent ") {
+                    if let Some(id) = self.agent_id_by_name(name) {
+                        self.dispatch_command(id, CommandType::Pause).await;
+                    }
+                } else if let Some(name) = other.strip_prefix("resume agent ") {
+                    if let Some(id) = self.agent_id_by_name(name) {
+                        self.dispatch_command(id, CommandType::Resume).await;
+                    }
+                }
+            }
+        }
+        self.state.palette = None;
+    }
+
+    fn agent_id_by_name(&self, name: &str) -> Option<AgentId> {
+        self.state
+            .agents
+            .iter()
+            .find(|(_, s)| s.agent.name == name)
+            .map(|(id, _)| id.clone())
     }
 
     /// Applies a resolved mouse target to the state. Selection mirrors what
