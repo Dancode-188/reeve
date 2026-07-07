@@ -414,6 +414,74 @@ impl WarmStore {
         .await
     }
 
+    /// Completed traces newest-first with their total cost, for the History
+    /// view. Cost lives span by span in the `gen_ai.usage.cost` attribute,
+    /// so it is aggregated here with SQLite's JSON functions rather than
+    /// denormalized onto the trace row. Scoped to one agent when given.
+    pub async fn list_history(
+        &self,
+        agent_id: Option<&AgentId>,
+        limit: u32,
+    ) -> Result<Vec<(Trace, f64)>, StorageError> {
+        let agent_id = agent_id.cloned();
+        self.with_conn(move |conn| {
+            let sql = format!(
+                "SELECT t.*, COALESCE(SUM(json_extract(s.attributes,
+                     '$.\"gen_ai.usage.cost\"')), 0.0) AS total_cost
+                 FROM traces t
+                 LEFT JOIN spans s ON s.trace_id = t.id
+                 WHERE t.completed_at IS NOT NULL {}
+                 GROUP BY t.id
+                 ORDER BY t.started_at DESC
+                 LIMIT ?1",
+                if agent_id.is_some() {
+                    "AND t.agent_id = ?2"
+                } else {
+                    ""
+                }
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let map = |row: &Row| {
+                let trace = row_to_trace(row)?;
+                let cost: f64 = row.get("total_cost")?;
+                Ok((trace, cost))
+            };
+            let rows = match &agent_id {
+                Some(a) => stmt.query_map(params![limit, a.as_str()], map)?,
+                None => stmt.query_map(params![limit], map)?,
+            };
+            rows.collect()
+        })
+        .await
+    }
+
+    /// Removes a trace and its spans and span events from the warm tier, in
+    /// one transaction. Evaluation results and intervention records survive:
+    /// they are the audit trail of what Reeve observed and did, and deleting
+    /// a trace's data should not also rewrite history about decisions.
+    pub async fn delete_trace(&self, trace_id: &TraceId) -> Result<(), StorageError> {
+        let trace_id = trace_id.clone();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM span_events WHERE span_id IN
+                     (SELECT id FROM spans WHERE trace_id = ?1)",
+                params![trace_id.as_str()],
+            )?;
+            tx.execute(
+                "DELETE FROM spans WHERE trace_id = ?1",
+                params![trace_id.as_str()],
+            )?;
+            tx.execute(
+                "DELETE FROM traces WHERE id = ?1",
+                params![trace_id.as_str()],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn save_span(&self, span: InternalSpan) -> Result<(), StorageError> {
         let status = enum_to_text(&span.status)?;
         let attributes = serde_json::to_string(&span.attributes)?;
@@ -959,6 +1027,73 @@ mod tests {
         CT::Redirect {
             instruction: "steer".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn list_history_aggregates_cost_and_orders_newest_first() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        for (tid, started, completed) in [("t1", 100, 150), ("t2", 200, 260)] {
+            store
+                .save_trace(Trace {
+                    id: tid.into(),
+                    agent_id: "agent-1".into(),
+                    status: TraceStatus::Completed,
+                    start_time: started,
+                    end_time: Some(completed),
+                    root_span_id: None,
+                    final_health_score: Some(90.0),
+                })
+                .await
+                .unwrap();
+        }
+        let mut costly = span("s1", "t2");
+        costly.attributes = serde_json::json!({"gen_ai.usage.cost": 0.25});
+        store.save_span(costly).await.unwrap();
+        let mut costly2 = span("s2", "t2");
+        costly2.attributes = serde_json::json!({"gen_ai.usage.cost": 0.05});
+        store.save_span(costly2).await.unwrap();
+
+        let history = store.list_history(None, 10).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].0.id.as_str(), "t2", "newest first");
+        assert!((history[0].1 - 0.30).abs() < 1e-9, "span costs summed");
+        assert!((history[1].1 - 0.0).abs() < 1e-9, "no spans, zero cost");
+    }
+
+    #[tokio::test]
+    async fn delete_trace_removes_spans_and_events_atomically() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t1")).await.unwrap();
+        store.save_span(span("s1", "t1")).await.unwrap();
+        store
+            .save_span_events(vec![SpanEvent {
+                id: "ev1".into(),
+                span_id: "s1".into(),
+                event_type: EventType::AssistantMessage,
+                occurred_at: 0,
+                content: None,
+            }])
+            .await
+            .unwrap();
+
+        store.delete_trace(&TraceId::from("t1")).await.unwrap();
+
+        assert!(
+            store
+                .get_trace(&TraceId::from("t1"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .list_spans_for_trace(&TraceId::from("t1"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

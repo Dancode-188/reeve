@@ -219,6 +219,12 @@ pub struct AppState {
     /// warm store when Focus view opens.
     pub focus_traces: Vec<Trace>,
     pub focus_selected: usize,
+    /// Completed traces with their total cost, newest first, loaded from
+    /// the warm store when History view opens.
+    pub history_entries: Vec<(Trace, f64)>,
+    pub history_selected: usize,
+    /// True while the selected history row is asking y/n before deletion.
+    pub history_confirm_delete: bool,
     pub show_help: bool,
     pub errors: Vec<String>,
     /// Unrecoverable startup error. When set, the normal cockpit is replaced
@@ -324,6 +330,9 @@ impl App {
                 view_mode: ViewMode::default(),
                 focus_traces: Vec::new(),
                 focus_selected: 0,
+                history_entries: Vec::new(),
+                history_selected: 0,
+                history_confirm_delete: false,
                 show_help: false,
                 errors: Vec::new(),
                 fatal_error: None,
@@ -626,6 +635,11 @@ impl App {
             self.handle_overlay_action(action).await;
             return;
         }
+        // History view owns navigation and its own delete confirmation; only
+        // quit, help, and the mode keys pass through to the shared handling.
+        if self.state.view_mode == ViewMode::History && self.handle_history_action(&action).await {
+            return;
+        }
 
         match action {
             Action::Quit => self.should_quit = true,
@@ -738,6 +752,9 @@ impl App {
             }
             Action::Char('2') => {
                 self.enter_focus().await;
+            }
+            Action::Char('3') => {
+                self.enter_history().await;
             }
             // Focus view: step backward/forward through the agent's trace
             // history. Newest-first list, so '[' (older) moves down it.
@@ -1079,6 +1096,104 @@ impl App {
             .unwrap_or(0);
         let next = (current as i32 + delta).rem_euclid(tv.span_order.len() as i32) as usize;
         tv.selected = Some(tv.span_order[next].clone());
+    }
+
+    /// Opens History view: completed traces for the selected agent, or all
+    /// agents when none is selected. An empty list is a meaningful view
+    /// here, unlike Focus, so entry always succeeds.
+    async fn enter_history(&mut self) {
+        let agent_id = self.state.selected_agent_id().cloned();
+        match self.warm.list_history(agent_id.as_ref(), 200).await {
+            Ok(entries) => {
+                self.state.history_entries = entries;
+                self.state.history_selected = 0;
+                self.state.history_confirm_delete = false;
+                self.state.view_mode = ViewMode::History;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load trace history");
+            }
+        }
+    }
+
+    /// Handles an action while History view is active. Returns true when the
+    /// action was consumed. Quit, help, and the mode-switch keys fall
+    /// through to the shared handler.
+    async fn handle_history_action(&mut self, action: &Action) -> bool {
+        if self.state.history_confirm_delete {
+            match action {
+                Action::Char('y') => {
+                    if let Some((trace, _)) =
+                        self.state.history_entries.get(self.state.history_selected)
+                    {
+                        let trace_id = trace.id.clone();
+                        if let Err(e) = self.warm.delete_trace(&trace_id).await {
+                            tracing::warn!(error = %e, "failed to delete trace");
+                        } else {
+                            self.state
+                                .history_entries
+                                .remove(self.state.history_selected);
+                            if self.state.history_selected >= self.state.history_entries.len() {
+                                self.state.history_selected =
+                                    self.state.history_entries.len().saturating_sub(1);
+                            }
+                            // The deleted trace may be what the right panel
+                            // is showing; drop it rather than display a
+                            // trace that no longer exists.
+                            if self
+                                .state
+                                .trace
+                                .as_ref()
+                                .is_some_and(|tv| tv.trace_id == trace_id)
+                            {
+                                self.state.trace = None;
+                            }
+                        }
+                    }
+                    self.state.history_confirm_delete = false;
+                }
+                _ => {
+                    // Any other key declines: deletion must be deliberate.
+                    self.state.history_confirm_delete = false;
+                }
+            }
+            return true;
+        }
+        match action {
+            Action::MoveDown | Action::VimDown => {
+                let len = self.state.history_entries.len();
+                if len > 0 && self.state.history_selected < len - 1 {
+                    self.state.history_selected += 1;
+                }
+                true
+            }
+            Action::MoveUp | Action::VimUp => {
+                self.state.history_selected = self.state.history_selected.saturating_sub(1);
+                true
+            }
+            Action::Select => {
+                if let Some((trace, _)) =
+                    self.state.history_entries.get(self.state.history_selected)
+                {
+                    let id = trace.id.clone();
+                    self.load_trace(id).await;
+                }
+                true
+            }
+            // 'd' maps to DismissDegraded globally; in History it means
+            // delete, which is why History intercepts before shared handling.
+            Action::DismissDegraded => {
+                if !self.state.history_entries.is_empty() {
+                    self.state.history_confirm_delete = true;
+                }
+                true
+            }
+            Action::Dismiss if !self.state.show_help => {
+                self.state.view_mode = ViewMode::Fleet;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Opens Focus view on the selected agent: loads its recent trace

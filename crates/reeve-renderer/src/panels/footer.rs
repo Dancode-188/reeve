@@ -1,3 +1,4 @@
+use crate::app::ViewMode;
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -13,7 +14,7 @@ pub fn render(
     theme: &Theme,
     right_hidden: bool,
     left_hidden: bool,
-    focus_mode: bool,
+    view_mode: ViewMode,
 ) {
     if area.height == 0 {
         return;
@@ -29,10 +30,19 @@ pub fn render(
     let bracket = Style::default().fg(theme.subtext());
     let warn = Style::default().fg(theme.health_warn());
 
-    let groups: Vec<Line> = if focus_mode {
+    let groups: Vec<Line> = if view_mode == ViewMode::Focus {
         vec![
             key_group("[\u{5B}/\u{5D}]", "traces", &kb, &action, &bracket),
             key_group("[j/k]", "nav", &kb, &action, &bracket),
+            key_group("[1]", "fleet", &kb, &action, &bracket),
+            key_group("[?]", "help", &kb, &action, &bracket),
+            key_group("[q]", "quit", &kb, &action, &bracket),
+        ]
+    } else if view_mode == ViewMode::History {
+        vec![
+            key_group("[j/k]", "nav", &kb, &action, &bracket),
+            key_group("[Enter]", "detail", &kb, &action, &bracket),
+            key_group("[d]", "delete", &kb, &action, &bracket),
             key_group("[1]", "fleet", &kb, &action, &bracket),
             key_group("[?]", "help", &kb, &action, &bracket),
             key_group("[q]", "quit", &kb, &action, &bracket),
@@ -49,6 +59,7 @@ pub fn render(
             key_group("[h/l]", "panels", &kb, &action, &bracket),
             key_group("[Enter]", "fold", &kb, &action, &bracket),
             key_group("[2]", "focus", &kb, &action, &bracket),
+            key_group("[3]", "history", &kb, &action, &bracket),
             key_group("[?]", "help", &kb, &action, &bracket),
             key_group("[q]", "quit", &kb, &action, &bracket),
         ];
