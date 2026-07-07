@@ -2,6 +2,7 @@ pub mod app;
 pub mod ascii;
 pub mod context_windows;
 pub mod errors;
+pub mod impact;
 pub mod input;
 pub mod layout;
 pub mod panels;

@@ -1,3 +1,4 @@
+use crate::impact::ImpactState;
 use crate::input::Action;
 use crate::replay::{ReplayEvent, ReplayState};
 use indexmap::IndexMap;
@@ -233,6 +234,9 @@ pub struct AppState {
     /// DVR state while replaying a trace. Some = replay owns the keyboard
     /// and the footer becomes a scrubber.
     pub replay: Option<ReplayState>,
+    /// Intervention impact charts. Some = the center panel shows the
+    /// before/projected/after comparison for one command.
+    pub impact: Option<ImpactState>,
     pub show_help: bool,
     pub errors: Vec<String>,
     /// Unrecoverable startup error. When set, the normal cockpit is replaced
@@ -342,6 +346,7 @@ impl App {
                 history_selected: 0,
                 history_confirm_delete: false,
                 replay: None,
+                impact: None,
                 show_help: false,
                 errors: Vec::new(),
                 fatal_error: None,
@@ -648,6 +653,15 @@ impl App {
         // Replay owns the keyboard while active: h/l become stepping keys,
         // and Esc exits back to History.
         if self.state.replay.is_some() && self.handle_replay_action(&action) {
+            return;
+        }
+        // The impact view only reads; Esc closes it, quit still works.
+        if self.state.impact.is_some() {
+            match action {
+                Action::Dismiss => self.state.impact = None,
+                Action::Quit => self.should_quit = true,
+                _ => {}
+            }
             return;
         }
         // History view owns navigation and its own delete confirmation; only
@@ -1212,12 +1226,63 @@ impl App {
                 }
                 true
             }
+            Action::Char('W') => {
+                if let Some((trace, _)) =
+                    self.state.history_entries.get(self.state.history_selected)
+                {
+                    let id = trace.id.clone();
+                    let agent = trace.agent_id.clone();
+                    self.enter_impact(id, agent).await;
+                }
+                true
+            }
             Action::Dismiss if !self.state.show_help => {
                 self.state.view_mode = ViewMode::Fleet;
                 true
             }
             _ => false,
         }
+    }
+
+    /// Opens the impact view for the selected trace's intervention. A trace
+    /// without an applied command, or without traces on both sides of it in
+    /// the agent's history, silently stays in History: there is nothing to
+    /// compare yet.
+    async fn enter_impact(&mut self, trace_id: TraceId, agent_id: AgentId) {
+        let commands = self
+            .warm
+            .list_commands_for_trace(&trace_id)
+            .await
+            .unwrap_or_default();
+        let Some(command) = commands
+            .iter()
+            .find(|c| c.status == CommandStatus::Applied)
+            .or(commands.first())
+        else {
+            return;
+        };
+        let tag = match &command.command_type {
+            CommandType::Pause => "pause",
+            CommandType::Resume => "resume",
+            CommandType::Kill => "kill",
+            CommandType::Redirect { .. } => "redirect",
+            CommandType::InjectContext { .. } => "inject_context",
+        };
+
+        // The agent's history chronologically, so pre and post read
+        // left to right.
+        let mut history = match self.warm.list_history(Some(&agent_id), 200).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load history for impact view");
+                return;
+            }
+        };
+        history.reverse();
+        let Some(idx) = history.iter().position(|(t, _)| t.id == trace_id) else {
+            return;
+        };
+        self.state.impact = ImpactState::build(&history, idx, tag.to_string());
     }
 
     /// Loads a trace's full recorded timeline and starts replaying it.

@@ -7,6 +7,7 @@ pub mod footer;
 pub mod header;
 pub mod help;
 pub mod history;
+pub mod impact_view;
 pub mod left;
 pub mod overlay;
 pub mod right;
@@ -46,9 +47,12 @@ pub fn render(
         }
     }
 
-    // Replay shows the reconstructed tree even though it is entered from
-    // History; the history list returns when replay exits.
-    if state.view_mode == ViewMode::History && state.replay.is_none() {
+    // Replay shows the reconstructed tree and the impact view shows its
+    // charts, even though both are entered from History; the history list
+    // returns when they exit.
+    if let Some(ref impact) = state.impact {
+        impact_view::render(frame, panels.center, impact, theme);
+    } else if state.view_mode == ViewMode::History && state.replay.is_none() {
         history::render(frame, panels.center, state, theme);
     } else {
         center::render(frame, panels.center, state, theme, ascii, right_hidden);

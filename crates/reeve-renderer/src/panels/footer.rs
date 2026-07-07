@@ -42,6 +42,8 @@ pub fn render(
         vec![
             key_group("[j/k]", "nav", &kb, &action, &bracket),
             key_group("[Enter]", "detail", &kb, &action, &bracket),
+            key_group("[R]", "replay", &kb, &action, &bracket),
+            key_group("[W]", "impact", &kb, &action, &bracket),
             key_group("[d]", "delete", &kb, &action, &bracket),
             key_group("[1]", "fleet", &kb, &action, &bracket),
             key_group("[?]", "help", &kb, &action, &bracket),
