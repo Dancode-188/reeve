@@ -46,17 +46,17 @@ pub async fn run(
             ("disabled".to_string(), Some(reason.clone()))
         }
     };
+    let config_path = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".config/reeve/config.toml"))
+        .unwrap_or_else(|_| PathBuf::from(".config/reeve/config.toml"));
+
     tracing::info!(backend = %backend_name, "evaluation backend ready");
     let _ = engine_tx.send(EngineEvent::EvaluationBackendReady {
         backend: backend_name,
         reason: backend_reason,
-        privacy_tier: 1,
+        privacy_tier: policy::config::load_privacy_tier(&config_path),
     });
     let judge = Arc::new(LlmJudge::new(backend));
-
-    let config_path = std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".config/reeve/config.toml"))
-        .unwrap_or_else(|_| PathBuf::from(".config/reeve/config.toml"));
 
     let mut fingerprints: HashMap<AgentId, AgentFingerprint> = HashMap::new();
     let mut score_histories: HashMap<AgentId, VecDeque<f64>> = HashMap::new();

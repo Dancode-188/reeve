@@ -8,6 +8,7 @@ use std::path::Path;
 struct ConfigFile {
     #[serde(default)]
     rules: Vec<RuleEntry>,
+    privacy_tier: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +106,24 @@ pub fn load(path: &Path) -> Vec<PolicyRule> {
         .collect()
 }
 
+/// The configured privacy tier, default 1 (metadata only, no content).
+/// Tier 2 enables SpanEvent content capture. Values above 2 are accepted
+/// and behave as 2 until redaction layers claim them. A missing or
+/// unparseable file falls back to 1: privacy fails closed.
+pub fn load_privacy_tier(path: &Path) -> u8 {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return 1,
+    };
+    match toml::from_str::<ConfigFile>(&text) {
+        Ok(c) => c.privacy_tier.unwrap_or(1).max(1),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "could not parse config; privacy tier defaults to 1");
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +176,45 @@ command_type = "redirect"
         );
         let rules = load(f.path());
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn privacy_tier_defaults_to_one() {
+        assert_eq!(
+            load_privacy_tier(std::path::Path::new("/nonexistent/config.toml")),
+            1
+        );
+        let empty = write_temp("");
+        assert_eq!(load_privacy_tier(empty.path()), 1);
+    }
+
+    #[test]
+    fn privacy_tier_reads_configured_value() {
+        let f = write_temp("privacy_tier = 2\n");
+        assert_eq!(load_privacy_tier(f.path()), 2);
+    }
+
+    #[test]
+    fn privacy_tier_zero_clamps_to_one() {
+        let f = write_temp("privacy_tier = 0\n");
+        assert_eq!(load_privacy_tier(f.path()), 1);
+    }
+
+    #[test]
+    fn privacy_tier_coexists_with_rules() {
+        let f = write_temp(
+            r#"
+privacy_tier = 2
+
+[[rules]]
+id = "r1"
+name = "R"
+trigger_condition = "health_score < 50"
+command_type = "pause"
+"#,
+        );
+        assert_eq!(load_privacy_tier(f.path()), 2);
+        assert_eq!(load(f.path()).len(), 1);
     }
 
     #[test]
