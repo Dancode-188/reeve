@@ -73,6 +73,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reeve_model::entity::intervention::InterventionCommand,
     )>(64);
 
+    // Privacy tier gates SpanEvent content capture. Tier 1 (the default)
+    // stores metadata only; tier 2+ stores content. Enabling capture is a
+    // deliberate act (editing the config), and the consent log makes that
+    // act auditable after the fact.
+    let config_path = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".config/reeve/config.toml"))
+        .unwrap_or_else(|_| PathBuf::from(".config/reeve/config.toml"));
+    let privacy_tier = reeve_engine::policy::config::load_privacy_tier(&config_path);
+    if privacy_tier >= 2 {
+        let consent_path = db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("consent.log");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let line = format!(
+            "{now_ms} CONTENT_CAPTURE_ENABLED tier={privacy_tier} source={}\n",
+            config_path.display()
+        );
+        if let Err(e) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&consent_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()))
+        {
+            tracing::warn!(error = %e, "failed to write consent log");
+        }
+    }
+
     let engine_ingestion_rx = ingestion_tx.subscribe();
     tokio::spawn(reeve_ingestion::serve(
         addr,
@@ -80,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ingestion_tx,
         ntp_offsets.clone(),
         paused_agents.clone(),
+        privacy_tier >= 2,
     ));
     tokio::spawn(reeve_engine::run(
         engine_ingestion_rx,
