@@ -207,6 +207,18 @@ impl ReplayState {
         ((self.clock_ms - start) as f64 / (end - start) as f64).clamp(0.0, 1.0)
     }
 
+    /// Seeks to a fraction of the timeline, emitting everything up to that
+    /// moment. Scrubber clicks land here.
+    pub fn seek(&mut self, fraction: f64) {
+        let (start, end) = (self.start_ms(), self.end_ms());
+        self.clock_ms = start + ((end - start) as f64 * fraction.clamp(0.0, 1.0)) as i64;
+        self.position = self
+            .events
+            .iter()
+            .take_while(|e| e.at() <= self.clock_ms)
+            .count();
+    }
+
     /// After a manual position change, the clock lands on the timestamp of
     /// the last emitted event so resuming play continues from there.
     fn sync_clock(&mut self) {
@@ -347,6 +359,18 @@ mod tests {
         r.toggle_play();
         assert_eq!(r.position, 0);
         assert!(r.playing);
+    }
+
+    #[test]
+    fn seek_emits_everything_up_to_the_fraction() {
+        let mut r = replay();
+        // Timeline 100..300; fraction 0.5 is clock 200: three events emit.
+        r.seek(0.5);
+        assert_eq!(r.position, 3);
+        r.seek(0.0);
+        assert_eq!(r.position, 1, "the event at the start timestamp emits");
+        r.seek(1.0);
+        assert_eq!(r.position, 5);
     }
 
     #[test]

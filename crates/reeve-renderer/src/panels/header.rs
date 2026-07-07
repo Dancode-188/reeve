@@ -35,6 +35,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     // Right side: selected agent info or agent count
     let right_line = build_right_line(state, theme);
+    let mut right_line = right_line;
+    if !state.mouse_enabled {
+        right_line.spans.insert(
+            0,
+            Span::styled("[mouse off]  ", Style::default().fg(theme.subtext())),
+        );
+    }
     let right = Paragraph::new(right_line)
         .alignment(Alignment::Right)
         .style(chrome_style);

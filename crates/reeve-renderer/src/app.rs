@@ -1,5 +1,6 @@
 use crate::impact::ImpactState;
 use crate::input::Action;
+use crate::mouse::MouseTarget;
 use crate::replay::{ReplayEvent, ReplayState};
 use indexmap::IndexMap;
 use reeve_intervention::dispatcher::Dispatcher;
@@ -239,6 +240,10 @@ pub struct AppState {
     pub impact: Option<ImpactState>,
     /// Spending analytics, loaded from the warm store when Cost view opens.
     pub cost_summary: CostSummary,
+    /// Mouse capture wanted. The render loop reconciles the terminal's
+    /// actual capture state with this; m toggles it, and the header shows
+    /// a dim indicator while off so text selection visibly works again.
+    pub mouse_enabled: bool,
     pub show_help: bool,
     pub errors: Vec<String>,
     /// Unrecoverable startup error. When set, the normal cockpit is replaced
@@ -350,6 +355,7 @@ impl App {
                 replay: None,
                 impact: None,
                 cost_summary: CostSummary::default(),
+                mouse_enabled: true,
                 show_help: false,
                 errors: Vec::new(),
                 fatal_error: None,
@@ -787,6 +793,9 @@ impl App {
             }
             Action::Char('3') => {
                 self.enter_history().await;
+            }
+            Action::Char('m') => {
+                self.state.mouse_enabled = !self.state.mouse_enabled;
             }
             Action::Char('4') => match self.warm.cost_summary().await {
                 Ok(summary) => {
@@ -1253,6 +1262,69 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Applies a resolved mouse target to the state. Selection mirrors what
+    /// the equivalent keys do; a click on the already-selected span folds
+    /// it, standing in for double-click without timing state.
+    pub async fn apply_mouse_target(&mut self, target: MouseTarget) {
+        match target {
+            MouseTarget::SelectAgent(idx) => {
+                if idx < self.state.agents.len() {
+                    self.state.selected_agent = Some(idx);
+                    self.load_trace_for_selected().await;
+                }
+            }
+            MouseTarget::SelectSpan(span_id) => {
+                if let Some(ref mut tv) = self.state.trace {
+                    tv.selected = Some(span_id);
+                }
+            }
+            MouseTarget::ToggleSpan(span_id) => {
+                if let Some(ref mut tv) = self.state.trace {
+                    if tv.collapsed.contains(&span_id) {
+                        tv.collapsed.remove(&span_id);
+                    } else {
+                        tv.collapsed.insert(span_id);
+                    }
+                    tv.span_order = tv
+                        .root
+                        .as_ref()
+                        .map(|r| flatten_tree(r, &tv.children, &tv.collapsed))
+                        .unwrap_or_default();
+                }
+            }
+            MouseTarget::SelectHistoryRow(idx) => {
+                if idx < self.state.history_entries.len() {
+                    self.state.history_selected = idx;
+                }
+            }
+            MouseTarget::ScrollPanel { center, up, .. } => {
+                if center {
+                    if let Some(ref mut tv) = self.state.trace {
+                        tv.scroll = if up {
+                            tv.scroll.saturating_sub(1)
+                        } else {
+                            tv.scroll + 1
+                        };
+                    }
+                } else {
+                    self.state.streaming.auto_scroll = false;
+                    self.state.streaming.scroll = if up {
+                        self.state.streaming.scroll.saturating_sub(1)
+                    } else {
+                        self.state.streaming.scroll + 1
+                    };
+                }
+            }
+            MouseTarget::Seek(fraction) => {
+                if let Some(ref mut replay) = self.state.replay {
+                    replay.seek(fraction);
+                    self.rebuild_replay_view();
+                }
+            }
+            MouseTarget::None => {}
         }
     }
 
