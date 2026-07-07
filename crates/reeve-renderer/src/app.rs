@@ -21,6 +21,9 @@ pub struct MetricScore {
 pub struct PolicyAlertEntry {
     pub description: String,
     pub command_type: String,
+    /// Preformatted effectiveness note, e.g. "redirect: +0.42 avg · 5 tries".
+    /// None until enough measured outcomes exist for the firing rule.
+    pub effectiveness: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -457,6 +460,7 @@ impl App {
                 command_type,
                 requires_confirmation,
                 auto_confirm_after_secs,
+                effectiveness,
             } => {
                 if self.state.policy_alerts.len() >= 5 {
                     self.state.policy_alerts.pop_front();
@@ -464,6 +468,12 @@ impl App {
                 self.state.policy_alerts.push_back(PolicyAlertEntry {
                     description: description.clone(),
                     command_type: command_type.clone(),
+                    effectiveness: effectiveness.map(|h| {
+                        format!(
+                            "{}: {:+.2} avg \u{00B7} {} tries",
+                            h.command, h.avg_delta, h.sample_count
+                        )
+                    }),
                 });
                 self.state
                     .flash_targets

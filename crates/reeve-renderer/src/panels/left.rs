@@ -33,7 +33,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     let has_alerts = !state.policy_alerts.is_empty();
     let alert_height = if has_alerts {
-        1 + state.policy_alerts.len().min(4) as u16 // label+rows (capped at 4)
+        // Label + one row per alert plus one per effectiveness note, capped.
+        let rows: usize = state
+            .policy_alerts
+            .iter()
+            .map(|a| 1 + usize::from(a.effectiveness.is_some()))
+            .sum();
+        1 + rows.min(6) as u16
     } else {
         0
     };
@@ -410,12 +416,29 @@ fn render_alerts(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     let max_label = (area.width as usize).saturating_sub(3);
     let max_rows = area.height.saturating_sub(1) as usize;
 
-    for alert in state.policy_alerts.iter().rev().take(max_rows) {
+    let mut rows_left = max_rows;
+    for alert in state.policy_alerts.iter().rev() {
+        if rows_left == 0 {
+            break;
+        }
         let label = truncate(&alert.description, max_label);
         lines.push(Line::from(vec![
             Span::styled("\u{26A0} ", Style::default().fg(theme.health_warn())),
             Span::styled(label, Style::default().fg(theme.text())),
         ]));
+        rows_left -= 1;
+        // What has historically worked for this failure, from measured
+        // outcomes. Indented under its alert, dim: context, not a new alarm.
+        if let Some(ref note) = alert.effectiveness {
+            if rows_left == 0 {
+                break;
+            }
+            lines.push(Line::from(Span::styled(
+                format!("  {}", truncate(note, max_label)),
+                Style::default().fg(theme.subtext()),
+            )));
+            rows_left -= 1;
+        }
     }
 
     frame.render_widget(

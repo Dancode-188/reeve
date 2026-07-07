@@ -1,14 +1,14 @@
 use reeve_model::entity::policy::{PolicyRule, RuleScope};
 use reeve_model::entity::{
-    Agent, AgentStatus, CommandStatus, EvaluationResult, EvaluatorType, EventType, IntegrationPath,
-    InternalSpan, InterventionCommand, InterventionOutcome, SpanEvent, SpanStatus, TargetType,
-    Trace, TraceStatus,
+    Agent, AgentStatus, CommandStatus, CommandType, EvaluationResult, EvaluatorType, EventType,
+    IntegrationPath, InternalSpan, InterventionCommand, InterventionOutcome, SpanEvent, SpanStatus,
+    TargetType, Trace, TraceStatus,
 };
 use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, SpanId, TraceId};
 use rusqlite::{Connection, Row, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -171,6 +171,44 @@ fn row_to_intervention_command(row: &Row) -> rusqlite::Result<InterventionComman
         issued_by: row.get("issued_by")?,
         valid_until_ms: row.get("valid_until_ms")?,
     })
+}
+
+fn effectiveness_rows(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> rusqlite::Result<Vec<(String, f64)>> {
+    conn.prepare(sql)?
+        .query_map(params, |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?
+        .collect()
+}
+
+/// Groups (serialized command_type, delta) rows by command tag and returns
+/// the tag with the best average delta among tags with enough samples.
+fn best_by_tag(rows: &[(String, f64)], min_samples: u32) -> Option<(String, f64, u32)> {
+    let mut by_tag: HashMap<&'static str, (f64, u32)> = HashMap::new();
+    for (raw, delta) in rows {
+        let Ok(command_type) = serde_json::from_str::<CommandType>(raw) else {
+            continue;
+        };
+        let tag = match command_type {
+            CommandType::Pause => "pause",
+            CommandType::Resume => "resume",
+            CommandType::Kill => "kill",
+            CommandType::Redirect { .. } => "redirect",
+            CommandType::InjectContext { .. } => "inject_context",
+        };
+        let entry = by_tag.entry(tag).or_insert((0.0, 0));
+        entry.0 += delta;
+        entry.1 += 1;
+    }
+    by_tag
+        .into_iter()
+        .filter(|(_, (_, n))| *n >= min_samples)
+        .map(|(tag, (sum, n))| (tag.to_string(), sum / n as f64, n))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
 }
 
 fn row_to_intervention_outcome(row: &Row) -> rusqlite::Result<InterventionOutcome> {
@@ -629,6 +667,57 @@ impl WarmStore {
         .await
     }
 
+    /// The best-performing intervention for a rule, from measured outcomes.
+    ///
+    /// Aggregates deltas of outcomes whose command was issued by `rule_id`,
+    /// grouped by command type, requiring at least `min_samples` before an
+    /// answer is offered. Scoped to `agent_id` first; when that agent has
+    /// too few samples, falls back to all agents sharing its framework, so
+    /// a fresh agent benefits from its siblings' history. Returns the
+    /// command tag, average delta, and sample count of the best performer.
+    ///
+    /// The command_type column stores the serialized CommandType, which
+    /// carries redirect instructions inline, so grouping happens in Rust on
+    /// the extracted tag rather than in SQL on the raw column.
+    pub async fn best_intervention_for_rule(
+        &self,
+        rule_id: &RuleId,
+        agent_id: &AgentId,
+        min_samples: u32,
+    ) -> Result<Option<(String, f64, u32)>, StorageError> {
+        let rule_id = rule_id.clone();
+        let agent_id = agent_id.clone();
+        self.with_conn(move |conn| {
+            let agent_scoped = effectiveness_rows(
+                conn,
+                "SELECT ic.command_type, io.delta
+                 FROM intervention_outcomes io
+                 JOIN intervention_commands ic ON io.command_id = ic.id
+                 JOIN traces t ON ic.trace_id = t.id
+                 WHERE ic.policy_id = ?1 AND t.agent_id = ?2
+                   AND io.delta IS NOT NULL",
+                params![rule_id.as_str(), agent_id.as_str()],
+            )?;
+            if let Some(best) = best_by_tag(&agent_scoped, min_samples) {
+                return Ok(Some(best));
+            }
+            let framework_scoped = effectiveness_rows(
+                conn,
+                "SELECT ic.command_type, io.delta
+                 FROM intervention_outcomes io
+                 JOIN intervention_commands ic ON io.command_id = ic.id
+                 JOIN traces t ON ic.trace_id = t.id
+                 JOIN agents a ON t.agent_id = a.id
+                 WHERE ic.policy_id = ?1 AND io.delta IS NOT NULL
+                   AND a.framework =
+                       (SELECT framework FROM agents WHERE id = ?2)",
+                params![rule_id.as_str(), agent_id.as_str()],
+            )?;
+            Ok(best_by_tag(&framework_scoped, min_samples))
+        })
+        .await
+    }
+
     pub async fn list_spans_for_trace(
         &self,
         trace_id: &TraceId,
@@ -801,6 +890,118 @@ mod tests {
             issued_by: "human".to_string(),
             valid_until_ms: i64::MAX,
         }
+    }
+
+    /// Seeds one measured outcome: an agent-owned trace, a command issued by
+    /// `rule` (None = human), and an outcome with the given delta.
+    async fn seed_outcome(
+        store: &WarmStore,
+        agent: &str,
+        n: u32,
+        rule: Option<&str>,
+        command_type: CT,
+        delta: f64,
+    ) {
+        let trace_id = format!("t-{agent}-{n}");
+        let cmd_id = format!("c-{agent}-{n}");
+        store
+            .save_trace(Trace {
+                id: trace_id.as_str().into(),
+                agent_id: agent.into(),
+                status: TraceStatus::Completed,
+                start_time: 0,
+                end_time: Some(1),
+                root_span_id: None,
+                final_health_score: None,
+            })
+            .await
+            .unwrap();
+        let mut cmd = make_command(&cmd_id, &trace_id);
+        cmd.policy_id = rule.map(Into::into);
+        cmd.command_type = command_type;
+        store.save_intervention_command(cmd).await.unwrap();
+        store
+            .save_intervention_outcome(InterventionOutcome {
+                id: format!("o-{agent}-{n}"),
+                command_id: cmd_id.as_str().into(),
+                trace_id: trace_id.as_str().into(),
+                pre_intervention_score: Some(40.0),
+                post_intervention_score: Some(40.0 + delta),
+                delta: Some(delta),
+                spans_measured: Some(3),
+                measured_at: 0,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn redirect() -> CT {
+        CT::Redirect {
+            instruction: "steer".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn best_intervention_prefers_highest_average_delta() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        for (n, delta) in [(1, 0.3), (2, 0.4), (3, 0.5)] {
+            seed_outcome(&store, "agent-1", n, Some("rule-a"), redirect(), delta).await;
+        }
+        for (n, delta) in [(4, 0.1), (5, 0.1), (6, 0.1)] {
+            seed_outcome(&store, "agent-1", n, Some("rule-a"), CT::Pause, delta).await;
+        }
+
+        let best = store
+            .best_intervention_for_rule(&RuleId::from("rule-a"), &AgentId::from("agent-1"), 3)
+            .await
+            .unwrap()
+            .expect("enough samples for an answer");
+        assert_eq!(best.0, "redirect");
+        assert!((best.1 - 0.4).abs() < 1e-9, "mean of 0.3/0.4/0.5");
+        assert_eq!(best.2, 3);
+    }
+
+    #[tokio::test]
+    async fn best_intervention_falls_back_to_framework() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        insert_test_agent(&store, "agent-2").await;
+        // agent-1 has one sample, below the minimum; agent-2 shares the
+        // framework and has three.
+        seed_outcome(&store, "agent-1", 1, Some("rule-a"), redirect(), 0.9).await;
+        for n in 2..5 {
+            seed_outcome(&store, "agent-2", n, Some("rule-a"), redirect(), 0.2).await;
+        }
+
+        let best = store
+            .best_intervention_for_rule(&RuleId::from("rule-a"), &AgentId::from("agent-1"), 3)
+            .await
+            .unwrap()
+            .expect("framework siblings supply the samples");
+        assert_eq!(best.0, "redirect");
+        assert_eq!(best.2, 4, "fallback aggregates the whole framework");
+    }
+
+    #[tokio::test]
+    async fn best_intervention_ignores_other_rules_and_human_commands() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        for n in 1..4 {
+            seed_outcome(&store, "agent-1", n, Some("rule-b"), redirect(), 0.9).await;
+        }
+        for n in 4..7 {
+            seed_outcome(&store, "agent-1", n, None, redirect(), 0.9).await;
+        }
+
+        let best = store
+            .best_intervention_for_rule(&RuleId::from("rule-a"), &AgentId::from("agent-1"), 3)
+            .await
+            .unwrap();
+        assert!(
+            best.is_none(),
+            "other rules' and human-issued outcomes must not answer for rule-a"
+        );
     }
 
     #[tokio::test]
