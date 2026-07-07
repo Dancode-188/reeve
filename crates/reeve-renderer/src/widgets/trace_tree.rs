@@ -18,6 +18,8 @@ pub struct TraceTree<'a> {
     pub collapsed: &'a HashSet<SpanId>,
     pub span_health_scores: &'a HashMap<SpanId, f64>,
     pub outcome_lines: &'a [OutcomeLine],
+    /// Spans carrying a developer note; they get the annotation indicator.
+    pub annotated: &'a HashMap<SpanId, String>,
     pub root: Option<&'a SpanId>,
     /// Spans not reachable from the root: arrived before their parent. They
     /// render as flat rows labeled as awaiting it, per the live-view rule
@@ -143,6 +145,18 @@ impl<'a> TraceTree<'a> {
             spans.push(Span::styled("]", Style::default().fg(self.theme.subtext())));
         }
 
+        if self.annotated.contains_key(id) {
+            let diamond = if self.ascii.enabled() {
+                " [n]"
+            } else {
+                " \u{2666}"
+            };
+            spans.push(Span::styled(
+                diamond.to_string(),
+                Style::default().fg(self.theme.get("blue")),
+            ));
+        }
+
         lines.push(Line::from(spans));
 
         // Outcome lines for this span (or root-level outcomes when span_id is None and is_root).
@@ -221,7 +235,9 @@ mod tests {
             .draw(|frame| {
                 let theme = make_theme();
                 let ascii = make_ascii();
+                let annotated: HashMap<SpanId, String> = HashMap::new();
                 let widget = TraceTree {
+                    annotated: &annotated,
                     children: &children,
                     names: &names,
                     collapsed: &collapsed,
@@ -278,7 +294,9 @@ mod tests {
             .draw(|frame| {
                 let theme = make_theme();
                 let ascii = make_ascii();
+                let annotated: HashMap<SpanId, String> = HashMap::new();
                 let widget = TraceTree {
+                    annotated: &annotated,
                     children: &children,
                     names: &names,
                     collapsed: &collapsed,
@@ -332,7 +350,9 @@ mod tests {
             .draw(|frame| {
                 let theme = make_theme();
                 let ascii = make_ascii();
+                let annotated: HashMap<SpanId, String> = HashMap::new();
                 let widget = TraceTree {
+                    annotated: &annotated,
                     children: &children,
                     names: &names,
                     collapsed: &collapsed,

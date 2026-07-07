@@ -10,6 +10,7 @@ pub mod help;
 pub mod history;
 pub mod impact_view;
 pub mod left;
+pub mod note_input;
 pub mod overlay;
 pub mod palette;
 pub mod right;

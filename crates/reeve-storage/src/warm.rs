@@ -1,8 +1,8 @@
 use reeve_model::entity::policy::{PolicyRule, RuleScope};
 use reeve_model::entity::{
     Agent, AgentStatus, CommandStatus, CommandType, EvaluationResult, EvaluatorType, EventType,
-    IntegrationPath, InternalSpan, InterventionCommand, InterventionOutcome, SpanEvent, SpanStatus,
-    TargetType, Trace, TraceStatus,
+    IntegrationPath, InternalSpan, InterventionCommand, InterventionOutcome, SpanEvent, SpanNote,
+    SpanStatus, TargetType, Trace, TraceStatus,
 };
 use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, SpanId, TraceId};
 use rusqlite::{Connection, Row, params};
@@ -700,6 +700,61 @@ impl WarmStore {
         .await
     }
 
+    /// Saves a developer annotation. One note per span: annotating again
+    /// replaces the note, keeping the interaction one keystroke instead of
+    /// a note-management UI.
+    pub async fn save_span_note(&self, note: SpanNote) -> Result<(), StorageError> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "DELETE FROM span_notes WHERE span_id = ?1",
+                params![note.span_id.as_str()],
+            )?;
+            conn.execute(
+                "INSERT INTO span_notes (id, span_id, content, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    note.id,
+                    note.span_id.as_str(),
+                    note.content,
+                    note.created_at
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// A trace's annotations keyed by span, loaded with the trace so notes
+    /// survive into history and replay views.
+    pub async fn span_notes_for_trace(
+        &self,
+        trace_id: &TraceId,
+    ) -> Result<HashMap<String, SpanNote>, StorageError> {
+        let trace_id = trace_id.clone();
+        self.with_conn(move |conn| {
+            conn.prepare(
+                "SELECT n.id, n.span_id, n.content, n.created_at
+                 FROM span_notes n
+                 JOIN spans s ON n.span_id = s.id
+                 WHERE s.trace_id = ?1",
+            )?
+            .query_map(params![trace_id.as_str()], |row| {
+                let span_id: String = row.get(1)?;
+                Ok((
+                    span_id.clone(),
+                    SpanNote {
+                        id: row.get(0)?,
+                        span_id: span_id.into(),
+                        content: row.get(2)?,
+                        created_at: row.get(3)?,
+                    },
+                ))
+            })?
+            .collect()
+        })
+        .await
+    }
+
     /// Content of a trace's span events keyed by span, for replay's
     /// streaming box. Only events that carried content (privacy tier 2
     /// recordings) come back; a tier 1 trace returns an empty map.
@@ -1151,6 +1206,40 @@ mod tests {
         CT::Redirect {
             instruction: "steer".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn span_note_saves_and_replaces() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t1")).await.unwrap();
+        store.save_span(span("s1", "t1")).await.unwrap();
+
+        store
+            .save_span_note(SpanNote {
+                id: "n1".to_string(),
+                span_id: "s1".into(),
+                content: "first thought".to_string(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        store
+            .save_span_note(SpanNote {
+                id: "n2".to_string(),
+                span_id: "s1".into(),
+                content: "better thought".to_string(),
+                created_at: 2,
+            })
+            .await
+            .unwrap();
+
+        let notes = store
+            .span_notes_for_trace(&TraceId::from("t1"))
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 1, "one note per span; the second replaces");
+        assert_eq!(notes.get("s1").unwrap().content, "better thought");
     }
 
     #[tokio::test]

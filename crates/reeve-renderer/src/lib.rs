@@ -211,6 +211,15 @@ async fn run_inner(
                     }
 
                     panels::render(frame, &panels, &app.state, &theme, &ascii);
+                    if let Some((_, ref buffer)) = app.state.note_input {
+                        let row = ratatui::layout::Rect {
+                            y: full.footer.y.saturating_sub(1),
+                            height: 1,
+                            x: 0,
+                            width: frame.area().width,
+                        };
+                        panels::note_input::render(frame, row, buffer, &theme);
+                    }
                     if let Some(ref buffer) = app.state.palette {
                         let row = ratatui::layout::Rect {
                             y: full.footer.y.saturating_sub(1),

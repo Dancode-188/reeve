@@ -181,6 +181,7 @@ mod tests {
                 text: "redirect +0.4".to_string(),
             }],
             orphans: Vec::new(),
+            notes: HashMap::new(),
         }
     }
 
