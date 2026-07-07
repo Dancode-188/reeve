@@ -20,6 +20,11 @@ pub struct TraceTree<'a> {
     pub outcome_lines: &'a [OutcomeLine],
     /// Spans carrying a developer note; they get the annotation indicator.
     pub annotated: &'a HashMap<SpanId, String>,
+    /// Active filter text. Non-matching rows dim rather than disappear so
+    /// tree connectors stay truthful.
+    pub filter: Option<&'a str>,
+    /// Span attribute lookup for filter matching.
+    pub spans: &'a HashMap<SpanId, reeve_model::entity::span::InternalSpan>,
     pub root: Option<&'a SpanId>,
     /// Spans not reachable from the root: arrived before their parent. They
     /// render as flat rows labeled as awaiting it, per the live-view rule
@@ -98,6 +103,9 @@ impl<'a> TraceTree<'a> {
         };
 
         let is_selected = self.selected == Some(id);
+        let dimmed = self.filter.is_some_and(|f| {
+            !crate::app::span_matches_filter(self.spans.get(id), self.names.get(id), f)
+        });
         let display = self
             .names
             .get(id)
@@ -119,6 +127,10 @@ impl<'a> TraceTree<'a> {
                 .bg(self.theme.highlight())
                 .fg(self.theme.background())
                 .add_modifier(Modifier::BOLD)
+        } else if dimmed {
+            Style::default()
+                .fg(self.theme.subtext())
+                .add_modifier(Modifier::DIM)
         } else {
             Style::default().fg(self.theme.text())
         };
@@ -236,8 +248,12 @@ mod tests {
                 let theme = make_theme();
                 let ascii = make_ascii();
                 let annotated: HashMap<SpanId, String> = HashMap::new();
+                let empty_spans: HashMap<SpanId, reeve_model::entity::span::InternalSpan> =
+                    HashMap::new();
                 let widget = TraceTree {
                     annotated: &annotated,
+                    filter: None,
+                    spans: &empty_spans,
                     children: &children,
                     names: &names,
                     collapsed: &collapsed,
@@ -295,8 +311,12 @@ mod tests {
                 let theme = make_theme();
                 let ascii = make_ascii();
                 let annotated: HashMap<SpanId, String> = HashMap::new();
+                let empty_spans: HashMap<SpanId, reeve_model::entity::span::InternalSpan> =
+                    HashMap::new();
                 let widget = TraceTree {
                     annotated: &annotated,
+                    filter: None,
+                    spans: &empty_spans,
                     children: &children,
                     names: &names,
                     collapsed: &collapsed,
@@ -351,8 +371,12 @@ mod tests {
                 let theme = make_theme();
                 let ascii = make_ascii();
                 let annotated: HashMap<SpanId, String> = HashMap::new();
+                let empty_spans: HashMap<SpanId, reeve_model::entity::span::InternalSpan> =
+                    HashMap::new();
                 let widget = TraceTree {
                     annotated: &annotated,
+                    filter: None,
+                    spans: &empty_spans,
                     children: &children,
                     names: &names,
                     collapsed: &collapsed,

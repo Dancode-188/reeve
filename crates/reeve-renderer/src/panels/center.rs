@@ -18,6 +18,45 @@ pub fn render(
     right_hidden: bool,
 ) {
     let has_streaming = !state.streaming.content.is_empty();
+    let filter_text = state
+        .filter_input
+        .as_deref()
+        .or(state.filter_applied.as_deref())
+        .filter(|f| !f.is_empty());
+
+    let (area, filter_area) = if state.filter_input.is_some() && area.height > 3 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Fill(1)])
+            .split(area);
+        (chunks[1], Some(chunks[0]))
+    } else {
+        (area, None)
+    };
+    if let Some(fa) = filter_area {
+        let buffer = state.filter_input.as_deref().unwrap_or("");
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled(
+                    " /",
+                    ratatui::style::Style::default().fg(theme.get("blue")),
+                ),
+                ratatui::text::Span::styled(
+                    buffer.to_string(),
+                    ratatui::style::Style::default().fg(theme.text()),
+                ),
+                ratatui::text::Span::styled(
+                    "\u{258C}",
+                    ratatui::style::Style::default().fg(theme.text()),
+                ),
+                ratatui::text::Span::styled(
+                    "  [Tab] next  [Enter] keep  [Esc] clear",
+                    ratatui::style::Style::default().fg(theme.subtext()),
+                ),
+            ])),
+            fa,
+        );
+    }
 
     let (tree_area, stream_area) = if has_streaming && area.height > 10 {
         let chunks = Layout::default()
@@ -45,6 +84,8 @@ pub fn render(
                 span_health_scores: &tv.span_health_scores,
                 outcome_lines: &tv.outcome_lines,
                 annotated: &tv.notes,
+                filter: filter_text,
+                spans: &tv.spans,
                 root: tv.root.as_ref(),
                 orphans: &tv.orphans,
                 selected: tv.selected.as_ref(),
@@ -62,6 +103,7 @@ pub fn render(
         let empty_collapsed: HashSet<SpanId> = HashSet::new();
         let empty_scores: HashMap<SpanId, f64> = HashMap::new();
         let empty_notes: HashMap<SpanId, String> = HashMap::new();
+        let empty_spans: HashMap<SpanId, reeve_model::entity::span::InternalSpan> = HashMap::new();
         frame.render_widget(
             TraceTree {
                 children: &empty,
@@ -70,6 +112,8 @@ pub fn render(
                 span_health_scores: &empty_scores,
                 outcome_lines: &[],
                 annotated: &empty_notes,
+                filter: None,
+                spans: &empty_spans,
                 root: None,
                 orphans: &[],
                 selected: None,
