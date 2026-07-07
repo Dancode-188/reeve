@@ -15,7 +15,37 @@ pub struct Theme {
     semantic: HashMap<String, String>,
 }
 
+/// The shipped themes, in `T` cycling order. Names must match the `name`
+/// field inside each embedded file.
+pub const BUILTIN_THEMES: &[&str] = &[
+    "mocha",
+    "macchiato",
+    "frappe",
+    "latte",
+    "dracula",
+    "nord",
+    "gruvbox",
+    "tokyo-night",
+];
+
 impl Theme {
+    /// Loads a shipped theme by name. The files are embedded so switching
+    /// works wherever the binary runs, not only from a source checkout.
+    pub fn load_named(name: &str) -> Option<Self> {
+        let content = match name {
+            "mocha" => include_str!("../../../themes/mocha.toml"),
+            "macchiato" => include_str!("../../../themes/macchiato.toml"),
+            "frappe" => include_str!("../../../themes/frappe.toml"),
+            "latte" => include_str!("../../../themes/latte.toml"),
+            "dracula" => include_str!("../../../themes/dracula.toml"),
+            "nord" => include_str!("../../../themes/nord.toml"),
+            "gruvbox" => include_str!("../../../themes/gruvbox.toml"),
+            "tokyo-night" => include_str!("../../../themes/tokyo-night.toml"),
+            _ => return None,
+        };
+        Self::from_str(content).ok()
+    }
+
     pub fn load() -> Self {
         let user_path = std::env::var("HOME")
             .ok()

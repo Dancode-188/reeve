@@ -11,6 +11,7 @@ pub mod history;
 pub mod impact_view;
 pub mod left;
 pub mod overlay;
+pub mod palette;
 pub mod right;
 pub mod scrubber;
 
