@@ -13,6 +13,17 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Spending analytics for the Cost view.
+#[derive(Debug, Clone, Default)]
+pub struct CostSummary {
+    pub total: f64,
+    pub trace_count: u32,
+    /// (agent name, total cost), highest spend first.
+    pub by_agent: Vec<(String, f64)>,
+    /// (model name, total cost), highest spend first.
+    pub by_model: Vec<(String, f64)>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("database error: {0}")]
@@ -638,6 +649,57 @@ impl WarmStore {
         .await
     }
 
+    /// Spending totals for the Cost view: overall total with trace count,
+    /// cost grouped by agent, and cost grouped by model, in one pass over
+    /// span attributes. Spans without a model attribute group under
+    /// "other". Agents appear even at zero spend so the fleet is complete.
+    pub async fn cost_summary(&self) -> Result<CostSummary, StorageError> {
+        self.with_conn(|conn| {
+            let total: f64 = conn.query_row(
+                "SELECT COALESCE(SUM(json_extract(attributes,
+                     '$.\"gen_ai.usage.cost\"')), 0.0) FROM spans",
+                [],
+                |row| row.get(0),
+            )?;
+            let trace_count: u32 = conn.query_row(
+                "SELECT COUNT(*) FROM traces WHERE completed_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            let by_agent: Vec<(String, f64)> = conn
+                .prepare(
+                    "SELECT a.name, COALESCE(SUM(json_extract(s.attributes,
+                         '$.\"gen_ai.usage.cost\"')), 0.0) AS cost
+                     FROM agents a
+                     LEFT JOIN traces t ON t.agent_id = a.id
+                     LEFT JOIN spans s ON s.trace_id = t.id
+                     GROUP BY a.id ORDER BY cost DESC",
+                )?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let by_model: Vec<(String, f64)> = conn
+                .prepare(
+                    "SELECT COALESCE(json_extract(attributes,
+                         '$.\"gen_ai.request.model\"'), 'other') AS model,
+                         SUM(json_extract(attributes,
+                         '$.\"gen_ai.usage.cost\"')) AS cost
+                     FROM spans
+                     WHERE json_extract(attributes,
+                         '$.\"gen_ai.usage.cost\"') IS NOT NULL
+                     GROUP BY model ORDER BY cost DESC",
+                )?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(CostSummary {
+                total,
+                trace_count,
+                by_agent,
+                by_model,
+            })
+        })
+        .await
+    }
+
     /// Content of a trace's span events keyed by span, for replay's
     /// streaming box. Only events that carried content (privacy tier 2
     /// recordings) come back; a tier 1 trace returns an empty map.
@@ -1089,6 +1151,31 @@ mod tests {
         CT::Redirect {
             instruction: "steer".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn cost_summary_groups_by_agent_and_model() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t1")).await.unwrap();
+        let mut s1 = span("s1", "t1");
+        s1.attributes = serde_json::json!({
+            "gen_ai.usage.cost": 0.20, "gen_ai.request.model": "phi4-mini"
+        });
+        store.save_span(s1).await.unwrap();
+        let mut s2 = span("s2", "t1");
+        s2.attributes = serde_json::json!({"gen_ai.usage.cost": 0.05});
+        store.save_span(s2).await.unwrap();
+
+        let summary = store.cost_summary().await.unwrap();
+        assert!((summary.total - 0.25).abs() < 1e-9);
+        assert_eq!(summary.by_agent[0].0, "test-agent");
+        assert!((summary.by_agent[0].1 - 0.25).abs() < 1e-9);
+        assert_eq!(summary.by_model[0], ("phi4-mini".to_string(), 0.20));
+        assert_eq!(
+            summary.by_model[1].0, "other",
+            "spans without a model attribute group under other"
+        );
     }
 
     #[tokio::test]

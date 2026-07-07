@@ -9,7 +9,7 @@ use reeve_model::entity::span::InternalSpan;
 use reeve_model::entity::trace::Trace;
 use reeve_model::ids::{AgentId, CommandId, SpanId, TraceId};
 use reeve_model::signal::{CostTrend, EngineEvent, EvaluationConfidence, IngestionEvent};
-use reeve_storage::warm::WarmStore;
+use reeve_storage::warm::{CostSummary, WarmStore};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -237,6 +237,8 @@ pub struct AppState {
     /// Intervention impact charts. Some = the center panel shows the
     /// before/projected/after comparison for one command.
     pub impact: Option<ImpactState>,
+    /// Spending analytics, loaded from the warm store when Cost view opens.
+    pub cost_summary: CostSummary,
     pub show_help: bool,
     pub errors: Vec<String>,
     /// Unrecoverable startup error. When set, the normal cockpit is replaced
@@ -347,6 +349,7 @@ impl App {
                 history_confirm_delete: false,
                 replay: None,
                 impact: None,
+                cost_summary: CostSummary::default(),
                 show_help: false,
                 errors: Vec::new(),
                 fatal_error: None,
@@ -785,6 +788,15 @@ impl App {
             Action::Char('3') => {
                 self.enter_history().await;
             }
+            Action::Char('4') => match self.warm.cost_summary().await {
+                Ok(summary) => {
+                    self.state.cost_summary = summary;
+                    self.state.view_mode = ViewMode::Cost;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load cost summary");
+                }
+            },
             // Focus view: step backward/forward through the agent's trace
             // history. Newest-first list, so '[' (older) moves down it.
             Action::Char('[') if self.state.view_mode == ViewMode::Focus => {
