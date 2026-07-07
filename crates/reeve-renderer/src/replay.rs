@@ -43,6 +43,9 @@ pub struct ReplayState {
     /// Captured span-event content keyed by span id, for the streaming box.
     /// Empty for privacy tier 1 recordings.
     pub span_content: std::collections::HashMap<String, String>,
+    /// Developer annotations keyed by span id, so notes made live are
+    /// still there when the trace replays.
+    pub notes: std::collections::HashMap<String, String>,
 }
 
 const SPEEDS: &[f64] = &[0.5, 1.0, 2.0, 4.0];
@@ -73,6 +76,7 @@ impl ReplayState {
             playing: true,
             speed: 1.0,
             span_content: std::collections::HashMap::new(),
+            notes: std::collections::HashMap::new(),
         }
     }
 

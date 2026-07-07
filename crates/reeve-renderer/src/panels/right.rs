@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Borders, Paragraph},
 };
 use reeve_model::signal::EvaluationConfidence;
 
@@ -38,6 +38,28 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, as
     let sdh = span_detail_height(state);
     let ctx_h = ctx_window_height(state);
     let has_quality = !state.metric_scores.is_empty();
+
+    // The NOTE box takes fixed rows off the bottom when the selected span
+    // carries an annotation; everything else stacks above it.
+    let note = state.trace.as_ref().and_then(|tv| {
+        tv.selected
+            .as_ref()
+            .and_then(|id| tv.notes.get(id))
+            .cloned()
+    });
+    let area = if let Some(ref content) = note {
+        let note_h = note_height(content, area.width);
+        if area.height > note_h {
+            let chunks =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(note_h)]).split(area);
+            render_note(frame, chunks[1], content, theme);
+            chunks[0]
+        } else {
+            area
+        }
+    } else {
+        area
+    };
 
     match (ctx_h, has_quality) {
         (0, false) => {
@@ -71,6 +93,40 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme, as
             render_quality(frame, chunks[2], state, theme);
         }
     }
+}
+
+/// Label row plus the bordered box: prose the developer reads, one of the
+/// two bordered content boxes the design allows.
+fn note_height(content: &str, width: u16) -> u16 {
+    let inner = width.saturating_sub(2).max(1) as usize;
+    let lines = content.len().div_ceil(inner).max(1) as u16;
+    1 + lines.min(4) + 2
+}
+
+fn render_note(frame: &mut Frame, area: Rect, content: &str, theme: &Theme) {
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).split(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "NOTE",
+            Style::default().fg(theme.get("blue")),
+        ))),
+        chunks[0],
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_idle()))
+        .style(Style::default().bg(theme.surface()));
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            content.to_string(),
+            Style::default()
+                .fg(theme.text())
+                .add_modifier(Modifier::ITALIC),
+        ))
+        .wrap(ratatui::widgets::Wrap { trim: true })
+        .block(block),
+        chunks[1],
+    );
 }
 
 fn span_detail_height(state: &AppState) -> u16 {

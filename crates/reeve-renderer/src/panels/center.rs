@@ -44,6 +44,7 @@ pub fn render(
                 collapsed: &tv.collapsed,
                 span_health_scores: &tv.span_health_scores,
                 outcome_lines: &tv.outcome_lines,
+                annotated: &tv.notes,
                 root: tv.root.as_ref(),
                 orphans: &tv.orphans,
                 selected: tv.selected.as_ref(),
@@ -60,6 +61,7 @@ pub fn render(
         let empty_names: HashMap<SpanId, String> = HashMap::new();
         let empty_collapsed: HashSet<SpanId> = HashSet::new();
         let empty_scores: HashMap<SpanId, f64> = HashMap::new();
+        let empty_notes: HashMap<SpanId, String> = HashMap::new();
         frame.render_widget(
             TraceTree {
                 children: &empty,
@@ -67,6 +69,7 @@ pub fn render(
                 collapsed: &empty_collapsed,
                 span_health_scores: &empty_scores,
                 outcome_lines: &[],
+                annotated: &empty_notes,
                 root: None,
                 orphans: &[],
                 selected: None,

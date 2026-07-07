@@ -88,6 +88,9 @@ pub struct TraceView {
     /// arrived yet. Rendered as flat rows awaiting the parent. Populated
     /// during replay, where arrival order routinely puts children first.
     pub orphans: Vec<SpanId>,
+    /// Developer annotations keyed by span: the tree shows an indicator and
+    /// the right panel shows the content in the NOTE box.
+    pub notes: HashMap<SpanId, String>,
 }
 
 pub struct StreamingState {
@@ -247,6 +250,8 @@ pub struct AppState {
     pub palette_match: usize,
     /// True while `kill all` waits for its y/n confirmation.
     pub palette_confirm_kill: bool,
+    /// Open note input: the span being annotated and the buffer so far.
+    pub note_input: Option<(SpanId, String)>,
     /// Theme name the palette or T selected; the render loop applies it.
     pub pending_theme: Option<String>,
     /// Mouse capture wanted. The render loop reconciles the terminal's
@@ -367,6 +372,7 @@ impl App {
                 palette: None,
                 palette_match: 0,
                 palette_confirm_kill: false,
+                note_input: None,
                 pending_theme: None,
                 mouse_enabled: true,
                 show_help: false,
@@ -640,6 +646,17 @@ impl App {
                         text: format!("{cmd_label} {delta_str}{spans_str}"),
                     });
                 }
+                let notes = self
+                    .warm
+                    .span_notes_for_trace(&trace_id)
+                    .await
+                    .map(|m| {
+                        m.into_iter()
+                            .map(|(k, n)| (SpanId::from(k.as_str()), n.content))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 self.state.trace = Some(TraceView {
                     trace_id,
                     root,
@@ -653,6 +670,7 @@ impl App {
                     span_health_scores: HashMap::new(),
                     outcome_lines,
                     orphans: Vec::new(),
+                    notes,
                 });
             }
             Err(e) => {
@@ -670,6 +688,11 @@ impl App {
         // When overlay is open, consume most actions before they reach the cockpit.
         if self.state.overlay.is_some() {
             self.handle_overlay_action(action).await;
+            return;
+        }
+        // The note input owns the keyboard while open.
+        if self.state.note_input.is_some() {
+            self.handle_note_action(action).await;
             return;
         }
         // The palette owns the keyboard while open.
@@ -814,6 +837,18 @@ impl App {
             }
             Action::Char('m') => {
                 self.state.mouse_enabled = !self.state.mouse_enabled;
+            }
+            Action::Char('n') => {
+                if let Some(span_id) = self.state.trace.as_ref().and_then(|tv| tv.selected.clone())
+                {
+                    let existing = self
+                        .state
+                        .trace
+                        .as_ref()
+                        .and_then(|tv| tv.notes.get(&span_id).cloned())
+                        .unwrap_or_default();
+                    self.state.note_input = Some((span_id, existing));
+                }
             }
             Action::Char(':') => {
                 self.state.palette = Some(String::new());
@@ -1089,7 +1124,8 @@ impl App {
     /// Whether keystrokes are currently text rather than commands. Drives the
     /// mode-aware key mapping in `input::map_event`.
     pub fn text_input_active(&self) -> bool {
-        self.state.palette.is_some()
+        self.state.note_input.is_some()
+            || self.state.palette.is_some()
             || matches!(
                 self.state.overlay,
                 Some(InterventionOverlayState {
@@ -1296,6 +1332,47 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    async fn handle_note_action(&mut self, action: Action) {
+        match action {
+            Action::Dismiss => {
+                self.state.note_input = None;
+            }
+            Action::Char(c) => {
+                if let Some((_, ref mut buffer)) = self.state.note_input {
+                    buffer.push(c);
+                }
+            }
+            Action::Backspace => {
+                if let Some((_, ref mut buffer)) = self.state.note_input {
+                    buffer.pop();
+                }
+            }
+            Action::Select => {
+                let Some((span_id, content)) = self.state.note_input.take() else {
+                    return;
+                };
+                if content.is_empty() {
+                    return;
+                }
+                let now_ms = current_ms();
+                let note = reeve_model::entity::SpanNote {
+                    id: format!("note-{now_ms:x}"),
+                    span_id: span_id.clone(),
+                    content: content.clone(),
+                    created_at: now_ms,
+                };
+                if let Err(e) = self.warm.save_span_note(note).await {
+                    tracing::warn!(error = %e, "failed to save span note");
+                    return;
+                }
+                if let Some(ref mut tv) = self.state.trace {
+                    tv.notes.insert(span_id, content);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1570,8 +1647,15 @@ impl App {
             .span_content_for_trace(&trace_id)
             .await
             .unwrap_or_default();
+        let notes = self
+            .warm
+            .span_notes_for_trace(&trace_id)
+            .await
+            .map(|m| m.into_iter().map(|(k, n)| (k, n.content)).collect())
+            .unwrap_or_default();
         let mut replay = ReplayState::new(trace_id, spans, evals, commands);
         replay.span_content = span_content;
+        replay.notes = notes;
         self.state.replay = Some(replay);
         self.rebuild_replay_view();
     }
@@ -1721,6 +1805,11 @@ impl App {
             span_health_scores: HashMap::new(),
             outcome_lines: Vec::new(),
             orphans,
+            notes: replay
+                .notes
+                .iter()
+                .map(|(k, v)| (SpanId::from(k.as_str()), v.clone()))
+                .collect(),
         });
     }
 
