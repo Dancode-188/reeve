@@ -252,6 +252,11 @@ pub struct AppState {
     pub palette_confirm_kill: bool,
     /// Open note input: the span being annotated and the buffer so far.
     pub note_input: Option<(SpanId, String)>,
+    /// Filter bar: Some means the input row is open below the TRACE header.
+    /// The string filters tree rows by operation/tool name substring.
+    pub filter_input: Option<String>,
+    /// A filter kept applied after the bar closed with Enter.
+    pub filter_applied: Option<String>,
     /// Theme name the palette or T selected; the render loop applies it.
     pub pending_theme: Option<String>,
     /// Mouse capture wanted. The render loop reconciles the terminal's
@@ -373,6 +378,8 @@ impl App {
                 palette_match: 0,
                 palette_confirm_kill: false,
                 note_input: None,
+                filter_input: None,
+                filter_applied: None,
                 pending_theme: None,
                 mouse_enabled: true,
                 show_help: false,
@@ -690,6 +697,11 @@ impl App {
             self.handle_overlay_action(action).await;
             return;
         }
+        // The filter bar owns the keyboard while open.
+        if self.state.filter_input.is_some() {
+            self.handle_filter_action(action);
+            return;
+        }
         // The note input owns the keyboard while open.
         if self.state.note_input.is_some() {
             self.handle_note_action(action).await;
@@ -761,6 +773,13 @@ impl App {
                 }
                 _ => {}
             },
+            // With a filter applied, Tab cycles matches instead of panels.
+            Action::NextPanel if self.state.filter_applied.is_some() => {
+                self.cycle_filter_match(true);
+            }
+            Action::PrevPanel if self.state.filter_applied.is_some() => {
+                self.cycle_filter_match(false);
+            }
             Action::NextPanel => {
                 self.state.panel_focus = match self.state.panel_focus {
                     PanelFocus::Left => PanelFocus::Center,
@@ -837,6 +856,12 @@ impl App {
             }
             Action::Char('m') => {
                 self.state.mouse_enabled = !self.state.mouse_enabled;
+            }
+            Action::Char('/') => {
+                if self.state.trace.is_some() {
+                    self.state.filter_input =
+                        Some(self.state.filter_applied.clone().unwrap_or_default());
+                }
             }
             Action::Char('n') => {
                 if let Some(span_id) = self.state.trace.as_ref().and_then(|tv| tv.selected.clone())
@@ -1125,6 +1150,7 @@ impl App {
     /// mode-aware key mapping in `input::map_event`.
     pub fn text_input_active(&self) -> bool {
         self.state.note_input.is_some()
+            || self.state.filter_input.is_some()
             || self.state.palette.is_some()
             || matches!(
                 self.state.overlay,
@@ -1332,6 +1358,83 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    fn handle_filter_action(&mut self, action: Action) {
+        match action {
+            Action::Dismiss => {
+                // Esc clears everything: the bar and any applied filter.
+                self.state.filter_input = None;
+                self.state.filter_applied = None;
+            }
+            Action::Select => {
+                // Enter keeps the filter but closes the bar.
+                let buffer = self.state.filter_input.take().unwrap_or_default();
+                self.state.filter_applied = if buffer.is_empty() {
+                    None
+                } else {
+                    Some(buffer)
+                };
+                self.cycle_filter_match(true);
+            }
+            Action::Char(c) => {
+                if let Some(ref mut buffer) = self.state.filter_input {
+                    buffer.push(c);
+                }
+            }
+            Action::Backspace => {
+                if let Some(ref mut buffer) = self.state.filter_input {
+                    buffer.pop();
+                }
+            }
+            // Tab cycles matches without closing the bar.
+            Action::NextPanel => self.cycle_filter_match(true),
+            _ => {}
+        }
+    }
+
+    /// The filter active for display purposes: the live buffer while the
+    /// bar is open, the applied filter after Enter.
+    pub fn active_filter(&self) -> Option<&str> {
+        self.state
+            .filter_input
+            .as_deref()
+            .or(self.state.filter_applied.as_deref())
+            .filter(|f| !f.is_empty())
+    }
+
+    /// Moves the tree selection to the next or previous span matching the
+    /// active filter, wrapping around.
+    fn cycle_filter_match(&mut self, forward: bool) {
+        let Some(filter) = self.active_filter().map(str::to_string) else {
+            return;
+        };
+        let Some(tv) = self.state.trace.as_mut() else {
+            return;
+        };
+        let matches: Vec<usize> = tv
+            .span_order
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| span_matches_filter(tv.spans.get(*id), tv.names.get(*id), &filter))
+            .map(|(i, _)| i)
+            .collect();
+        if matches.is_empty() {
+            return;
+        }
+        let current = tv
+            .selected
+            .as_ref()
+            .and_then(|id| tv.span_order.iter().position(|s| s == id));
+        let next = match (current, forward) {
+            (Some(c), true) => matches.iter().find(|&&i| i > c).or(matches.first()),
+            (Some(c), false) => matches.iter().rev().find(|&&i| i < c).or(matches.last()),
+            (None, true) => matches.first(),
+            (None, false) => matches.last(),
+        };
+        if let Some(&idx) = next {
+            tv.selected = Some(tv.span_order[idx].clone());
         }
     }
 
@@ -1899,6 +2002,36 @@ fn flatten_tree(
         }
     }
     order
+}
+
+/// Whether a span matches the filter text: substring match against the
+/// operation name and the tool name attribute, case-insensitive.
+pub fn span_matches_filter(
+    span: Option<&InternalSpan>,
+    name: Option<&String>,
+    filter: &str,
+) -> bool {
+    let needle = filter.to_lowercase();
+    if let Some(n) = name {
+        if n.to_lowercase().contains(&needle) {
+            return true;
+        }
+    }
+    if let Some(s) = span {
+        if s.operation.to_lowercase().contains(&needle) {
+            return true;
+        }
+        if let Some(tool) = s
+            .attributes
+            .get("gen_ai.tool.name")
+            .and_then(|v| v.as_str())
+        {
+            if tool.to_lowercase().contains(&needle) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn current_ms() -> i64 {
