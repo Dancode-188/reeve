@@ -20,6 +20,10 @@ pub enum Action {
     Resize(u16, u16),
     OverlayOpen,
     QuickPause,
+    JumpTop,
+    JumpBottom,
+    HalfPageDown,
+    HalfPageUp,
     Char(char),
     Backspace,
 }
@@ -87,6 +91,12 @@ pub fn map_event(event: Event, text_input: bool) -> Option<Action> {
             (KeyCode::PageDown, _) => Some(Action::ScrollDown),
             (KeyCode::Char('?'), _) => Some(Action::ToggleHelp),
             (KeyCode::Esc, _) => Some(Action::Dismiss),
+            (KeyCode::Char('g'), KeyModifiers::NONE) => Some(Action::JumpTop),
+            (KeyCode::Char('G'), _) | (KeyCode::Char('g'), KeyModifiers::SHIFT) => {
+                Some(Action::JumpBottom)
+            }
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => Some(Action::HalfPageDown),
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => Some(Action::HalfPageUp),
             (KeyCode::Char('d'), _) => Some(Action::DismissDegraded),
             (KeyCode::Char('r'), _) => Some(Action::Retry),
             (KeyCode::Char('i'), _) => Some(Action::OverlayOpen),
