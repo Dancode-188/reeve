@@ -259,6 +259,9 @@ pub struct AppState {
     pub filter_applied: Option<String>,
     /// Theme name the palette or T selected; the render loop applies it.
     pub pending_theme: Option<String>,
+    /// Zoomed panel: the focused panel takes the full body width until z
+    /// is pressed again or Backspace steps out.
+    pub zoomed: bool,
     /// Mouse capture wanted. The render loop reconciles the terminal's
     /// actual capture state with this; m toggles it, and the header shows
     /// a dim indicator while off so text selection visibly works again.
@@ -381,6 +384,7 @@ impl App {
                 filter_input: None,
                 filter_applied: None,
                 pending_theme: None,
+                zoomed: false,
                 mouse_enabled: true,
                 show_help: false,
                 errors: Vec::new(),
@@ -857,6 +861,92 @@ impl App {
             Action::Char('m') => {
                 self.state.mouse_enabled = !self.state.mouse_enabled;
             }
+            Action::JumpTop => match self.state.panel_focus {
+                PanelFocus::Left => {
+                    if !self.state.agents.is_empty() {
+                        self.state.selected_agent = Some(0);
+                        self.load_trace_for_selected().await;
+                    }
+                }
+                PanelFocus::Center => {
+                    if let Some(ref mut tv) = self.state.trace {
+                        tv.selected = tv.span_order.first().cloned();
+                        tv.scroll = 0;
+                    }
+                }
+                PanelFocus::Right => {
+                    self.state.streaming.auto_scroll = false;
+                    self.state.streaming.scroll = 0;
+                }
+            },
+            Action::JumpBottom => match self.state.panel_focus {
+                PanelFocus::Left => {
+                    let len = self.state.agents.len();
+                    if len > 0 {
+                        self.state.selected_agent = Some(len - 1);
+                        self.load_trace_for_selected().await;
+                    }
+                }
+                PanelFocus::Center => {
+                    if let Some(ref mut tv) = self.state.trace {
+                        tv.selected = tv.span_order.last().cloned();
+                        tv.scroll = tv.span_order.len().saturating_sub(1) as u16;
+                    }
+                }
+                PanelFocus::Right => {
+                    self.state.streaming.auto_scroll = true;
+                }
+            },
+            Action::HalfPageDown => {
+                if self.state.panel_focus == PanelFocus::Center {
+                    self.move_center_selection(10);
+                }
+            }
+            Action::HalfPageUp => {
+                if self.state.panel_focus == PanelFocus::Center {
+                    self.move_center_selection(-10);
+                }
+            }
+            // a expands every node, A collapses to the root.
+            Action::Char('a') => {
+                if let Some(ref mut tv) = self.state.trace {
+                    tv.collapsed.clear();
+                    tv.span_order = tv
+                        .root
+                        .as_ref()
+                        .map(|r| flatten_tree(r, &tv.children, &tv.collapsed))
+                        .unwrap_or_default();
+                }
+            }
+            Action::Char('A') => {
+                if let Some(ref mut tv) = self.state.trace {
+                    if let Some(root) = tv.root.clone() {
+                        // Every node with children collapses, the root
+                        // included: collapse-all leaves just the root row.
+                        tv.collapsed = tv.children.keys().cloned().collect();
+                        tv.span_order = flatten_tree(&root, &tv.children, &tv.collapsed);
+                        tv.selected = Some(root);
+                    }
+                }
+            }
+            Action::Char('z') => {
+                self.state.zoomed = !self.state.zoomed;
+            }
+            Action::Char('P') => {
+                // Fleet pause behind the same confirmation style kill all
+                // uses; shares the palette's dispatch path.
+                self.state.palette = Some("pause all".to_string());
+                self.state.palette_match = 0;
+                self.execute_palette_command("pause all").await;
+            }
+            Action::Backspace => {
+                // Step back one level: zoom, then view mode, then nothing.
+                if self.state.zoomed {
+                    self.state.zoomed = false;
+                } else if self.state.view_mode != ViewMode::Fleet {
+                    self.state.view_mode = ViewMode::Fleet;
+                }
+            }
             Action::Char('/') => {
                 if self.state.trace.is_some() {
                     self.state.filter_input =
@@ -907,7 +997,7 @@ impl App {
             Action::Char(']') if self.state.view_mode == ViewMode::Focus => {
                 self.focus_step(-1).await;
             }
-            Action::Resize(_, _) | Action::Char(_) | Action::Backspace => {}
+            Action::Resize(_, _) | Action::Char(_) => {}
         }
     }
 
@@ -1315,6 +1405,25 @@ impl App {
             }
             Action::MoveUp | Action::VimUp => {
                 self.state.history_selected = self.state.history_selected.saturating_sub(1);
+                true
+            }
+            Action::JumpTop => {
+                self.state.history_selected = 0;
+                true
+            }
+            Action::JumpBottom => {
+                self.state.history_selected = self.state.history_entries.len().saturating_sub(1);
+                true
+            }
+            Action::HalfPageDown => {
+                let len = self.state.history_entries.len();
+                if len > 0 {
+                    self.state.history_selected = (self.state.history_selected + 10).min(len - 1);
+                }
+                true
+            }
+            Action::HalfPageUp => {
+                self.state.history_selected = self.state.history_selected.saturating_sub(10);
                 true
             }
             Action::Select => {

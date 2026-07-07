@@ -23,6 +23,35 @@ const COLLAPSE_LEFT: u16 = 80;
 /// carries a short trace id, a score, and a cost per row.
 const FOCUS_LIST_WIDTH: u16 = 26;
 
+/// Zoom: the focused panel takes the whole body. The other panels get
+/// zero-width rects, which every renderer already treats as hidden.
+pub fn compute_zoomed(area: Rect, focus_left: bool, focus_right: bool) -> Panels {
+    let zero = Rect {
+        width: 0,
+        height: 0,
+        ..area
+    };
+    if focus_left {
+        Panels {
+            left: area,
+            center: zero,
+            right: zero,
+        }
+    } else if focus_right {
+        Panels {
+            left: zero,
+            center: zero,
+            right: area,
+        }
+    } else {
+        Panels {
+            left: zero,
+            center: area,
+            right: zero,
+        }
+    }
+}
+
 /// Focus view: the agent fleet gives way to a trace-history strip, the tree
 /// takes the reclaimed width, the right panel stays. Same breakpoints as
 /// `compute`: below 120 columns the right panel hides, below 80 the strip
@@ -190,6 +219,22 @@ mod tests {
         let layout = compute_full(area);
         assert_eq!(layout.header.height, 0);
         assert_eq!(layout.footer.height, 0);
+    }
+
+    #[test]
+    fn compute_zoomed_gives_everything_to_the_focused_panel() {
+        let area = Rect::new(0, 0, 160, 40);
+        let center = compute_zoomed(area, false, false);
+        assert_eq!(center.center.width, 160);
+        assert_eq!(center.left.width, 0);
+        assert_eq!(center.right.width, 0);
+
+        let left = compute_zoomed(area, true, false);
+        assert_eq!(left.left.width, 160);
+        assert_eq!(left.center.width, 0);
+
+        let right = compute_zoomed(area, false, true);
+        assert_eq!(right.right.width, 160);
     }
 
     #[test]

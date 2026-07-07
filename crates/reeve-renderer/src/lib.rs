@@ -188,10 +188,17 @@ async fn run_inner(
 
                     let view_mode = app.state.view_mode;
                     let full = layout::compute_full(frame.area());
-                    let split = if view_mode == app::ViewMode::Focus {
-                        layout::compute_focus
-                    } else {
-                        layout::compute
+                    let zoomed = app.state.zoomed;
+                    let focus_left = app.state.panel_focus == app::PanelFocus::Left;
+                    let focus_right = app.state.panel_focus == app::PanelFocus::Right;
+                    let split = move |area| {
+                        if zoomed {
+                            layout::compute_zoomed(area, focus_left, focus_right)
+                        } else if view_mode == app::ViewMode::Focus {
+                            layout::compute_focus(area)
+                        } else {
+                            layout::compute(area)
+                        }
                     };
                     let mut panels = split(full.body);
                     let right_hidden = panels.right.width == 0;
