@@ -157,27 +157,39 @@ async fn run_inner(
                         return;
                     }
 
+                    let focus_mode = app.state.view_mode == app::ViewMode::Focus;
                     let full = layout::compute_full(frame.area());
-                    let right_hidden = full.panels.right.width == 0;
-                    let left_hidden = full.panels.left.width == 0;
+                    let split = if focus_mode {
+                        layout::compute_focus
+                    } else {
+                        layout::compute
+                    };
+                    let mut panels = split(full.body);
+                    let right_hidden = panels.right.width == 0;
+                    let left_hidden = panels.left.width == 0;
                     panels::render_header(frame, full.header, &app.state, &theme);
 
                     let is_degraded = app.state.eval_backend.as_deref() == Some("disabled")
                         && !app.state.degraded_dismissed;
-                    let panels = if is_degraded && full.body.height >= 3 {
+                    if is_degraded && full.body.height >= 3 {
                         let chunks = Layout::vertical([
                             Constraint::Length(2),
                             Constraint::Fill(1),
                         ])
                         .split(full.body);
                         panels::render_degraded(frame, chunks[0], &app.state, &theme);
-                        layout::compute(chunks[1])
-                    } else {
-                        full.panels
-                    };
+                        panels = split(chunks[1]);
+                    }
 
                     panels::render(frame, &panels, &app.state, &theme, &ascii);
-                    panels::render_footer(frame, full.footer, &theme, right_hidden, left_hidden);
+                    panels::render_footer(
+                        frame,
+                        full.footer,
+                        &theme,
+                        right_hidden,
+                        left_hidden,
+                        focus_mode,
+                    );
                     if app.state.show_help {
                         panels::render_help_overlay(frame, frame.area(), &theme);
                     }

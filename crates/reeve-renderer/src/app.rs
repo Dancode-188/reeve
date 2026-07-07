@@ -4,6 +4,7 @@ use reeve_intervention::dispatcher::Dispatcher;
 use reeve_model::entity::agent::Agent;
 use reeve_model::entity::intervention::{CommandStatus, CommandType, InterventionCommand};
 use reeve_model::entity::span::InternalSpan;
+use reeve_model::entity::trace::Trace;
 use reeve_model::ids::{AgentId, CommandId, SpanId, TraceId};
 use reeve_model::signal::{CostTrend, EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::WarmStore;
@@ -108,6 +109,20 @@ pub enum PanelFocus {
     Right,
 }
 
+/// What the cockpit's screen currently means. Fleet is the live three-panel
+/// default. Focus trades the agent list for a compact trace-history strip on
+/// one agent. History and Cost are reserved variants; their keys stay inert
+/// until those views exist, because switching to a blank mode is worse than
+/// not switching.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    #[default]
+    Fleet,
+    Focus,
+    History,
+    Cost,
+}
+
 pub struct FatalError {
     pub message: String,
     pub hint: Option<String>,
@@ -199,6 +214,11 @@ pub struct AppState {
     pub privacy_tier: u8,
     pub flash_targets: HashMap<FlashTarget, (FlashDirection, u8)>,
     pub panel_focus: PanelFocus,
+    pub view_mode: ViewMode,
+    /// The selected agent's recent traces, newest first, loaded from the
+    /// warm store when Focus view opens.
+    pub focus_traces: Vec<Trace>,
+    pub focus_selected: usize,
     pub show_help: bool,
     pub errors: Vec<String>,
     /// Unrecoverable startup error. When set, the normal cockpit is replaced
@@ -301,6 +321,9 @@ impl App {
                 privacy_tier: 1,
                 flash_targets: HashMap::new(),
                 panel_focus: PanelFocus::default(),
+                view_mode: ViewMode::default(),
+                focus_traces: Vec::new(),
+                focus_selected: 0,
                 show_help: false,
                 errors: Vec::new(),
                 fatal_error: None,
@@ -710,6 +733,20 @@ impl App {
                     self.dispatch_command(agent_id, cmd).await;
                 }
             }
+            Action::Char('1') => {
+                self.state.view_mode = ViewMode::Fleet;
+            }
+            Action::Char('2') => {
+                self.enter_focus().await;
+            }
+            // Focus view: step backward/forward through the agent's trace
+            // history. Newest-first list, so '[' (older) moves down it.
+            Action::Char('[') if self.state.view_mode == ViewMode::Focus => {
+                self.focus_step(1).await;
+            }
+            Action::Char(']') if self.state.view_mode == ViewMode::Focus => {
+                self.focus_step(-1).await;
+            }
             Action::Resize(_, _) | Action::Char(_) | Action::Backspace => {}
         }
     }
@@ -1042,6 +1079,45 @@ impl App {
             .unwrap_or(0);
         let next = (current as i32 + delta).rem_euclid(tv.span_order.len() as i32) as usize;
         tv.selected = Some(tv.span_order[next].clone());
+    }
+
+    /// Opens Focus view on the selected agent: loads its recent trace
+    /// history newest-first and shows the newest. Stays in Fleet when no
+    /// agent is selected or the agent has no completed traces yet, since a
+    /// Focus view with nothing to focus on is just a broken Fleet view.
+    async fn enter_focus(&mut self) {
+        let Some(agent_id) = self.state.selected_agent_id().cloned() else {
+            return;
+        };
+        let traces = match self.warm.list_recent_traces_for_agent(&agent_id, 50).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load trace history for focus view");
+                return;
+            }
+        };
+        if traces.is_empty() {
+            return;
+        }
+        let first = traces[0].id.clone();
+        self.state.focus_traces = traces;
+        self.state.focus_selected = 0;
+        self.state.view_mode = ViewMode::Focus;
+        self.load_trace(first).await;
+    }
+
+    async fn focus_step(&mut self, delta: i32) {
+        let len = self.state.focus_traces.len();
+        if len == 0 {
+            return;
+        }
+        let next = (self.state.focus_selected as i32 + delta).clamp(0, len as i32 - 1) as usize;
+        if next == self.state.focus_selected {
+            return;
+        }
+        self.state.focus_selected = next;
+        let trace_id = self.state.focus_traces[next].id.clone();
+        self.load_trace(trace_id).await;
     }
 
     async fn load_trace_for_selected(&mut self) {
