@@ -6,6 +6,7 @@ pub mod focus_list;
 pub mod footer;
 pub mod header;
 pub mod help;
+pub mod history;
 pub mod left;
 pub mod overlay;
 pub mod right;
@@ -44,7 +45,11 @@ pub fn render(
         }
     }
 
-    center::render(frame, panels.center, state, theme, ascii, right_hidden);
+    if state.view_mode == ViewMode::History {
+        history::render(frame, panels.center, state, theme);
+    } else {
+        center::render(frame, panels.center, state, theme, ascii, right_hidden);
+    }
 
     if !right_hidden {
         let border = Block::default()
@@ -66,9 +71,9 @@ pub fn render_footer(
     theme: &Theme,
     right_hidden: bool,
     left_hidden: bool,
-    focus_mode: bool,
+    view_mode: ViewMode,
 ) {
-    footer::render(frame, area, theme, right_hidden, left_hidden, focus_mode);
+    footer::render(frame, area, theme, right_hidden, left_hidden, view_mode);
 }
 
 pub fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {

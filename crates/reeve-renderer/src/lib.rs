@@ -157,9 +157,9 @@ async fn run_inner(
                         return;
                     }
 
-                    let focus_mode = app.state.view_mode == app::ViewMode::Focus;
+                    let view_mode = app.state.view_mode;
                     let full = layout::compute_full(frame.area());
-                    let split = if focus_mode {
+                    let split = if view_mode == app::ViewMode::Focus {
                         layout::compute_focus
                     } else {
                         layout::compute
@@ -188,7 +188,7 @@ async fn run_inner(
                         &theme,
                         right_hidden,
                         left_hidden,
-                        focus_mode,
+                        view_mode,
                     );
                     if app.state.show_help {
                         panels::render_help_overlay(frame, frame.area(), &theme);
