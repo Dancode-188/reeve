@@ -5,6 +5,7 @@ pub mod errors;
 pub mod input;
 pub mod layout;
 pub mod panels;
+pub mod replay;
 pub mod theme;
 pub mod widgets;
 
@@ -150,6 +151,8 @@ async fn run_inner(
                 app.state.advance_flash();
                 app.sync_pause_status();
                 app.check_auto_confirm().await;
+                // 66ms of wall time per tick, matching the render interval.
+                app.advance_replay(66.0);
 
                 terminal.draw(|frame| {
                     if let Some(ref err) = app.state.fatal_error {
@@ -182,14 +185,18 @@ async fn run_inner(
                     }
 
                     panels::render(frame, &panels, &app.state, &theme, &ascii);
-                    panels::render_footer(
-                        frame,
-                        full.footer,
-                        &theme,
-                        right_hidden,
-                        left_hidden,
-                        view_mode,
-                    );
+                    if let Some(ref replay) = app.state.replay {
+                        panels::scrubber::render(frame, full.footer, replay, &theme);
+                    } else {
+                        panels::render_footer(
+                            frame,
+                            full.footer,
+                            &theme,
+                            right_hidden,
+                            left_hidden,
+                            view_mode,
+                        );
+                    }
                     if app.state.show_help {
                         panels::render_help_overlay(frame, frame.area(), &theme);
                     }

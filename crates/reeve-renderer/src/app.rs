@@ -1,4 +1,5 @@
 use crate::input::Action;
+use crate::replay::{ReplayEvent, ReplayState};
 use indexmap::IndexMap;
 use reeve_intervention::dispatcher::Dispatcher;
 use reeve_model::entity::agent::Agent;
@@ -81,6 +82,10 @@ pub struct TraceView {
     pub span_health_scores: HashMap<SpanId, f64>,
     /// Pre-formatted outcome annotations loaded from the warm store on trace load.
     pub outcome_lines: Vec<OutcomeLine>,
+    /// Spans not reachable from the root because their parent has not
+    /// arrived yet. Rendered as flat rows awaiting the parent. Populated
+    /// during replay, where arrival order routinely puts children first.
+    pub orphans: Vec<SpanId>,
 }
 
 pub struct StreamingState {
@@ -225,6 +230,9 @@ pub struct AppState {
     pub history_selected: usize,
     /// True while the selected history row is asking y/n before deletion.
     pub history_confirm_delete: bool,
+    /// DVR state while replaying a trace. Some = replay owns the keyboard
+    /// and the footer becomes a scrubber.
+    pub replay: Option<ReplayState>,
     pub show_help: bool,
     pub errors: Vec<String>,
     /// Unrecoverable startup error. When set, the normal cockpit is replaced
@@ -333,6 +341,7 @@ impl App {
                 history_entries: Vec::new(),
                 history_selected: 0,
                 history_confirm_delete: false,
+                replay: None,
                 show_help: false,
                 errors: Vec::new(),
                 fatal_error: None,
@@ -616,6 +625,7 @@ impl App {
                     collapsed,
                     span_health_scores: HashMap::new(),
                     outcome_lines,
+                    orphans: Vec::new(),
                 });
             }
             Err(e) => {
@@ -633,6 +643,11 @@ impl App {
         // When overlay is open, consume most actions before they reach the cockpit.
         if self.state.overlay.is_some() {
             self.handle_overlay_action(action).await;
+            return;
+        }
+        // Replay owns the keyboard while active: h/l become stepping keys,
+        // and Esc exits back to History.
+        if self.state.replay.is_some() && self.handle_replay_action(&action) {
             return;
         }
         // History view owns navigation and its own delete confirmation; only
@@ -1188,12 +1203,200 @@ impl App {
                 }
                 true
             }
+            Action::Char('R') => {
+                if let Some((trace, _)) =
+                    self.state.history_entries.get(self.state.history_selected)
+                {
+                    let id = trace.id.clone();
+                    self.enter_replay(id).await;
+                }
+                true
+            }
             Action::Dismiss if !self.state.show_help => {
                 self.state.view_mode = ViewMode::Fleet;
                 true
             }
             _ => false,
         }
+    }
+
+    /// Loads a trace's full recorded timeline and starts replaying it.
+    async fn enter_replay(&mut self, trace_id: TraceId) {
+        let spans = match self.warm.list_spans_for_trace(&trace_id).await {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load spans for replay");
+                return;
+            }
+        };
+        let evals = self
+            .warm
+            .list_evaluations_for_trace(&trace_id)
+            .await
+            .unwrap_or_default();
+        let commands = self
+            .warm
+            .list_commands_for_trace(&trace_id)
+            .await
+            .unwrap_or_default();
+        let span_content = self
+            .warm
+            .span_content_for_trace(&trace_id)
+            .await
+            .unwrap_or_default();
+        let mut replay = ReplayState::new(trace_id, spans, evals, commands);
+        replay.span_content = span_content;
+        self.state.replay = Some(replay);
+        self.rebuild_replay_view();
+    }
+
+    /// Returns true when the action was consumed by replay.
+    fn handle_replay_action(&mut self, action: &Action) -> bool {
+        let Some(replay) = self.state.replay.as_mut() else {
+            return false;
+        };
+        match action {
+            Action::Char(' ') => replay.toggle_play(),
+            // h/l are PrevPanel/NextPanel in normal mode; in replay they
+            // step the timeline span by span.
+            Action::NextPanel => replay.step(true),
+            Action::PrevPanel => replay.step(false),
+            Action::Char('>') => replay.cycle_speed(true),
+            Action::Char('<') => replay.cycle_speed(false),
+            Action::Char('0') => replay.reset_speed(),
+            Action::Char('I') => replay.jump_to_marker(true),
+            // Shift+I arrives as 'I'; plain 'i' maps to OverlayOpen, which
+            // replay repurposes as the backward marker jump.
+            Action::OverlayOpen => replay.jump_to_marker(false),
+            Action::Dismiss => {
+                self.state.replay = None;
+                self.state.streaming.content.clear();
+                return true;
+            }
+            Action::Quit => {
+                self.should_quit = true;
+                return true;
+            }
+            _ => return true, // swallow everything else; replay owns the keys
+        }
+        self.rebuild_replay_view();
+        true
+    }
+
+    /// Called every render tick: advances the virtual clock while playing
+    /// and rebuilds the visible state when new events emitted.
+    pub fn advance_replay(&mut self, wall_ms: f64) {
+        let advanced = match self.state.replay.as_mut() {
+            Some(r) => r.tick(wall_ms),
+            None => return,
+        };
+        if advanced {
+            self.rebuild_replay_view();
+        }
+    }
+
+    /// Rebuilds the trace view, quality rows, gauge, and streaming box from
+    /// the replay's emitted prefix. Rebuilding from scratch each time keeps
+    /// one source of truth for visibility; warm-store traces are small
+    /// enough that this is well under a render tick.
+    fn rebuild_replay_view(&mut self) {
+        let Some(replay) = self.state.replay.as_ref() else {
+            return;
+        };
+
+        let mut span_map: HashMap<SpanId, InternalSpan> = HashMap::new();
+        let mut children: HashMap<SpanId, Vec<SpanId>> = HashMap::new();
+        let mut names: HashMap<SpanId, String> = HashMap::new();
+        let mut root: Option<SpanId> = None;
+        let mut metric_scores: Vec<MetricScore> = Vec::new();
+        let mut latest_llm_span: Option<SpanId> = None;
+
+        for event in replay.emitted() {
+            match event {
+                ReplayEvent::Span(span) => {
+                    if let Some(ref pid) = span.parent_id {
+                        children
+                            .entry(pid.clone())
+                            .or_default()
+                            .push(span.id.clone());
+                    } else if root.is_none() {
+                        root = Some(span.id.clone());
+                    }
+                    names.insert(span.id.clone(), span.operation.clone());
+                    span_map.insert(span.id.clone(), (**span).clone());
+                    if span.operation.starts_with("gen_ai.chat") {
+                        latest_llm_span = Some(span.id.clone());
+                    }
+                }
+                ReplayEvent::Eval(eval) => {
+                    metric_scores.retain(|m| m.name != eval.metric);
+                    metric_scores.push(MetricScore {
+                        name: eval.metric.clone(),
+                        score: eval.score,
+                        confidence: None,
+                    });
+                }
+                ReplayEvent::Command { .. } => {}
+            }
+        }
+
+        let collapsed = HashSet::new();
+        let mut span_order = root
+            .as_ref()
+            .map(|r| flatten_tree(r, &children, &collapsed))
+            .unwrap_or_default();
+        // Spans arrive leaves-first and the root arrives last, so mid-replay
+        // most spans are orphans: not yet reachable from any root. They must
+        // still render, in arrival order, exactly as the live view shows
+        // spans awaiting their parent.
+        let reachable: HashSet<&SpanId> = span_order.iter().collect();
+        let orphans: Vec<SpanId> = replay
+            .emitted()
+            .iter()
+            .filter_map(|e| match e {
+                ReplayEvent::Span(s) if !reachable.contains(&s.id) => Some(s.id.clone()),
+                _ => None,
+            })
+            .collect();
+        span_order.extend(orphans.iter().cloned());
+
+        // The gauge replays through the same arithmetic the engine used
+        // live; scoring lives in reeve-model for exactly this reuse.
+        let score_map: HashMap<&str, f64> = metric_scores
+            .iter()
+            .map(|m| (m.name.as_str(), m.score))
+            .collect();
+        self.state.health_score = reeve_model::scoring::compute(&score_map).map(|hs| hs.value);
+        self.state.metric_scores = metric_scores;
+
+        // The latest replayed LLM span's captured content shows in the
+        // streaming box; a tier 1 recording shows the honest notice instead.
+        self.state.streaming.content = match &latest_llm_span {
+            Some(span_id) => replay
+                .span_content
+                .get(span_id.as_str())
+                .cloned()
+                .unwrap_or_else(|| {
+                    "content was not captured for this trace (privacy tier 1)".to_string()
+                }),
+            None => String::new(),
+        };
+
+        self.state.trace = Some(TraceView {
+            trace_id: replay.trace_id.clone(),
+            root,
+            spans: span_map,
+            children,
+            names,
+            span_order,
+            scroll: 0,
+            selected: None,
+            collapsed,
+            span_health_scores: HashMap::new(),
+            outcome_lines: Vec::new(),
+            orphans,
+        });
     }
 
     /// Opens Focus view on the selected agent: loads its recent trace

@@ -4,7 +4,6 @@ pub mod policy;
 
 use evaluation::TraceContext;
 use evaluation::fingerprint::AgentFingerprint;
-use evaluation::health_score;
 use evaluation::heuristic::{
     CostEfficiencyEvaluator, Evaluator, FingerprintDeviationEvaluator,
     IntentActionDivergenceEvaluator, LatencyNormalityEvaluator, LoopDetector,
@@ -176,7 +175,7 @@ pub async fn run(
 
                 let mut tier1_health: Option<f64> = None;
 
-                if let Some(hs) = health_score::compute(&metric_scores) {
+                if let Some(hs) = reeve_model::scoring::compute(&metric_scores) {
                     tier1_health = Some(hs.value);
                     let event = EngineEvent::HealthScoreUpdated {
                         agent_id: agent_id.clone(),
@@ -629,7 +628,7 @@ async fn run_tier2(
         }
     }
 
-    if let Some(hs) = health_score::compute(&all_scores) {
+    if let Some(hs) = reeve_model::scoring::compute(&all_scores) {
         let event = EngineEvent::HealthScoreUpdated {
             agent_id,
             trace_id: trace_id.clone(),

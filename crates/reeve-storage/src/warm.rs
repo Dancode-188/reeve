@@ -617,6 +617,68 @@ impl WarmStore {
         .await
     }
 
+    /// A trace's evaluation results in the order they were produced, for
+    /// replaying the quality timeline. Trace-targeted results only; span
+    /// results share the timeline but target ids are span ids, and replay
+    /// keys its quality animation off the trace-level rows.
+    pub async fn list_evaluations_for_trace(
+        &self,
+        trace_id: &TraceId,
+    ) -> Result<Vec<EvaluationResult>, StorageError> {
+        let trace_id = trace_id.clone();
+        self.with_conn(move |conn| {
+            conn.prepare(
+                "SELECT * FROM evaluation_results
+                 WHERE target_id = ?1 AND target_type = 'trace'
+                 ORDER BY evaluated_at",
+            )?
+            .query_map(params![trace_id.as_str()], row_to_evaluation_result)?
+            .collect()
+        })
+        .await
+    }
+
+    /// Content of a trace's span events keyed by span, for replay's
+    /// streaming box. Only events that carried content (privacy tier 2
+    /// recordings) come back; a tier 1 trace returns an empty map.
+    pub async fn span_content_for_trace(
+        &self,
+        trace_id: &TraceId,
+    ) -> Result<HashMap<String, String>, StorageError> {
+        let trace_id = trace_id.clone();
+        self.with_conn(move |conn| {
+            conn.prepare(
+                "SELECT se.span_id, se.content FROM span_events se
+                 JOIN spans s ON se.span_id = s.id
+                 WHERE s.trace_id = ?1 AND se.content IS NOT NULL
+                 ORDER BY se.occurred_at",
+            )?
+            .query_map(params![trace_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect()
+        })
+        .await
+    }
+
+    /// A trace's intervention commands in the order they were issued, for
+    /// replay's timeline markers.
+    pub async fn list_commands_for_trace(
+        &self,
+        trace_id: &TraceId,
+    ) -> Result<Vec<InterventionCommand>, StorageError> {
+        let trace_id = trace_id.clone();
+        self.with_conn(move |conn| {
+            conn.prepare(
+                "SELECT * FROM intervention_commands
+                 WHERE trace_id = ?1 ORDER BY issued_at",
+            )?
+            .query_map(params![trace_id.as_str()], row_to_intervention_command)?
+            .collect()
+        })
+        .await
+    }
+
     pub async fn save_intervention_command(
         &self,
         command: InterventionCommand,

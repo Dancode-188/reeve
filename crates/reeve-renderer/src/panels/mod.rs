@@ -10,6 +10,7 @@ pub mod history;
 pub mod left;
 pub mod overlay;
 pub mod right;
+pub mod scrubber;
 
 use crate::app::ViewMode;
 use crate::{app::AppState, ascii::AsciiMode, layout::Panels, theme::Theme};
@@ -45,7 +46,9 @@ pub fn render(
         }
     }
 
-    if state.view_mode == ViewMode::History {
+    // Replay shows the reconstructed tree even though it is entered from
+    // History; the history list returns when replay exits.
+    if state.view_mode == ViewMode::History && state.replay.is_none() {
         history::render(frame, panels.center, state, theme);
     } else {
         center::render(frame, panels.center, state, theme, ascii, right_hidden);
