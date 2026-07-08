@@ -15,6 +15,8 @@ pub mod overlay;
 pub mod palette;
 pub mod right;
 pub mod scrubber;
+pub mod skeleton;
+pub mod toast;
 
 use crate::app::ViewMode;
 use crate::{app::AppState, ascii::AsciiMode, layout::Panels, theme::Theme};

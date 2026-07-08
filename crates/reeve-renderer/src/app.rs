@@ -259,6 +259,14 @@ pub struct AppState {
     pub filter_applied: Option<String>,
     /// Theme name the palette or T selected; the render loop applies it.
     pub pending_theme: Option<String>,
+    /// Agents whose health crossed a band boundary for the worse while not
+    /// selected. Their AGENTS rows pulse in the new band's color until the
+    /// developer selects them or the score recovers. Peripheral vision for
+    /// fleets; distinct from the one-tick flash on the selected agent.
+    pub sustained_alerts: HashMap<AgentId, f64>,
+    /// Transient notices: text plus remaining render ticks. Drawn bottom
+    /// right, newest last, dropped as the TTL runs out.
+    pub toasts: VecDeque<(String, u16)>,
     /// Zoomed panel: the focused panel takes the full body width until z
     /// is pressed again or Backspace steps out.
     pub zoomed: bool,
@@ -286,8 +294,20 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Queue a transient notice. Three seconds at the 15fps tick rate.
+    pub fn toast(&mut self, text: impl Into<String>) {
+        self.toasts.push_back((text.into(), 45));
+        if self.toasts.len() > 3 {
+            self.toasts.pop_front();
+        }
+    }
+
     /// Decrement all flash TTLs by one tick and remove expired entries.
     pub fn advance_flash(&mut self) {
+        for (_, ttl) in self.toasts.iter_mut() {
+            *ttl = ttl.saturating_sub(1);
+        }
+        self.toasts.retain(|(_, ttl)| *ttl > 0);
         self.flash_targets.retain(|_, (_, ttl)| {
             *ttl = ttl.saturating_sub(1);
             *ttl > 0
@@ -384,6 +404,8 @@ impl App {
                 filter_input: None,
                 filter_applied: None,
                 pending_theme: None,
+                sustained_alerts: HashMap::new(),
+                toasts: VecDeque::new(),
                 zoomed: false,
                 mouse_enabled: true,
                 show_help: false,
@@ -481,6 +503,19 @@ impl App {
                     self.state
                         .flash_targets
                         .insert(FlashTarget::AgentRow(agent_id.clone()), (dir, 2));
+
+                    // Band crossings on unselected agents start a sustained
+                    // pulse; recovery or selection clears it.
+                    let is_selected = self.state.selected_agent_id() == Some(&agent_id);
+                    match sustained_transition(prev_score, score, is_selected) {
+                        Some(true) => {
+                            self.state.sustained_alerts.insert(agent_id.clone(), score);
+                        }
+                        Some(false) => {
+                            self.state.sustained_alerts.remove(&agent_id);
+                        }
+                        None => {}
+                    }
                 }
 
                 // Associate the score with gen_ai.* spans in the loaded trace.
@@ -1583,6 +1618,7 @@ impl App {
                 if let Some(ref mut tv) = self.state.trace {
                     tv.notes.insert(span_id, content);
                 }
+                self.state.toast("note saved");
             }
             _ => {}
         }
@@ -1677,9 +1713,12 @@ impl App {
                     .filter(|id| !self.dispatcher.is_paused(id))
                     .cloned()
                     .collect();
+                let count = ids.len();
                 for id in ids {
                     self.dispatch_command(id, CommandType::Pause).await;
                 }
+                self.state
+                    .toast(format!("pause dispatched to {count} agents"));
             }
             "resume all" => {
                 let ids: Vec<AgentId> = self
@@ -1707,6 +1746,7 @@ impl App {
                 if let Some(name) = other.strip_prefix("theme ") {
                     if crate::theme::BUILTIN_THEMES.contains(&name) {
                         self.state.pending_theme = Some(name.to_string());
+                        self.state.toast(format!("theme: {name}"));
                     }
                 } else if let Some(name) = other.strip_prefix("pause agent ") {
                     if let Some(id) = self.agent_id_by_name(name) {
@@ -1738,6 +1778,7 @@ impl App {
             MouseTarget::SelectAgent(idx) => {
                 if idx < self.state.agents.len() {
                     self.state.selected_agent = Some(idx);
+                    self.acknowledge_sustained();
                     self.load_trace_for_selected().await;
                 }
             }
@@ -2075,6 +2116,13 @@ impl App {
         }
     }
 
+    /// Selecting an agent acknowledges its sustained alert.
+    fn acknowledge_sustained(&mut self) {
+        if let Some(id) = self.state.selected_agent_id().cloned() {
+            self.state.sustained_alerts.remove(&id);
+        }
+    }
+
     fn move_selection(&mut self, delta: i32) {
         match self.state.panel_focus {
             PanelFocus::Left => {
@@ -2085,6 +2133,7 @@ impl App {
                 let current = self.state.selected_agent.unwrap_or(0) as i32;
                 let next = (current + delta).rem_euclid(len as i32) as usize;
                 self.state.selected_agent = Some(next);
+                self.acknowledge_sustained();
             }
             PanelFocus::Center => {}
             PanelFocus::Right => {}
@@ -2141,6 +2190,33 @@ pub fn span_matches_filter(
         }
     }
     false
+}
+
+/// What a health-score change means for an agent's sustained alert:
+/// Some(true) starts the pulse, Some(false) clears it, None leaves it.
+/// Only a downward band crossing on an unselected agent starts one; any
+/// non-worsening update clears, so a recovered agent stops pulsing even
+/// if it recovered while the developer was looking elsewhere. A downward
+/// crossing on the selected agent neither starts nor clears: the developer
+/// is already looking at it, and the one-tick flash covers the change.
+fn sustained_transition(prev: f64, score: f64, is_selected: bool) -> Option<bool> {
+    if band_rank(score) < band_rank(prev) {
+        if is_selected { None } else { Some(true) }
+    } else {
+        Some(false)
+    }
+}
+
+/// Health band as an ordinal so crossings compare cleanly: 2 healthy,
+/// 1 caution, 0 critical.
+fn band_rank(score: f64) -> u8 {
+    if score >= 80.0 {
+        2
+    } else if score >= 50.0 {
+        1
+    } else {
+        0
+    }
 }
 
 fn current_ms() -> i64 {
@@ -2227,6 +2303,35 @@ mod tests {
             Some(CommandType::InjectContext { context }) => assert_eq!(context, "extra facts"),
             other => panic!("inject_context must map with its context, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sustained_pulse_starts_on_downward_crossing_of_unselected_agent() {
+        assert_eq!(
+            sustained_transition(85.0, 45.0, false),
+            Some(true),
+            "healthy to critical on an unselected agent starts the pulse"
+        );
+        assert_eq!(
+            sustained_transition(85.0, 75.0, false),
+            Some(true),
+            "healthy to caution counts as a crossing"
+        );
+        assert_eq!(
+            sustained_transition(85.0, 45.0, true),
+            None,
+            "the selected agent gets the flash, not a sustained pulse"
+        );
+        assert_eq!(
+            sustained_transition(85.0, 82.0, false),
+            Some(false),
+            "movement inside a band clears rather than pulses"
+        );
+        assert_eq!(
+            sustained_transition(45.0, 85.0, false),
+            Some(false),
+            "recovery clears the pulse"
+        );
     }
 
     #[test]
