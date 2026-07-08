@@ -35,7 +35,7 @@ Reeve is for that moment.
 ---
 
 ```
-┌─ REEVE v0.3.0 ──────────────────────── ● research-bot  ◆72 CAUTION  $0.047 ──┐
+┌─ REEVE v0.4.0 ──────────────────────── ● research-bot  ◆72 CAUTION  $0.047 ──┐
 │ AGENTS          │ TRACE ── task-0047 ── 12.4s                   │ SPAN DETAIL│
 │                 │                                               │            │
 │ ● research-bot  │ ▾ agent.execute  ◷ 12.4s  ●                   │ gen_ai.chat│
@@ -79,7 +79,7 @@ key, no setup wizard.
 
 ## What it does
 
-Four things. In order.
+Five things. In order.
 
 **Watch.** Connect via OTel SDK integration or HTTP proxy. You get a live trace tree
 that builds as your agent works. When a span is streaming, the LLM response
@@ -100,9 +100,14 @@ not after.
 **Intervene.** Press `i`. Pause the agent, redirect it with a new instruction, inject
 context, or kill the trace. The agent applies the command at its next safe yield
 point and acknowledges every step back to the cockpit, so you watch the command
-land instead of hoping it did. Measuring whether the intervention improved quality
-and showing the delta inline in the trace tree is next on the
-[roadmap](ROADMAP.md) (v0.4.0).
+land instead of hoping it did.
+
+**Learn.** Every applied command gets a measured before/after health delta,
+shown inline in the trace tree. When a policy rule fires again, its alert
+carries the track record of what has historically fixed it. History (`3`)
+keeps completed traces; `R` replays one like a DVR, with the health gauge
+re-animating exactly as it happened, and `W` charts what an intervention
+changed against where the trend was heading.
 
 ---
 

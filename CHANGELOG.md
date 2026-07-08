@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-08
+
+### Added
+
+- Intervention outcome measurement: every applied command gets a measured
+  before/after health delta across the agent's next three completed traces
+  (the cross-trace window, ADR-0032). Outcome annotations render inline in
+  the trace tree under the span the command touched.
+- Effectiveness memory: when a policy rule fires, its alert carries the
+  track record of past interventions for that rule (`redirect: +0.42 avg ·
+  5 tries`), aggregated by rule identity with a same-framework fallback
+  below three samples (ADR-0034), and the suggested intervention is the
+  one that has historically worked.
+- View modes on `1`/`2`/`3`/`4`: Fleet (the default cockpit), Focus (one
+  agent, trace-history strip, full-width tree), History (persisted traces
+  from the warm store with cost aggregation and `d` delete), and Cost
+  (per-agent and per-model spend charts).
+- Replay mode (`R` on a History trace): DVR controls with play/pause,
+  step, four speeds, a scrubber with intervention markers, `I`/`i` marker
+  jumps, and the health gauge re-animating exactly as scores arrived.
+  Spans replay in arrival order, evaluations and commands interleave at
+  their recorded timestamps.
+- Intervention impact view (`W` on a History trace with interventions):
+  actual health and cost after the command charted against the
+  trajectory the pre-intervention trend projected.
+- Privacy tier configuration: `privacy_tier` in
+  `~/.config/reeve/config.toml`, default 1 (metadata only), tier 2
+  enables span content capture with a `consent.log` line recording the
+  decision. Read once at startup, failing closed (ADR-0035).
+- Mouse support: click to select agents and spans, click a selected span
+  to fold it, scroll any panel, click the replay scrubber to seek. `m`
+  toggles capture off for native text selection, with a `[mouse off]`
+  header indicator.
+- Command palette on `:` with incremental completion: `pause all`,
+  `resume all`, `kill all` (confirmed), `pause`/`resume agent <name>`,
+  `theme <name>`, `replay last`.
+- Live theme switching: `:theme <name>` and `T` cycling through the eight
+  bundled themes, no restart.
+- Span annotation on `n`: notes persist to the warm store, annotated
+  spans carry a diamond in the tree, and the note renders in the right
+  panel's NOTE box, in live view and replay alike.
+- Trace tree filter bar on `/`: substring match over operation and tool
+  names, non-matching rows dim rather than disappear, `Tab` cycles
+  matches even after the bar closes.
+- The rest of the navigation map: `g`/`G` jump, `Ctrl+d`/`Ctrl+u` half
+  page, `a`/`A` expand/collapse all, `z` zoom panel, `P` fleet pause,
+  `Backspace` steps back one level.
+- Copy and export: `y` copies the selected span's identity line, `Y` the
+  trace id (OSC 52, works over SSH and in tmux, ADR-0033), `e` exports
+  the loaded trace as JSON including annotations and captured content.
+- Ambient integrations: the terminal tab title carries a fleet summary
+  with the worst health band, and opt-in desktop notifications
+  (`[notifications]` in config, default off) fire for critical band
+  crossings and confirmations waiting on input.
+- Animation completeness: sustained pulse on unselected agents that
+  crossed a health band for the worse, transient bottom-right toasts for
+  the cockpit's own confirmations, and a startup wordmark that dissolves
+  into the live cockpit when the first agent connects.
+- `r` on the degraded banner actually re-probes the evaluation backend,
+  so starting Ollama after Reeve no longer requires a restart; recovery
+  raises a `tier 2 evaluation resumed` toast.
+- Alerts stack most severe first and `x` dismisses the top one.
+- `Ctrl+W`/`Ctrl+U` line editing in every text input.
+- ADRs 0032 through 0035.
+
+### Fixed
+
+- Killing an idle agent from the intervention overlay now says there is
+  nothing to kill instead of walking through a confirmation the SDK
+  would refuse.
+- The help overlay lists every key the cockpit answers to; it had not
+  been updated since before the view modes existed.
+- The Python SDK's generated gRPC bindings no longer require a `grpcio`
+  version that is not on PyPI.
+
+### Changed
+
+- Health scoring moved to `reeve-model` (`reeve_model::scoring`), so
+  replay recomputes the gauge with exactly the arithmetic the live
+  engine used; `reeve-engine` re-exports it unchanged.
+- `serde_json` is a runtime dependency of `reeve-renderer` (trace
+  export).
+
 ## [0.3.0] - 2026-07-06
 
 ### Added
@@ -179,5 +262,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI: fmt check, clippy with `-D warnings`, tests, release build.
 - Issue templates, PR template, CONTRIBUTING.md, ROADMAP.md.
 
+[0.4.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.4.0
+[0.3.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.1.0
