@@ -26,6 +26,8 @@ pub enum Action {
     HalfPageUp,
     Char(char),
     Backspace,
+    DeleteWord,
+    ClearLine,
 }
 
 /// Forwards raw terminal events to the app. The raw-key-to-action mapping
@@ -57,6 +59,8 @@ pub fn map_event(event: Event, text_input: bool) -> Option<Action> {
                 code, modifiers, ..
             }) => match (code, modifiers) {
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Action::Quit),
+                (KeyCode::Char('w'), KeyModifiers::CONTROL) => Some(Action::DeleteWord),
+                (KeyCode::Char('u'), KeyModifiers::CONTROL) => Some(Action::ClearLine),
                 (KeyCode::Esc, _) => Some(Action::Dismiss),
                 (KeyCode::Enter, _) => Some(Action::Select),
                 // Completion cycling in the command palette; the overlay
