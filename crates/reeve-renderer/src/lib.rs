@@ -1,5 +1,6 @@
 pub mod app;
 pub mod ascii;
+pub mod clipboard;
 pub mod context_windows;
 pub mod errors;
 pub mod impact;

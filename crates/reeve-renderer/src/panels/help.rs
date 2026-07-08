@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 pub fn render(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let popup = centered(48, 14, area);
+    let popup = centered(52, 30, area);
 
     let key = Style::default().fg(theme.highlight());
     let desc = Style::default().fg(theme.text());
@@ -16,11 +16,24 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme) {
     let rows: &[(&str, &str)] = &[
         ("j / k", "navigate up/down"),
         ("h / l", "switch panel left/right"),
-        ("Tab / Shift-Tab", "switch panel"),
+        ("g / G", "jump to top / bottom"),
+        ("Ctrl-d / Ctrl-u", "half page down / up"),
         ("Enter", "expand / fold span"),
-        ("PageUp / PageDown", "scroll"),
+        ("a / A", "expand all / collapse all"),
+        ("z", "zoom focused panel"),
+        ("Backspace", "step back one level"),
+        ("1 2 3 4", "fleet / focus / history / cost"),
+        ("R / W", "replay / impact (history)"),
+        ("i", "intervention menu"),
+        ("p / P", "pause agent / pause fleet"),
+        (":", "command palette"),
+        ("/", "filter trace tree"),
+        ("n", "annotate span"),
+        ("y / Y", "copy span / trace id"),
+        ("e", "export trace json"),
+        ("T", "cycle theme"),
+        ("m", "toggle mouse capture"),
         ("?", "toggle this overlay"),
-        ("Esc", "close overlay"),
         ("q  /  Ctrl-c", "quit"),
     ];
 
