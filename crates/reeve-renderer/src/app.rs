@@ -1065,6 +1065,44 @@ impl App {
                         Some(self.state.filter_applied.clone().unwrap_or_default());
                 }
             }
+            Action::Char('y') => {
+                let copied = self.state.trace.as_ref().and_then(|tv| {
+                    let id = tv.selected.as_ref()?;
+                    let span = tv.spans.get(id)?;
+                    let dur = span
+                        .end_time
+                        .map(|e| format!("{} ms", e - span.start_time))
+                        .unwrap_or_else(|| "running".to_string());
+                    Some(format!(
+                        "{} · {} · {} · {:?}",
+                        span.operation,
+                        id.as_str(),
+                        dur,
+                        span.status
+                    ))
+                });
+                if let Some(text) = copied {
+                    crate::clipboard::copy(&text);
+                    self.state.toast("span copied");
+                }
+            }
+            Action::Char('Y') => {
+                if let Some(id) = self.state.trace.as_ref().map(|tv| tv.trace_id.clone()) {
+                    crate::clipboard::copy(id.as_str());
+                    self.state.toast("trace id copied");
+                }
+            }
+            Action::Char('e') => {
+                if let Some(trace_id) = self.state.trace.as_ref().map(|tv| tv.trace_id.clone()) {
+                    match self.export_trace(&trace_id).await {
+                        Ok(path) => self.state.toast(format!("exported {path}")),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "trace export failed");
+                            self.state.toast("export failed");
+                        }
+                    }
+                }
+            }
             Action::Char('n') => {
                 if let Some(span_id) = self.state.trace.as_ref().and_then(|tv| tv.selected.clone())
                 {
@@ -1837,6 +1875,61 @@ impl App {
             }
         }
         self.state.palette = None;
+    }
+
+    /// Writes the loaded trace as JSON next to the working directory:
+    /// trace, spans, evaluations, commands, and notes. Span content rides
+    /// along when the privacy tier captured it, the same visibility the
+    /// cockpit itself has.
+    async fn export_trace(&self, trace_id: &TraceId) -> Result<String, String> {
+        let trace = self
+            .warm
+            .get_trace(trace_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("trace not found")?;
+        let spans = self
+            .warm
+            .list_spans_for_trace(trace_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let evaluations = self
+            .warm
+            .list_evaluations_for_trace(trace_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let commands = self
+            .warm
+            .list_commands_for_trace(trace_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let notes = self
+            .warm
+            .span_notes_for_trace(trace_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let content = self
+            .warm
+            .span_content_for_trace(trace_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let doc = serde_json::json!({
+            "trace": trace,
+            "spans": spans,
+            "evaluations": evaluations,
+            "commands": commands,
+            "notes": notes.values().collect::<Vec<_>>(),
+            "span_content": content,
+        });
+        let short: String = trace_id.as_str().chars().take(8).collect();
+        let path = format!("reeve-export-{short}.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(path)
     }
 
     fn agent_id_by_name(&self, name: &str) -> Option<AgentId> {

@@ -4,6 +4,7 @@ version = "0.3.0"
 edition = "2024"
 
 [dependencies]
+serde_json = { workspace = true }
 reeve-model = { path = "../reeve-model" }
 reeve-storage = { path = "../reeve-storage" }
 reeve-intervention = { path = "../reeve-intervention" }
@@ -17,4 +18,3 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
