@@ -89,6 +89,7 @@ pub async fn run(
     ascii_mode: bool,
     dispatcher: Arc<Dispatcher>,
     notifications_enabled: bool,
+    reprobe_requested: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), RendererError> {
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
@@ -103,6 +104,7 @@ pub async fn run(
         ascii_mode,
         dispatcher,
         notifications_enabled,
+        reprobe_requested,
     )
     .await;
 
@@ -122,6 +124,7 @@ async fn run_inner(
     ascii_mode: bool,
     dispatcher: Arc<Dispatcher>,
     notifications_enabled: bool,
+    reprobe_requested: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), RendererError> {
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -131,6 +134,7 @@ async fn run_inner(
     let mut theme = Theme::load();
     let mut app = App::new(ingestion_rx, engine_event_rx, warm, dispatcher).await;
     app.state.notifications_enabled = notifications_enabled;
+    app.reprobe_requested = Some(reprobe_requested);
 
     let (event_tx, mut event_rx) = mpsc::channel(64);
     tokio::spawn(async move {

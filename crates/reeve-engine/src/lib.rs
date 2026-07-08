@@ -31,12 +31,18 @@ pub type DispatchSender = mpsc::Sender<(AgentId, InterventionCommand)>;
 /// pattern as the NTP offset map and the paused-agents set.
 pub type AppliedCommands = Arc<std::sync::Mutex<Vec<AppliedCommand>>>;
 
+/// Set by the renderer when the developer presses r on the degraded
+/// banner; consumed by the engine, which re-probes the evaluation backend.
+/// Same shared-state pattern as the NTP offset map and the paused set.
+pub type ReprobeRequested = Arc<std::sync::atomic::AtomicBool>;
+
 pub async fn run(
     mut ingestion_rx: broadcast::Receiver<IngestionEvent>,
     engine_tx: broadcast::Sender<EngineEvent>,
     warm: Arc<WarmStore>,
     dispatch_tx: Option<DispatchSender>,
     applied_commands: Option<AppliedCommands>,
+    reprobe_requested: Option<ReprobeRequested>,
 ) {
     let backend = llm_judge::probe().await;
     let (backend_name, backend_reason) = match &backend {
@@ -50,12 +56,15 @@ pub async fn run(
         .unwrap_or_else(|_| PathBuf::from(".config/reeve/config.toml"));
 
     tracing::info!(backend = %backend_name, "evaluation backend ready");
+    // Read once at startup, resent unchanged on reprobe: the privacy tier
+    // deliberately does not reload while Reeve runs.
+    let startup_privacy_tier = policy::config::load_privacy_tier(&config_path);
     let _ = engine_tx.send(EngineEvent::EvaluationBackendReady {
         backend: backend_name,
         reason: backend_reason,
-        privacy_tier: policy::config::load_privacy_tier(&config_path),
+        privacy_tier: startup_privacy_tier,
     });
-    let judge = Arc::new(LlmJudge::new(backend));
+    let mut judge = Arc::new(LlmJudge::new(backend));
 
     let mut fingerprints: HashMap<AgentId, AgentFingerprint> = HashMap::new();
     let mut score_histories: HashMap<AgentId, VecDeque<f64>> = HashMap::new();
@@ -106,8 +115,37 @@ pub async fn run(
         Box::new(FingerprintDeviationEvaluator),
     ];
 
+    // The reprobe flag needs a timer, not event piggybacking: with no
+    // agents connected there are no events, and that is exactly when a
+    // developer is most likely to be starting Ollama.
+    let mut reprobe_tick = tokio::time::interval(std::time::Duration::from_secs(2));
+
     loop {
         let event = tokio::select! {
+            _ = reprobe_tick.tick() => {
+                let requested = reprobe_requested
+                    .as_ref()
+                    .is_some_and(|f| f.swap(false, std::sync::atomic::Ordering::Relaxed));
+                if requested {
+                    let backend = llm_judge::probe().await;
+                    let (backend_name, backend_reason) = match &backend {
+                        llm_judge::JudgeBackend::Local { model, .. } => {
+                            (format!("local ({})", model), None)
+                        }
+                        llm_judge::JudgeBackend::Disabled { reason } => {
+                            ("disabled".to_string(), Some(reason.clone()))
+                        }
+                    };
+                    tracing::info!(backend = %backend_name, "evaluation backend re-probed");
+                    let _ = engine_tx.send(EngineEvent::EvaluationBackendReady {
+                        backend: backend_name,
+                        reason: backend_reason,
+                        privacy_tier: startup_privacy_tier,
+                    });
+                    judge = Arc::new(LlmJudge::new(backend));
+                }
+                continue;
+            }
             _ = reload_signal.recv() => {
                 let db_rules = warm.load_policy_rules().await.unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "failed to reload policy rules from database");
