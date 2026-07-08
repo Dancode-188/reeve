@@ -7,32 +7,41 @@
 //! never logged, persisted, or attached to any synthesized span.
 
 use crate::normalize::PipelineSpan;
+use crate::sse::SseAccumulator;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
+use futures_util::StreamExt;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::trace::v1::Span as OtlpSpan;
 use opentelemetry_proto::tonic::trace::v1::Status as OtlpStatus;
 use reeve_model::entity::IntegrationPath;
+use reeve_model::signal::IngestionEvent;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
+/// A stream that goes silent for this long is dead: cancel upstream and
+/// finalize with what accumulated.
+const DEFAULT_STREAM_CHUNK_TIMEOUT_MS: u64 = 30_000;
 
 struct ProxyState {
     client: reqwest::Client,
     upstream: String,
     pipeline_tx: mpsc::Sender<PipelineSpan>,
+    signal_tx: broadcast::Sender<IngestionEvent>,
     /// Overrides User-Agent derivation when set (REEVE_PROXY_AGENT_NAME).
     agent_name_override: Option<String>,
+    stream_chunk_timeout: std::time::Duration,
 }
 
 pub async fn run(
     addr: SocketAddr,
     pipeline_tx: mpsc::Sender<PipelineSpan>,
+    signal_tx: broadcast::Sender<IngestionEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let upstream =
         std::env::var("REEVE_PROXY_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
@@ -40,7 +49,9 @@ pub async fn run(
         addr,
         upstream,
         std::env::var("REEVE_PROXY_AGENT_NAME").ok(),
+        std::time::Duration::from_millis(DEFAULT_STREAM_CHUNK_TIMEOUT_MS),
         pipeline_tx,
+        signal_tx,
     )
     .await
 }
@@ -49,13 +60,17 @@ pub async fn run_with(
     addr: SocketAddr,
     upstream: String,
     agent_name_override: Option<String>,
+    stream_chunk_timeout: std::time::Duration,
     pipeline_tx: mpsc::Sender<PipelineSpan>,
+    signal_tx: broadcast::Sender<IngestionEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = Arc::new(ProxyState {
         client: reqwest::Client::new(),
         upstream,
         pipeline_tx,
+        signal_tx,
         agent_name_override,
+        stream_chunk_timeout,
     });
 
     let app = axum::Router::new()
@@ -121,10 +136,14 @@ async fn forward(
         .is_some_and(|ct| ct.starts_with("text/event-stream"));
 
     if streaming {
-        // SSE passes through chunk by chunk with nothing buffered; span
-        // synthesis for streams is the next milestone item.
-        let stream = upstream_resp.bytes_stream();
-        return build_response(status, &resp_headers, Body::from_stream(stream));
+        let body = stream_and_accumulate(
+            state.clone(),
+            upstream_resp,
+            headers.clone(),
+            arrived,
+            overhead_ms,
+        );
+        return build_response(status, &resp_headers, body);
     }
 
     let resp_body = match upstream_resp.bytes().await {
@@ -168,6 +187,209 @@ fn build_response(status: reqwest::StatusCode, headers: &HeaderMap, body: Body) 
     builder
         .body(body)
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// How a stream ended. Every path out of a stream produces exactly one
+/// of these, and every one finalizes the span.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StreamOutcome {
+    Completed,
+    /// The client dropped the connection mid-stream. Upstream is
+    /// cancelled immediately so tokens stop being generated. Not a
+    /// failure: closing a tool is behavior, not breakage.
+    ClientDisconnected,
+    /// The upstream sent an error event or the connection to it died.
+    /// The error was forwarded to the client unchanged; retrying is the
+    /// client SDK's decision, never the proxy's.
+    ApiFailed,
+    /// No chunk arrived within the per-chunk timeout.
+    StreamTimedOut,
+}
+
+impl StreamOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            StreamOutcome::Completed => "completed",
+            StreamOutcome::ClientDisconnected => "client_disconnected",
+            StreamOutcome::ApiFailed => "api_failed",
+            StreamOutcome::StreamTimedOut => "stream_timed_out",
+        }
+    }
+}
+
+/// Forwards SSE chunks to the client the moment they arrive while a side
+/// accumulator reconstructs the round trip. Chunks go client-first: the
+/// send happens before the parse, so the proxy adds no latency the
+/// client can observe. Emits StreamingUpdate per text delta so the
+/// cockpit's streaming box renders the generation live, and finalizes a
+/// span through every exit path.
+fn stream_and_accumulate(
+    state: Arc<ProxyState>,
+    upstream_resp: reqwest::Response,
+    req_headers: HeaderMap,
+    arrived: SystemTime,
+    overhead_ms: f64,
+) -> Body {
+    let (body_tx, body_rx) = mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+
+    tokio::spawn(async move {
+        let mut upstream = upstream_resp.bytes_stream();
+        let mut acc = SseAccumulator::default();
+        let trace_id = random_bytes(16);
+        let span_id = random_bytes(8);
+        let span_id_hex: String = span_id.iter().map(|b| format!("{:02x}", b)).collect();
+        let trace_id_hex: String = trace_id.iter().map(|b| format!("{:02x}", b)).collect();
+        let mut first_chunk_at: Option<SystemTime> = None;
+        let mut outcome = StreamOutcome::Completed;
+
+        loop {
+            let next = tokio::time::timeout(state.stream_chunk_timeout, upstream.next()).await;
+            let chunk = match next {
+                Err(_) => {
+                    outcome = StreamOutcome::StreamTimedOut;
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(Err(e))) => {
+                    tracing::debug!(error = %e, "upstream stream error");
+                    outcome = StreamOutcome::ApiFailed;
+                    break;
+                }
+                Ok(Some(Ok(chunk))) => chunk,
+            };
+            first_chunk_at.get_or_insert_with(SystemTime::now);
+
+            // Client first: nothing the accumulator does may delay the
+            // chunk. A failed send means the client is gone; cancel
+            // upstream by leaving the loop, which drops the connection.
+            if body_tx.send(Ok(chunk.clone())).await.is_err() {
+                outcome = StreamOutcome::ClientDisconnected;
+                break;
+            }
+
+            let update = acc.feed(&chunk);
+            if update.api_failed {
+                outcome = StreamOutcome::ApiFailed;
+                // Keep forwarding whatever follows the error event; the
+                // upstream closes the stream on its own terms.
+            }
+            if update.content_changed {
+                let _ = state.signal_tx.send(IngestionEvent::StreamingUpdate {
+                    trace_id: trace_id_hex.clone().into(),
+                    span_id: span_id_hex.clone().into(),
+                    content: acc.content.clone(),
+                });
+            }
+        }
+        drop(body_tx);
+
+        let ttft_ms = first_chunk_at.and_then(|t| {
+            t.duration_since(arrived)
+                .ok()
+                .map(|d| d.as_secs_f64() * 1e3)
+        });
+        finalize_stream_span(
+            &state,
+            &req_headers,
+            acc,
+            outcome,
+            trace_id,
+            span_id,
+            arrived,
+            ttft_ms,
+            overhead_ms,
+        )
+        .await;
+    });
+
+    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(body_rx))
+}
+
+/// The streaming counterpart of synthesize_span: same shape of span,
+/// built from the accumulator, plus the outcome and time-to-first-token.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_stream_span(
+    state: &ProxyState,
+    req_headers: &HeaderMap,
+    acc: SseAccumulator,
+    outcome: StreamOutcome,
+    trace_id: Vec<u8>,
+    span_id: Vec<u8>,
+    arrived: SystemTime,
+    ttft_ms: Option<f64>,
+    overhead_ms: f64,
+) {
+    let model = acc.model.unwrap_or_else(|| "unknown".to_string());
+    let mut attributes = vec![
+        kv_str("gen_ai.system", "anthropic"),
+        kv_str("gen_ai.operation.name", "chat"),
+        kv_str("gen_ai.request.model", &model),
+        kv_int("gen_ai.usage.input_tokens", acc.input_tokens as i64),
+        kv_int("gen_ai.usage.output_tokens", acc.output_tokens as i64),
+        kv_int(
+            "gen_ai.usage.total_tokens",
+            (acc.input_tokens + acc.output_tokens) as i64,
+        ),
+        kv_str("reeve.proxy.stream_outcome", outcome.label()),
+        kv_double("reeve.proxy.overhead_ms", overhead_ms),
+    ];
+    if let Some(ttft) = ttft_ms {
+        attributes.push(kv_double("reeve.proxy.ttft_ms", ttft));
+    }
+    if acc.cache_read_tokens > 0 {
+        attributes.push(kv_int(
+            "gen_ai.usage.cache_read_tokens",
+            acc.cache_read_tokens as i64,
+        ));
+    }
+    if let Some(cost) = crate::pricing::estimate(
+        &model,
+        acc.input_tokens,
+        acc.output_tokens,
+        acc.cache_read_tokens,
+        acc.cache_creation_tokens,
+    ) {
+        attributes.push(kv_double("gen_ai.usage.cost", cost));
+    }
+
+    // Upstream failures and timeouts are failures; a client disconnect
+    // is not, because a developer closing their tool is behavior.
+    let status_code = match outcome {
+        StreamOutcome::ApiFailed | StreamOutcome::StreamTimedOut => 2,
+        StreamOutcome::Completed | StreamOutcome::ClientDisconnected => 1,
+    };
+
+    let span = OtlpSpan {
+        trace_id,
+        span_id,
+        name: "gen_ai.chat".to_string(),
+        start_time_unix_nano: to_nanos(arrived),
+        end_time_unix_nano: to_nanos(SystemTime::now()),
+        attributes,
+        status: Some(OtlpStatus {
+            code: status_code,
+            message: String::new(),
+        }),
+        ..Default::default()
+    };
+
+    let service_name = state
+        .agent_name_override
+        .clone()
+        .unwrap_or_else(|| derive_agent_name(req_headers));
+
+    let ps = PipelineSpan {
+        span,
+        service_name,
+        service_instance_id: "proxy".to_string(),
+        framework: "proxy".to_string(),
+        arrived_at: to_millis(arrived),
+        clock_offset_ms: 0,
+        integration: IntegrationPath::Proxy,
+    };
+    if state.pipeline_tx.send(ps).await.is_err() {
+        tracing::warn!("normalize stage unavailable, stream span discarded");
+    }
 }
 
 /// One Messages API round trip becomes one gen_ai.chat span carrying the
@@ -373,6 +595,7 @@ mod tests {
         });
 
         let (tx, rx) = mpsc::channel(8);
+        let (signal_tx, _) = broadcast::channel(64);
         let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         drop(proxy_listener);
@@ -380,10 +603,125 @@ mod tests {
             proxy_addr,
             format!("http://{}", upstream_addr),
             None,
+            std::time::Duration::from_millis(500),
             tx,
+            signal_tx,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         (format!("http://{}", proxy_addr), rx)
+    }
+
+    /// A mock upstream that speaks SSE with controllable behavior, plus
+    /// the proxy in front of it. Returns the proxy URL, the pipeline
+    /// receiver, and a subscription to the streaming signal.
+    async fn spawn_sse_proxy(
+        mode: &'static str,
+    ) -> (
+        String,
+        mpsc::Receiver<PipelineSpan>,
+        broadcast::Receiver<IngestionEvent>,
+    ) {
+        let upstream_app = axum::Router::new().route(
+            "/v1/messages",
+            post(move || async move {
+                let (tx, rx) = mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+                tokio::spawn(async move {
+                    let start = r#"event: message_start
+data: {"type":"message_start","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+
+"#;
+                    let _ = tx.send(Ok(start.into())).await;
+                    match mode {
+                        "complete" => {
+                            for word in ["one", "two", "three"] {
+                                let delta = format!(
+                                    r#"event: content_block_delta
+data: {{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{word} "}}}}
+
+"#
+                                );
+                                let _ = tx.send(Ok(delta.into())).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            }
+                            let tail = r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":30}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+                            let _ = tx.send(Ok(tail.into())).await;
+                        }
+                        "api_error" => {
+                            let err = r#"event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"busy"}}
+
+"#;
+                            let _ = tx.send(Ok(err.into())).await;
+                        }
+                        "hang" => {
+                            // One delta, then silence far past the proxy's
+                            // per-chunk timeout.
+                            let delta = r#"event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"then nothing"}}
+
+"#;
+                            let _ = tx.send(Ok(delta.into())).await;
+                            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                        }
+                        "endless" => {
+                            // Chunks forever, for the client-walks-away case.
+                            loop {
+                                let delta = r#"event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
+
+"#;
+                                if tx.send(Ok(delta.into())).await.is_err() {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                });
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(
+                        tokio_stream::wrappers::ReceiverStream::new(rx),
+                    ))
+                    .unwrap()
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let (tx, rx) = mpsc::channel(8);
+        let (signal_tx, signal_rx) = broadcast::channel(256);
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+        tokio::spawn(run_with(
+            proxy_addr,
+            format!("http://{}", upstream_addr),
+            None,
+            std::time::Duration::from_millis(500),
+            tx,
+            signal_tx,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        (format!("http://{}", proxy_addr), rx, signal_rx)
+    }
+
+    fn str_attr<'a>(span: &'a OtlpSpan, key: &str) -> Option<&'a str> {
+        match attr(span, key) {
+            Some(any_value::Value::StringValue(v)) => Some(v.as_str()),
+            _ => None,
+        }
     }
 
     fn attr<'a>(span: &'a OtlpSpan, key: &str) -> Option<&'a any_value::Value> {
@@ -509,6 +847,128 @@ mod tests {
         assert_eq!(derive_agent_name(&headers), "curl");
 
         assert_eq!(derive_agent_name(&HeaderMap::new()), "proxy-agent");
+    }
+
+    #[tokio::test]
+    async fn streaming_round_trip_synthesizes_and_emits_live_updates() {
+        let (base, mut rx, mut signal_rx) = spawn_sse_proxy("complete").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(r#"{"stream":true}"#)
+            .send()
+            .await
+            .unwrap();
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("one ") && body.contains("message_stop"),
+            "SSE passes through verbatim"
+        );
+
+        let ps = rx.recv().await.expect("stream must finalize a span");
+        assert_eq!(
+            str_attr(&ps.span, "reeve.proxy.stream_outcome"),
+            Some("completed")
+        );
+        assert_eq!(
+            str_attr(&ps.span, "gen_ai.request.model"),
+            Some("claude-opus-4-8")
+        );
+        assert!(
+            attr(&ps.span, "reeve.proxy.ttft_ms").is_some(),
+            "TTFT recorded"
+        );
+        // Opus: 1000 in + 30 out = 0.005 + 0.00075.
+        match attr(&ps.span, "gen_ai.usage.cost") {
+            Some(any_value::Value::DoubleValue(c)) => assert!((c - 0.00575).abs() < 1e-9),
+            other => panic!("cost missing: {other:?}"),
+        }
+        assert_eq!(ps.span.status.as_ref().map(|s| s.code), Some(1));
+
+        // The streaming box producer: accumulated content grows.
+        let mut last = String::new();
+        while let Ok(ev) = signal_rx.try_recv() {
+            if let IngestionEvent::StreamingUpdate { content, .. } = ev {
+                last = content;
+            }
+        }
+        assert_eq!(last, "one two three ", "live updates accumulate the text");
+    }
+
+    #[tokio::test]
+    async fn upstream_error_event_finalizes_as_api_failed() {
+        let (base, mut rx, _sig) = spawn_sse_proxy("api_error").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("overloaded_error"),
+            "error forwarded to the client unchanged"
+        );
+        let ps = rx.recv().await.unwrap();
+        assert_eq!(
+            str_attr(&ps.span, "reeve.proxy.stream_outcome"),
+            Some("api_failed")
+        );
+        assert_eq!(ps.span.status.as_ref().map(|s| s.code), Some(2));
+    }
+
+    #[tokio::test]
+    async fn silent_stream_finalizes_as_timed_out() {
+        let (base, mut rx, _sig) = spawn_sse_proxy("hang").await;
+        let client = reqwest::Client::new();
+        let handle = tokio::spawn(async move {
+            let resp = client
+                .post(format!("{base}/v1/messages"))
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            let _ = resp.text().await;
+        });
+        let ps = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("span must finalize within the chunk timeout")
+            .unwrap();
+        assert_eq!(
+            str_attr(&ps.span, "reeve.proxy.stream_outcome"),
+            Some("stream_timed_out")
+        );
+        assert_eq!(ps.span.status.as_ref().map(|s| s.code), Some(2));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn client_walking_away_finalizes_without_failure() {
+        let (base, mut rx, _sig) = spawn_sse_proxy("endless").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        // Read a little, then hang up mid-generation.
+        let mut stream = resp.bytes_stream();
+        let _ = stream.next().await;
+        drop(stream);
+
+        let ps = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("disconnect must finalize the span")
+            .unwrap();
+        assert_eq!(
+            str_attr(&ps.span, "reeve.proxy.stream_outcome"),
+            Some("client_disconnected")
+        );
+        assert_eq!(
+            ps.span.status.as_ref().map(|s| s.code),
+            Some(1),
+            "closing a tool is behavior, not breakage"
+        );
     }
 
     #[test]
