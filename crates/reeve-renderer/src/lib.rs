@@ -217,7 +217,19 @@ async fn run_inner(
                         panels = split(chunks[1]);
                     }
 
-                    panels::render(frame, &panels, &app.state, &theme, &ascii);
+                    if app.state.agents.is_empty() {
+                        // No agent has connected yet: the cockpit waits
+                        // visibly instead of rendering empty sections.
+                        panels::skeleton::render(
+                            frame,
+                            full.body,
+                            app.state.streaming.cursor_tick,
+                            ascii.enabled(),
+                            &theme,
+                        );
+                    } else {
+                        panels::render(frame, &panels, &app.state, &theme, &ascii);
+                    }
                     if let Some((_, ref buffer)) = app.state.note_input {
                         let row = ratatui::layout::Rect {
                             y: full.footer.y.saturating_sub(1),
@@ -257,6 +269,7 @@ async fn run_inner(
                             view_mode,
                         );
                     }
+                    panels::toast::render(frame, full.body, &app.state.toasts, &theme);
                     if app.state.show_help {
                         panels::render_help_overlay(frame, frame.area(), &theme);
                     }

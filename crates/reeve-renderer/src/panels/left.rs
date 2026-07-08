@@ -92,6 +92,11 @@ fn render_agents(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         let name = truncate(&agent_state.agent.name, max_name);
 
         let flash_color = state.flash_color(&FlashTarget::AgentRow(agent_id.clone()), theme);
+        // Sustained pulse: an unselected agent that crossed a health band
+        // for the worse keeps pulsing in the new band's color until it is
+        // selected or recovers. Slow cycle, same cadence as the live dot.
+        let sustained = state.sustained_alerts.get(agent_id).copied();
+        let pulse_on = (state.streaming.cursor_tick / 7) % 2 == 0;
         let name_style = if is_selected {
             Style::default()
                 .fg(theme.background())
@@ -99,6 +104,15 @@ fn render_agents(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                 .add_modifier(Modifier::BOLD)
         } else if let Some(c) = flash_color {
             Style::default().fg(c).add_modifier(Modifier::BOLD)
+        } else if let Some(score) = sustained {
+            let band = health_color(score, theme);
+            if pulse_on {
+                Style::default().fg(band).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(band)
+                    .add_modifier(Modifier::BOLD | Modifier::DIM)
+            }
         } else {
             Style::default()
                 .fg(theme.text())
