@@ -1599,12 +1599,14 @@ name = "reeve-ingestion"
 version = "0.4.0"
 dependencies = [
  "axum 0.8.9",
+ "futures-util",
  "opentelemetry-proto 0.32.0",
  "reeve-model",
  "reeve-storage",
  "reqwest",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tonic 0.14.6",
  "tonic-health",
  "tracing",

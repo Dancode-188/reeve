@@ -4,6 +4,7 @@ pub mod pricing;
 pub mod proxy;
 pub mod receive;
 pub mod route;
+pub mod sse;
 
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
 use receive::OtlpReceiver;
@@ -36,8 +37,9 @@ pub async fn serve(
     // The HTTP proxy is a second producer into the same pipeline: spans it
     // synthesizes are normalized, assembled, and routed like SDK spans.
     let proxy_pipeline_tx = pipeline_tx.clone();
+    let proxy_signal_tx = signal_tx.clone();
     tokio::spawn(async move {
-        if let Err(e) = proxy::run(proxy_addr, proxy_pipeline_tx).await {
+        if let Err(e) = proxy::run(proxy_addr, proxy_pipeline_tx, proxy_signal_tx).await {
             tracing::error!(error = %e, "HTTP proxy exited");
         }
     });

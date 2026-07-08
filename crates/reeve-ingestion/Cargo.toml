@@ -10,6 +10,8 @@ opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic", "trace"] }
 tonic = { workspace = true }
 axum = "0.8"
 reqwest = { workspace = true, features = ["stream"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
 tonic-health = "0.14.6"
 tokio = { workspace = true }
 tracing = { workspace = true }
