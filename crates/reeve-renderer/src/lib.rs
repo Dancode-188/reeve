@@ -88,14 +88,29 @@ pub async fn run(
     warm: Arc<WarmStore>,
     ascii_mode: bool,
     dispatcher: Arc<Dispatcher>,
+    notifications_enabled: bool,
 ) -> Result<(), RendererError> {
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    // Save the terminal title (XTWINOPS 22) so exit can restore whatever
+    // the shell had; SetTitle below overwrites it while Reeve runs.
+    print!("\x1b[22;0t");
 
-    let result = run_inner(ingestion_rx, engine_event_rx, warm, ascii_mode, dispatcher).await;
+    let result = run_inner(
+        ingestion_rx,
+        engine_event_rx,
+        warm,
+        ascii_mode,
+        dispatcher,
+        notifications_enabled,
+    )
+    .await;
 
     let _ = disable_raw_mode();
     let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    print!("\x1b[23;0t");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
 
     result
 }
@@ -106,6 +121,7 @@ async fn run_inner(
     warm: Arc<WarmStore>,
     ascii_mode: bool,
     dispatcher: Arc<Dispatcher>,
+    notifications_enabled: bool,
 ) -> Result<(), RendererError> {
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -114,6 +130,7 @@ async fn run_inner(
     let ascii = AsciiMode::new(ascii_mode);
     let mut theme = Theme::load();
     let mut app = App::new(ingestion_rx, engine_event_rx, warm, dispatcher).await;
+    app.state.notifications_enabled = notifications_enabled;
 
     let (event_tx, mut event_rx) = mpsc::channel(64);
     tokio::spawn(async move {
@@ -123,6 +140,7 @@ async fn run_inner(
     // 15fps: live enough to feel responsive, low enough to not burn CPU on a monitoring tool.
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(66));
     let mut mouse_captured = true;
+    let mut last_title = String::new();
 
     loop {
         tokio::select! {
@@ -166,6 +184,17 @@ async fn run_inner(
                             theme = new_theme;
                         }
                     }
+                }
+
+                // Terminal tab title: update only when the summary changes,
+                // not every tick; title writes are visible side effects.
+                let title = app.state.title_summary();
+                if title != last_title {
+                    let _ = execute!(
+                        std::io::stdout(),
+                        crossterm::terminal::SetTitle(&title)
+                    );
+                    last_title = title;
                 }
 
                 // Reconcile the terminal's capture state with the m toggle.

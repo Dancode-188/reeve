@@ -259,6 +259,11 @@ pub struct AppState {
     pub filter_applied: Option<String>,
     /// Theme name the palette or T selected; the render loop applies it.
     pub pending_theme: Option<String>,
+    /// Desktop notifications opt-in, read from config at startup.
+    pub notifications_enabled: bool,
+    /// Last health score seen per agent, feeding the terminal-title
+    /// fleet summary.
+    pub latest_agent_health: HashMap<AgentId, f64>,
     /// Agents whose health crossed a band boundary for the worse while not
     /// selected. Their AGENTS rows pulse in the new band's color until the
     /// developer selects them or the score recovers. Peripheral vision for
@@ -294,6 +299,24 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Raise a desktop notification when the developer opted in and the
+    /// system has notify-send; silently does nothing otherwise. Reserved
+    /// for events worth interrupting over: a critical band crossing and a
+    /// policy alert waiting on confirmation.
+    pub fn notify(&self, body: &str) {
+        if !self.notifications_enabled {
+            return;
+        }
+        let body = body.to_string();
+        tokio::spawn(async move {
+            let _ = tokio::process::Command::new("notify-send")
+                .arg("Reeve")
+                .arg(&body)
+                .output()
+                .await;
+        });
+    }
+
     /// Queue a transient notice. Three seconds at the 15fps tick rate.
     pub fn toast(&mut self, text: impl Into<String>) {
         self.toasts.push_back((text.into(), 45));
@@ -325,6 +348,34 @@ impl AppState {
             FlashDirection::Neutral => theme.text(),
             FlashDirection::Alert => theme.health_warn(),
         })
+    }
+
+    /// Compact fleet summary for the terminal tab title: agent count and
+    /// the worst band when anything is below healthy. A glance at the tab
+    /// bar answers "is anything wrong" without switching to it.
+    pub fn title_summary(&self) -> String {
+        let n = self.agents.len();
+        if n == 0 {
+            return "reeve".to_string();
+        }
+        let critical = self
+            .latest_agent_health
+            .values()
+            .filter(|s| **s < 50.0)
+            .count();
+        let caution = self
+            .latest_agent_health
+            .values()
+            .filter(|s| **s >= 50.0 && **s < 80.0)
+            .count();
+        let plural = if n == 1 { "agent" } else { "agents" };
+        if critical > 0 {
+            format!("reeve: {n} {plural}, {critical} critical")
+        } else if caution > 0 {
+            format!("reeve: {n} {plural}, {caution} caution")
+        } else {
+            format!("reeve: {n} {plural}")
+        }
     }
 
     pub fn selected_agent_id(&self) -> Option<&AgentId> {
@@ -404,6 +455,8 @@ impl App {
                 filter_input: None,
                 filter_applied: None,
                 pending_theme: None,
+                notifications_enabled: false,
+                latest_agent_health: HashMap::new(),
                 sustained_alerts: HashMap::new(),
                 toasts: VecDeque::new(),
                 zoomed: false,
@@ -483,6 +536,9 @@ impl App {
                 weight_coverage,
                 tier2_pending,
             } => {
+                self.state
+                    .latest_agent_health
+                    .insert(agent_id.clone(), score);
                 let prev = self.state.prev_health_score;
                 self.state.prev_health_score = Some(score);
                 self.state.health_score = Some(score);
@@ -510,6 +566,16 @@ impl App {
                     match sustained_transition(prev_score, score, is_selected) {
                         Some(true) => {
                             self.state.sustained_alerts.insert(agent_id.clone(), score);
+                            if score < 50.0 {
+                                let name = self
+                                    .state
+                                    .agents
+                                    .get(&agent_id)
+                                    .map(|a| a.agent.name.clone())
+                                    .unwrap_or_else(|| agent_id.to_string());
+                                self.state
+                                    .notify(&format!("{name} is critical (health {score:.0})"));
+                            }
                         }
                         Some(false) => {
                             self.state.sustained_alerts.remove(&agent_id);
@@ -602,6 +668,8 @@ impl App {
                     self.state.active_suggestion = Some(s);
                 }
                 if requires_confirmation {
+                    self.state
+                        .notify(&format!("policy alert needs confirmation: {description}"));
                     if let Some(agent_id) = self.state.selected_agent_id().cloned() {
                         self.state.pending_confirmation = Some(PendingConfirmation {
                             agent_id,
