@@ -16,6 +16,10 @@ pub struct PipelineSpan {
     pub framework: String,
     pub arrived_at: Timestamp,
     pub clock_offset_ms: i64,
+    /// How this span reached Reeve: the OTel receiver stamps Sdk, the
+    /// HTTP proxy stamps Proxy. Carried onto the synthesized Agent so
+    /// the cockpit can state proxy agents' reduced capabilities.
+    pub integration: IntegrationPath,
 }
 
 pub trait AttributeTranslator: Send + Sync {
@@ -171,7 +175,7 @@ impl AttributeTranslator for V1AttributeTranslator {
             id: reeve_model::ids::agent_id_from_service(&ps.service_name, &ps.service_instance_id),
             name: ps.service_name,
             framework: ps.framework,
-            integration: IntegrationPath::Sdk,
+            integration: ps.integration,
             status: AgentStatus::Running,
             first_seen_at: ps.arrived_at,
             last_seen_at: ps.arrived_at,
@@ -251,6 +255,7 @@ mod tests {
             framework: "opentelemetry".to_string(),
             arrived_at: 1_000_000,
             clock_offset_ms: 0,
+            integration: IntegrationPath::Sdk,
         }
     }
 

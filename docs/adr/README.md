@@ -40,6 +40,7 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0033](./0033-clipboard-via-osc-52.md) | Clipboard via OSC 52, Not a Native Library | Accepted | 2026-07-08 |
 | [0034](./0034-effectiveness-memory-keyed-by-rule-identity.md) | Effectiveness Memory Keyed by Rule Identity, Not Metric | Accepted | 2026-07-08 |
 | [0035](./0035-privacy-tier-read-once-fails-closed.md) | Privacy Tier Read Once at Startup, Failing Closed | Accepted | 2026-07-08 |
+| [0036](./0036-proxy-agent-identity-from-user-agent.md) | Proxy Agent Identity Derived from the User-Agent Product Token | Accepted | 2026-07-08 |
 
 ## Format
 

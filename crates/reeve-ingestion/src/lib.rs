@@ -1,5 +1,7 @@
 pub mod assemble;
 pub mod normalize;
+pub mod pricing;
+pub mod proxy;
 pub mod receive;
 pub mod route;
 
@@ -16,6 +18,7 @@ use tonic_health::{ServingStatus, server::health_reporter};
 
 pub async fn serve(
     addr: SocketAddr,
+    proxy_addr: SocketAddr,
     warm: Arc<WarmStore>,
     signal_tx: broadcast::Sender<IngestionEvent>,
     ntp_offsets: receive::NtpOffsets,
@@ -29,6 +32,15 @@ pub async fn serve(
     let (route_tx, route_rx) = tokio::sync::mpsc::channel(1024);
 
     tokio::spawn(normalize::run(pipeline_rx, capture_content, assemble_tx));
+
+    // The HTTP proxy is a second producer into the same pipeline: spans it
+    // synthesizes are normalized, assembled, and routed like SDK spans.
+    let proxy_pipeline_tx = pipeline_tx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = proxy::run(proxy_addr, proxy_pipeline_tx).await {
+            tracing::error!(error = %e, "HTTP proxy exited");
+        }
+    });
     tokio::spawn(assemble::run(assemble_rx, 500, route_tx, paused));
     tokio::spawn(route::run(route_rx, hot, warm, signal_tx));
 
