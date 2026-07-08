@@ -611,6 +611,13 @@ impl App {
                 if let Some(ref r) = reason {
                     tracing::info!(reason = r, "evaluation backend disabled");
                 }
+                // A recovery deserves its three seconds: degraded before,
+                // working now.
+                let was_degraded = self.state.eval_backend.as_deref() == Some("disabled");
+                if was_degraded && backend != "disabled" {
+                    self.state
+                        .toast(format!("tier 2 evaluation resumed \u{00B7} {backend}"));
+                }
                 self.state.eval_backend_reason = reason;
                 self.state.eval_backend = Some(backend);
                 self.state.privacy_tier = privacy_tier;
@@ -665,6 +672,16 @@ impl App {
                         )
                     }),
                 });
+                // Most severe first on screen: the weight of the command
+                // the rule carries, ties most recent first. The panel draws
+                // back-of-deque at the top, so the back must hold the most
+                // severe newest entry: drain newest-first, stable-sort by
+                // rank, then reverse so severity ascends front to back.
+                let mut entries: Vec<PolicyAlertEntry> =
+                    self.state.policy_alerts.drain(..).rev().collect();
+                entries.sort_by_key(|e| alert_severity_rank(&e.command_type));
+                entries.reverse();
+                self.state.policy_alerts = entries.into();
                 self.state
                     .flash_targets
                     .insert(FlashTarget::AlertSection, (FlashDirection::Alert, 2));
@@ -1065,6 +1082,13 @@ impl App {
                         Some(self.state.filter_applied.clone().unwrap_or_default());
                 }
             }
+            Action::Char('x') => {
+                // Dismiss the top alert, which the panel draws from the back
+                // of the deque. An alert that fired is informational once its
+                // command has been through its own dispatch and confirmation
+                // path.
+                self.state.policy_alerts.pop_back();
+            }
             Action::Char('y') => {
                 let copied = self.state.trace.as_ref().and_then(|tv| {
                     let id = tv.selected.as_ref()?;
@@ -1148,6 +1172,8 @@ impl App {
                 self.focus_step(-1).await;
             }
             Action::Resize(_, _) | Action::Char(_) => {}
+            // Line editing only means something inside a text input.
+            Action::DeleteWord | Action::ClearLine => {}
         }
     }
 
@@ -1171,6 +1197,15 @@ impl App {
                 _ => {}
             },
             OverlayMode::TextInput { .. } => match action {
+                Action::DeleteWord | Action::ClearLine => {
+                    if let Some(InterventionOverlayState {
+                        mode: OverlayMode::TextInput { buffer, .. },
+                        ..
+                    }) = self.state.overlay.as_mut()
+                    {
+                        edit_buffer(buffer, matches!(action, Action::DeleteWord));
+                    }
+                }
                 Action::Select => {
                     let Some(ov) = self.state.overlay.take() else {
                         return;
@@ -1277,10 +1312,28 @@ impl App {
                             };
                         }
                     }
-                    // [k] in overlay = kill
+                    // [k] in overlay = kill. Only a running or paused agent
+                    // can be killed; anything else gets told up front rather
+                    // than walked through a confirmation the SDK will refuse.
                     Action::VimUp if caps.contains(&"kill".to_string()) => {
-                        if let Some(ref mut ov) = self.state.overlay {
-                            ov.mode = OverlayMode::KillConfirm;
+                        let killable = self
+                            .state
+                            .overlay
+                            .as_ref()
+                            .and_then(|ov| self.state.agents.get(&ov.agent_id))
+                            .is_some_and(|a| {
+                                matches!(
+                                    a.agent.status,
+                                    reeve_model::entity::AgentStatus::Running
+                                        | reeve_model::entity::AgentStatus::Paused
+                                )
+                            });
+                        if killable {
+                            if let Some(ref mut ov) = self.state.overlay {
+                                ov.mode = OverlayMode::KillConfirm;
+                            }
+                        } else {
+                            self.state.toast("agent is not running, nothing to kill");
                         }
                     }
                     // [1] and [2] load templates into the input field.
@@ -1647,6 +1700,11 @@ impl App {
                     buffer.pop();
                 }
             }
+            Action::DeleteWord | Action::ClearLine => {
+                if let Some(ref mut buffer) = self.state.filter_input {
+                    edit_buffer(buffer, matches!(action, Action::DeleteWord));
+                }
+            }
             // Tab cycles matches without closing the bar.
             Action::NextPanel => self.cycle_filter_match(true),
             _ => {}
@@ -1710,6 +1768,11 @@ impl App {
             Action::Backspace => {
                 if let Some((_, ref mut buffer)) = self.state.note_input {
                     buffer.pop();
+                }
+            }
+            Action::DeleteWord | Action::ClearLine => {
+                if let Some((_, ref mut buffer)) = self.state.note_input {
+                    edit_buffer(buffer, matches!(action, Action::DeleteWord));
                 }
             }
             Action::Select => {
@@ -1789,6 +1852,12 @@ impl App {
             Action::Backspace => {
                 if let Some(ref mut buffer) = self.state.palette {
                     buffer.pop();
+                    self.state.palette_match = 0;
+                }
+            }
+            Action::DeleteWord | Action::ClearLine => {
+                if let Some(ref mut buffer) = self.state.palette {
+                    edit_buffer(buffer, matches!(action, Action::DeleteWord));
                     self.state.palette_match = 0;
                 }
             }
@@ -2377,6 +2446,36 @@ fn sustained_transition(prev: f64, score: f64, is_selected: bool) -> Option<bool
     }
 }
 
+/// Readline-style buffer editing shared by every text input: Ctrl+W
+/// deletes the last word, Ctrl+U clears the line.
+fn edit_buffer(buffer: &mut String, word_only: bool) {
+    if !word_only {
+        buffer.clear();
+        return;
+    }
+    while buffer.ends_with(' ') {
+        buffer.pop();
+    }
+    while let Some(c) = buffer.pop() {
+        if c == ' ' {
+            buffer.push(' ');
+            break;
+        }
+    }
+}
+
+/// Alert stacking order: the weight of the command the firing rule
+/// carries. Lower ranks stack higher in ALERTS.
+fn alert_severity_rank(command_type: &str) -> u8 {
+    match command_type {
+        "kill" => 0,
+        "pause" => 1,
+        "redirect" => 2,
+        "inject_context" => 3,
+        _ => 4,
+    }
+}
+
 /// Health band as an ordinal so crossings compare cleanly: 2 healthy,
 /// 1 caution, 0 critical.
 fn band_rank(score: f64) -> u8 {
@@ -2473,6 +2572,27 @@ mod tests {
             Some(CommandType::InjectContext { context }) => assert_eq!(context, "extra facts"),
             other => panic!("inject_context must map with its context, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn edit_buffer_deletes_word_and_clears_line() {
+        let mut b = "pause agent research-bot".to_string();
+        edit_buffer(&mut b, true);
+        assert_eq!(b, "pause agent ", "Ctrl+W removes the last word only");
+        edit_buffer(&mut b, true);
+        assert_eq!(b, "pause ", "trailing space then the next word");
+        edit_buffer(&mut b, false);
+        assert_eq!(b, "", "Ctrl+U clears everything");
+        edit_buffer(&mut b, true);
+        assert_eq!(b, "", "editing an empty buffer holds");
+    }
+
+    #[test]
+    fn alert_severity_ranks_kill_above_all() {
+        assert!(alert_severity_rank("kill") < alert_severity_rank("pause"));
+        assert!(alert_severity_rank("pause") < alert_severity_rank("redirect"));
+        assert!(alert_severity_rank("redirect") < alert_severity_rank("inject_context"));
+        assert!(alert_severity_rank("inject_context") < alert_severity_rank("unknown"));
     }
 
     #[test]
