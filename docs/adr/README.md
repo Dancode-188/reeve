@@ -37,6 +37,9 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0030](./0030-instant-reconstitution-from-wall-clock-timestamps.md) | Reconstituting `Instant` Values from Wall-Clock Timestamps for Cooldown Persistence | Accepted | 2026-07-06 |
 | [0031](./0031-canonical-agent-identity-across-channels.md) | Canonical Agent Identity Composed by One Function Across Both Channels | Accepted | 2026-07-06 |
 | [0032](./0032-cross-trace-outcome-measurement.md) | Cross-Trace Window for Intervention Outcome Measurement | Accepted | 2026-07-07 |
+| [0033](./0033-clipboard-via-osc-52.md) | Clipboard via OSC 52, Not a Native Library | Accepted | 2026-07-08 |
+| [0034](./0034-effectiveness-memory-keyed-by-rule-identity.md) | Effectiveness Memory Keyed by Rule Identity, Not Metric | Accepted | 2026-07-08 |
+| [0035](./0035-privacy-tier-read-once-fails-closed.md) | Privacy Tier Read Once at Startup, Failing Closed | Accepted | 2026-07-08 |
 
 ## Format
 
