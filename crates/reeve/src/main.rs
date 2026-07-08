@@ -105,8 +105,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let engine_ingestion_rx = ingestion_tx.subscribe();
+    let proxy_addr: std::net::SocketAddr = "127.0.0.1:4318"
+        .parse()
+        .expect("static proxy address is valid");
     tokio::spawn(reeve_ingestion::serve(
         addr,
+        proxy_addr,
         warm.clone(),
         ingestion_tx,
         ntp_offsets.clone(),

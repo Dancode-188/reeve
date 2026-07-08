@@ -163,6 +163,7 @@ impl TraceService for OtlpReceiver {
                         framework: framework.clone(),
                         arrived_at: arrived_at_ms,
                         clock_offset_ms,
+                        integration: reeve_model::entity::IntegrationPath::Sdk,
                     };
 
                     if self.pipeline_tx.send(ps).await.is_err() {
