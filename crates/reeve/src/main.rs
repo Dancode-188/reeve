@@ -164,7 +164,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    reeve_renderer::run(ingestion_rx, engine_event_rx, warm, ascii_mode, dispatcher).await?;
+    let notifications_enabled =
+        reeve_engine::policy::config::load_notifications_enabled(&config_path);
+    reeve_renderer::run(
+        ingestion_rx,
+        engine_event_rx,
+        warm,
+        ascii_mode,
+        dispatcher,
+        notifications_enabled,
+    )
+    .await?;
 
     Ok(())
 }

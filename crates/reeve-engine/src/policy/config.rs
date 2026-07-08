@@ -9,6 +9,12 @@ struct ConfigFile {
     #[serde(default)]
     rules: Vec<RuleEntry>,
     privacy_tier: Option<u8>,
+    notifications: Option<NotificationsSection>,
+}
+
+#[derive(Deserialize)]
+struct NotificationsSection {
+    enabled: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -124,6 +130,19 @@ pub fn load_privacy_tier(path: &Path) -> u8 {
     }
 }
 
+/// Whether desktop notifications are enabled. Default off: reaching
+/// outside the terminal is opt-in, and a missing or unparseable file
+/// means no notifications rather than surprise ones.
+pub fn load_notifications_enabled(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    toml::from_str::<ConfigFile>(&text)
+        .ok()
+        .and_then(|c| c.notifications.and_then(|n| n.enabled))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +153,20 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
+    }
+
+    #[test]
+    fn notifications_default_off_and_fail_closed() {
+        assert!(!load_notifications_enabled(Path::new("/nonexistent")));
+        let f = write_temp("privacy_tier = 2");
+        assert!(
+            !load_notifications_enabled(f.path()),
+            "absent section is off"
+        );
+        let f = write_temp("[notifications]\nenabled = true");
+        assert!(load_notifications_enabled(f.path()));
+        let f = write_temp("not [ valid toml");
+        assert!(!load_notifications_enabled(f.path()), "unparseable is off");
     }
 
     #[test]
