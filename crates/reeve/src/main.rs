@@ -113,12 +113,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         paused_agents.clone(),
         privacy_tier >= 2,
     ));
+    let reprobe_requested: reeve_engine::ReprobeRequested =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     tokio::spawn(reeve_engine::run(
         engine_ingestion_rx,
         engine_event_tx.clone(),
         warm.clone(),
         Some(dispatch_tx),
         Some(applied_commands.clone()),
+        Some(reprobe_requested.clone()),
     ));
     let control_server = reeve_intervention::server::run(
         engine_event_tx.clone(),
@@ -173,6 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ascii_mode,
         dispatcher,
         notifications_enabled,
+        reprobe_requested,
     )
     .await?;
 

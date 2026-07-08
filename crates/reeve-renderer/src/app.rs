@@ -391,6 +391,9 @@ pub struct App {
     pub warm: Arc<WarmStore>,
     pub dispatcher: Arc<Dispatcher>,
     pub should_quit: bool,
+    /// Set on r while degraded; the engine consumes it and re-probes the
+    /// evaluation backend. None only in tests.
+    pub reprobe_requested: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub state: AppState,
 }
 
@@ -423,6 +426,7 @@ impl App {
             warm,
             dispatcher,
             should_quit: false,
+            reprobe_requested: None,
             state: AppState {
                 agents,
                 selected_agent,
@@ -932,10 +936,15 @@ impl App {
                 if self.state.fatal_error.is_some() {
                     self.state.fatal_error = None;
                 } else {
-                    // Clear known degraded state; engine reprobe not yet wired
-                    self.state.eval_backend = None;
-                    self.state.eval_backend_reason = None;
+                    // Ask the engine to re-probe the evaluation backend. The
+                    // banner stays until its EvaluationBackendReady answers,
+                    // so a failed probe re-degrades honestly instead of the
+                    // banner clearing on hope.
+                    if let Some(ref flag) = self.reprobe_requested {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     self.state.degraded_dismissed = false;
+                    self.state.toast("re-probing evaluation backend");
                 }
             }
             Action::OverlayOpen => {
