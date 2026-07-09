@@ -26,6 +26,11 @@ pub type DisconnectedAgents = Arc<Mutex<std::collections::HashMap<AgentId, Insta
 /// because a dropped connection is diagnosable, unlike plain silence.
 const DISCONNECT_GRACE: Duration = Duration::from_secs(60);
 
+/// Total approximate bytes of in-flight trace data the assembler holds
+/// before it starts evicting the stalest traces. Bounds Reeve's memory
+/// against an agent that emits spans without ever completing a trace.
+const IN_FLIGHT_CEILING_BYTES: usize = 50 * 1024 * 1024;
+
 const STRAGGLER_WINDOW: Duration = Duration::from_secs(2);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -54,6 +59,9 @@ pub struct InFlightTrace {
     last_updated: Instant,
     completion_timer: Option<Instant>,
     pub cost_accumulator: f64,
+    /// Approximate memory footprint of this trace's spans and events,
+    /// maintained incrementally as they arrive.
+    pub approx_bytes: usize,
 }
 
 impl InFlightTrace {
@@ -69,11 +77,21 @@ impl InFlightTrace {
             last_updated: Instant::now(),
             completion_timer: None,
             cost_accumulator: 0.0,
+            approx_bytes: 0,
         }
     }
 
     pub fn receive_span(&mut self, span: InternalSpan, events: Vec<SpanEvent>) {
         self.last_updated = Instant::now();
+        // Attribute JSON plus event content dominates a span's footprint;
+        // the fixed struct overhead is approximated by a flat constant.
+        self.approx_bytes += span.attributes.to_string().len()
+            + span.operation.len()
+            + events
+                .iter()
+                .map(|e| e.content.as_deref().map_or(0, str::len))
+                .sum::<usize>()
+            + 256;
         self.span_events.insert(span.id.clone(), events);
 
         if let Some(cost) = span
@@ -172,6 +190,7 @@ pub struct Assembler {
     traces: HashMap<TraceId, InFlightTrace>,
     paused: PausedAgents,
     disconnected: DisconnectedAgents,
+    ceiling_bytes: usize,
 }
 
 impl Assembler {
@@ -180,6 +199,7 @@ impl Assembler {
             traces: HashMap::new(),
             paused,
             disconnected,
+            ceiling_bytes: IN_FLIGHT_CEILING_BYTES,
         }
     }
 
@@ -188,17 +208,55 @@ impl Assembler {
     /// agent a full window to continue.
     pub fn reload(&mut self, spans: Vec<(InternalSpan, Vec<SpanEvent>)>, agent: Agent) {
         for (span, events) in spans {
-            self.receive(span, events, agent.clone());
+            let _ = self.receive(span, events, agent.clone());
         }
     }
 
-    pub fn receive(&mut self, span: InternalSpan, events: Vec<SpanEvent>, agent: Agent) {
+    pub fn receive(
+        &mut self,
+        span: InternalSpan,
+        events: Vec<SpanEvent>,
+        agent: Agent,
+    ) -> Vec<(InFlightTrace, CompletionState)> {
         let trace_id = span.trace_id.clone();
         let trace = self
             .traces
             .entry(trace_id.clone())
-            .or_insert_with(|| InFlightTrace::new(trace_id, agent));
+            .or_insert_with(|| InFlightTrace::new(trace_id.clone(), agent));
         trace.receive_span(span, events);
+        self.enforce_ceiling(&trace_id)
+    }
+
+    /// Evicts the least recently updated traces while the total footprint
+    /// exceeds the ceiling. Staleness, not size, picks the victim: the
+    /// trace nobody has written to is the one most likely abandoned, and
+    /// evicting the largest would punish exactly the long-running agent
+    /// the ceiling exists to protect. The just-updated trace is exempt so
+    /// a single oversized trace cannot evict itself into a loop.
+    fn enforce_ceiling(&mut self, just_updated: &TraceId) -> Vec<(InFlightTrace, CompletionState)> {
+        let mut evicted = Vec::new();
+        loop {
+            let total: usize = self.traces.values().map(|t| t.approx_bytes).sum();
+            if total <= self.ceiling_bytes {
+                break;
+            }
+            let stalest = self
+                .traces
+                .iter()
+                .filter(|(id, _)| *id != just_updated)
+                .min_by_key(|(_, t)| t.last_updated)
+                .map(|(id, _)| id.clone());
+            let Some(id) = stalest else { break };
+            if let Some(trace) = self.traces.remove(&id) {
+                tracing::warn!(
+                    trace_id = %trace.trace_id,
+                    approx_bytes = trace.approx_bytes,
+                    "in-flight ceiling exceeded; evicting stalest trace as interrupted"
+                );
+                evicted.push((trace, CompletionState::Interrupted));
+            }
+        }
+        evicted
     }
 
     /// Returns all traces that have completed or been interrupted, removing
@@ -302,7 +360,11 @@ pub async fn run(
                             trace_id = %ns.span.trace_id,
                             "assembling span",
                         );
-                        assembler.receive(ns.span, ns.events, ns.agent);
+                        for evicted in assembler.receive(ns.span, ns.events, ns.agent) {
+                            if tx.send(evicted).await.is_err() {
+                                tracing::warn!("route stage unavailable, evicted trace dropped");
+                            }
+                        }
                     }
                     None => {
                         tracing::info!("assemble stage shut down");
@@ -701,5 +763,50 @@ mod tests {
             CompletionState::Completed,
             "a root that arrived before disconnect still completes normally"
         );
+    }
+
+    #[test]
+    fn ceiling_evicts_the_stalest_trace_first() {
+        let mut assembler = Assembler::new(
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+        );
+        assembler.ceiling_bytes = 2_000;
+
+        // Two traces; t1 goes stale, t2 keeps receiving.
+        let _ = assembler.receive(make_span("a", "t1", Some("m")), vec![], make_agent());
+        if let Some(t) = assembler.traces.get_mut(&TraceId::from("t1")) {
+            t.last_updated = Instant::now() - Duration::from_secs(10);
+        }
+        let _ = assembler.receive(make_span("b", "t2", Some("m")), vec![], make_agent());
+
+        // Push t2 over the ceiling: the STALE t1 is evicted, not t2.
+        let mut big = make_span("c", "t2", Some("m"));
+        big.attributes = serde_json::json!({"filler": "x".repeat(2_000)});
+        let evicted = assembler.receive(big, vec![], make_agent());
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0.trace_id, TraceId::from("t1"));
+        assert_eq!(evicted[0].1, CompletionState::Interrupted);
+        assert!(
+            assembler.traces.contains_key(&TraceId::from("t2")),
+            "the actively written trace survives"
+        );
+    }
+
+    #[test]
+    fn a_single_oversized_trace_is_never_self_evicted() {
+        let mut assembler = Assembler::new(
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+        );
+        assembler.ceiling_bytes = 500;
+        let mut big = make_span("a", "t1", Some("m"));
+        big.attributes = serde_json::json!({"filler": "x".repeat(5_000)});
+        let evicted = assembler.receive(big, vec![], make_agent());
+        assert!(
+            evicted.is_empty(),
+            "the only trace, however large, keeps flowing"
+        );
+        assert!(assembler.traces.contains_key(&TraceId::from("t1")));
     }
 }
