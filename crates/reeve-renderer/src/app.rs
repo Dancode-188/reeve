@@ -529,6 +529,19 @@ impl App {
                     self.update_ctx_suggestion();
                 }
             }
+            IngestionEvent::PipelineWarning { message } => {
+                if self.state.policy_alerts.len() >= 5 {
+                    self.state.policy_alerts.pop_front();
+                }
+                self.state.policy_alerts.push_back(PolicyAlertEntry {
+                    description: message,
+                    command_type: "warning".to_string(),
+                    effectiveness: None,
+                });
+                self.state
+                    .flash_targets
+                    .insert(FlashTarget::AlertSection, (FlashDirection::Alert, 2));
+            }
             IngestionEvent::StreamingUpdate { content, .. } => {
                 self.state.streaming.content.push_str(&content);
             }

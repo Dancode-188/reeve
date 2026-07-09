@@ -15,6 +15,7 @@ pub struct Router {
     warm: Arc<WarmStore>,
     signal_tx: broadcast::Sender<IngestionEvent>,
     seen_agents: HashSet<AgentId>,
+    last_batch_warning: Option<std::time::Instant>,
 }
 
 impl Router {
@@ -28,10 +29,51 @@ impl Router {
             warm,
             signal_tx,
             seen_agents: HashSet::new(),
+            last_batch_warning: None,
         }
     }
 
+    /// A trace whose spans consistently arrived long after they started
+    /// means the agent's OTel exporter batches on the default interval,
+    /// and the live cockpit is quietly seconds behind reality. One
+    /// warning per interval; a persistently misconfigured agent should
+    /// nag, not spam.
+    fn check_batch_latency(&mut self, trace: &InFlightTrace) {
+        const DELTA_THRESHOLD_MS: i64 = 4_000;
+        const MIN_SPANS: usize = 3;
+        const WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+        if trace.spans.len() < MIN_SPANS {
+            return;
+        }
+        let laggy = trace
+            .spans
+            .values()
+            .filter(|s| s.arrived_at - s.start_time > DELTA_THRESHOLD_MS)
+            .count();
+        if laggy * 10 < trace.spans.len() * 8 {
+            return; // fewer than 80% of spans lag: not a batching signature
+        }
+        let now = std::time::Instant::now();
+        if self
+            .last_batch_warning
+            .is_some_and(|at| now.duration_since(at) < WARN_INTERVAL)
+        {
+            return;
+        }
+        self.last_batch_warning = Some(now);
+        let _ = self.signal_tx.send(IngestionEvent::PipelineWarning {
+            message: format!(
+                "{} delivers spans seconds late (OTel batching); set schedule_delay_millis=500 in its exporter",
+                trace.agent.name
+            ),
+        });
+    }
+
     pub async fn route(&mut self, trace: InFlightTrace, state: CompletionState) {
+        if state == CompletionState::Completed {
+            self.check_batch_latency(&trace);
+        }
         let trace_id = trace.trace_id.clone();
         let agent_id = trace.agent.id.clone();
         let span_count = trace.spans.len();
@@ -310,5 +352,67 @@ mod tests {
             !connected_again,
             "AgentConnected must not fire on subsequent traces"
         );
+    }
+
+    #[tokio::test]
+    async fn laggy_trace_raises_one_batch_warning() {
+        let hot = Arc::new(Mutex::new(HotStore::new(1000)));
+        let warm = Arc::new(WarmStore::open_in_memory().unwrap());
+        let (signal_tx, mut signal_rx) = broadcast::channel(16);
+        let mut router = Router::new(hot, warm, signal_tx);
+
+        // Every span arrived 5s after it started: the batching signature.
+        let mut trace = InFlightTrace::new("t-lag".into(), make_agent());
+        for (i, id) in ["r", "a", "b"].iter().enumerate() {
+            let mut span = make_span(id, "t-lag", if i == 0 { None } else { Some("r") });
+            span.start_time = 1_000;
+            span.arrived_at = 6_500;
+            trace.receive_span(span, vec![]);
+        }
+        router.route(trace, CompletionState::Completed).await;
+
+        let mut warned = 0;
+        while let Ok(ev) = signal_rx.try_recv() {
+            if let IngestionEvent::PipelineWarning { message } = ev {
+                assert!(message.contains("schedule_delay_millis"));
+                warned += 1;
+            }
+        }
+        assert_eq!(warned, 1, "the batching signature warns exactly once");
+
+        // A second laggy trace inside the throttle window stays silent.
+        let mut trace2 = InFlightTrace::new("t-lag-2".into(), make_agent());
+        for (i, id) in ["r", "a", "b"].iter().enumerate() {
+            let mut span = make_span(id, "t-lag-2", if i == 0 { None } else { Some("r") });
+            span.start_time = 1_000;
+            span.arrived_at = 6_500;
+            trace2.receive_span(span, vec![]);
+        }
+        router.route(trace2, CompletionState::Completed).await;
+        let mut warned_again = false;
+        while let Ok(ev) = signal_rx.try_recv() {
+            if matches!(ev, IngestionEvent::PipelineWarning { .. }) {
+                warned_again = true;
+            }
+        }
+        assert!(!warned_again, "warnings are throttled, not per trace");
+    }
+
+    #[tokio::test]
+    async fn prompt_traces_never_warn() {
+        let hot = Arc::new(Mutex::new(HotStore::new(1000)));
+        let warm = Arc::new(WarmStore::open_in_memory().unwrap());
+        let (signal_tx, mut signal_rx) = broadcast::channel(16);
+        let mut router = Router::new(hot, warm, signal_tx);
+
+        // make_span arrives 1ms after start: healthy delivery.
+        let trace = make_trace_with_spans("t-ok", &["r", "a", "b"]);
+        router.route(trace, CompletionState::Completed).await;
+        while let Ok(ev) = signal_rx.try_recv() {
+            assert!(
+                !matches!(ev, IngestionEvent::PipelineWarning { .. }),
+                "prompt delivery must not warn"
+            );
+        }
     }
 }

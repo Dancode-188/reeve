@@ -26,6 +26,11 @@ pub enum IngestionEvent {
         agent_id: AgentId,
         status: AgentStatus,
     },
+    /// A pipeline-health notice for the developer: surfaced in ALERTS,
+    /// dismissible, advisory rather than actionable by command.
+    PipelineWarning {
+        message: String,
+    },
 }
 
 /// Confidence in an LLM judge result, derived from self-consistency scoring.
