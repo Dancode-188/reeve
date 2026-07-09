@@ -29,6 +29,11 @@ pub type NtpOffsets = Arc<Mutex<HashMap<String, i64>>>;
 /// held until T4 arrives in NtpFollowup.
 type NtpPending = Arc<Mutex<HashMap<AgentId, (i64, i64, i64)>>>;
 
+/// Agents whose control stream dropped, and when: written here, read by
+/// the ingestion assembler for the disconnect grace period. Same alias
+/// on both sides of the shared Arc, like the paused set.
+pub type DisconnectedAgents = Arc<Mutex<HashMap<AgentId, std::time::Instant>>>;
+
 /// Handle to the running control server. Used by the dispatcher to send
 /// commands to connected agents.
 #[derive(Clone)]
@@ -43,6 +48,7 @@ pub struct ControlServer {
     /// Cleared for an agent when its control stream drops, so a paused agent
     /// that crashes or disconnects does not hold its traces in flight forever.
     paused: PausedAgents,
+    disconnected: DisconnectedAgents,
 }
 
 impl ControlServer {
@@ -50,6 +56,7 @@ impl ControlServer {
         engine_tx: broadcast::Sender<EngineEvent>,
         ntp_offsets: NtpOffsets,
         paused: PausedAgents,
+        disconnected: DisconnectedAgents,
     ) -> Self {
         Self {
             connected: Arc::new(Mutex::new(HashMap::new())),
@@ -58,6 +65,7 @@ impl ControlServer {
             ntp_pending: Arc::new(Mutex::new(HashMap::new())),
             ntp_offsets,
             paused,
+            disconnected,
         }
     }
 
@@ -156,6 +164,10 @@ impl ReeveControl for ControlServer {
             );
         }
 
+        // A reconnect within the grace period clears the mark; the
+        // assembler's next tick resumes the idle clock from fresh.
+        self.disconnected.lock().unwrap().remove(&agent_id);
+
         let _ = self.engine_tx.send(EngineEvent::AgentControlConnected {
             agent_id: agent_id.clone(),
             capabilities: capabilities.clone(),
@@ -164,6 +176,7 @@ impl ReeveControl for ControlServer {
         tracing::info!(agent_id = %agent_id, ?capabilities, "agent connected to control channel");
 
         let connected = self.connected.clone();
+        let disconnected = self.disconnected.clone();
         let engine_tx = self.engine_tx.clone();
         let ack_sink = self.ack_sink.clone();
         let ntp_pending = self.ntp_pending.clone();
@@ -216,6 +229,10 @@ impl ReeveControl for ControlServer {
             }
 
             connected.lock().unwrap().remove(&agent_id);
+            disconnected
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone(), Instant::now());
             // A paused agent that disconnects is gone, not paused. Clearing
             // here lets the assembler's idle timeout finalize its traces
             // instead of holding them in flight indefinitely.
@@ -237,8 +254,9 @@ pub async fn run(
     engine_tx: broadcast::Sender<EngineEvent>,
     ntp_offsets: NtpOffsets,
     paused: PausedAgents,
+    disconnected: DisconnectedAgents,
 ) -> Arc<ControlServer> {
-    let server = ControlServer::new(engine_tx, ntp_offsets, paused);
+    let server = ControlServer::new(engine_tx, ntp_offsets, paused, disconnected);
     let handle = Arc::new(server.clone());
 
     let addr = "127.0.0.1:4316"
@@ -303,6 +321,7 @@ pub fn new_for_test(engine_tx: broadcast::Sender<EngineEvent>) -> Arc<ControlSer
         engine_tx,
         Arc::new(Mutex::new(HashMap::new())),
         Arc::new(Mutex::new(std::collections::HashSet::new())),
+        Arc::new(Mutex::new(HashMap::new())),
     ))
 }
 
@@ -316,6 +335,7 @@ mod tests {
             tx,
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashSet::new())),
+            Arc::new(Mutex::new(HashMap::new())),
         )
     }
 
@@ -392,6 +412,7 @@ mod tests {
                 tx,
                 ntp_offsets.clone(),
                 Arc::new(Mutex::new(std::collections::HashSet::new())),
+                Arc::new(Mutex::new(HashMap::new())),
             )
         };
 

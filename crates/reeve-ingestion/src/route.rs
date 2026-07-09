@@ -51,7 +51,9 @@ impl Router {
                     TraceStatus::Completed
                 }
             }
-            CompletionState::Interrupted => TraceStatus::Interrupted,
+            CompletionState::Interrupted | CompletionState::InterruptedResumable => {
+                TraceStatus::Interrupted
+            }
             CompletionState::InFlight => {
                 tracing::warn!(
                     trace_id = %trace_id,
@@ -117,8 +119,14 @@ impl Router {
             });
         }
 
+        let resumable = state == CompletionState::InterruptedResumable;
         if let Err(e) = self.warm.save_trace(trace_entity).await {
             tracing::error!(trace_id = %trace_id, error = %e, "failed to save trace");
+        }
+        if resumable {
+            if let Err(e) = self.warm.mark_resumable(&trace_id).await {
+                tracing::warn!(error = %e, trace_id = %trace_id, "failed to mark trace resumable");
+            }
         }
 
         for (_, span) in trace.spans {

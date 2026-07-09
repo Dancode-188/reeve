@@ -124,6 +124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxy_addr: std::net::SocketAddr = "127.0.0.1:4318"
         .parse()
         .expect("static proxy address is valid");
+    let disconnected_agents: reeve_ingestion::assemble::DisconnectedAgents =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     tokio::spawn(reeve_ingestion::serve(
         addr,
         proxy_addr,
@@ -131,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ingestion_tx,
         ntp_offsets.clone(),
         paused_agents.clone(),
+        disconnected_agents.clone(),
         privacy_tier >= 2,
     ));
     let reprobe_requested: reeve_engine::ReprobeRequested =
@@ -147,6 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine_event_tx.clone(),
         ntp_offsets,
         paused_agents.clone(),
+        disconnected_agents,
     )
     .await;
     let audit_path = db_path
