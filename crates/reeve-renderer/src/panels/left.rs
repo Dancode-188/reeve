@@ -88,7 +88,10 @@ fn render_agents(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             AgentStatus::Error => theme.health_crit(),
         };
 
-        let max_name = w.saturating_sub(3);
+        // A dropped control stream shows on the row: the grace period is
+        // exactly when a developer wants to know the agent may come back.
+        let offline = state.control_disconnected.contains(agent_id);
+        let max_name = w.saturating_sub(if offline { 11 } else { 3 });
         let name = truncate(&agent_state.agent.name, max_name);
 
         let flash_color = state.flash_color(&FlashTarget::AgentRow(agent_id.clone()), theme);
@@ -119,11 +122,18 @@ fn render_agents(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                 .add_modifier(Modifier::BOLD)
         };
 
-        lines.push(Line::from(vec![
+        let mut row = vec![
             Span::styled(indicator, Style::default().fg(indicator_color)),
             Span::raw(" "),
             Span::styled(name, name_style),
-        ]));
+        ];
+        if offline {
+            row.push(Span::styled(
+                " [offline]",
+                Style::default().fg(theme.health_warn()),
+            ));
+        }
+        lines.push(Line::from(row));
 
         // Sub-line: score + cost + trend for active/paused, idle text for idle
         let sub = match agent_state.agent.status {

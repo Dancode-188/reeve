@@ -259,6 +259,10 @@ pub struct AppState {
     pub filter_applied: Option<String>,
     /// Theme name the palette or T selected; the render loop applies it.
     pub pending_theme: Option<String>,
+    /// Agents whose control stream has dropped: the fleet row carries an
+    /// offline marker until they reconnect. Proxy agents never appear
+    /// here (no control channel).
+    pub control_disconnected: HashSet<AgentId>,
     /// Desktop notifications opt-in, read from config at startup.
     pub notifications_enabled: bool,
     /// Last health score seen per agent, feeding the terminal-title
@@ -459,6 +463,7 @@ impl App {
                 filter_input: None,
                 filter_applied: None,
                 pending_theme: None,
+                control_disconnected: HashSet::new(),
                 notifications_enabled: false,
                 latest_agent_health: HashMap::new(),
                 sustained_alerts: HashMap::new(),
@@ -707,9 +712,11 @@ impl App {
                 agent_id,
                 capabilities,
             } => {
+                self.state.control_disconnected.remove(&agent_id);
                 self.state.agent_capabilities.insert(agent_id, capabilities);
             }
             EngineEvent::AgentControlDisconnected { agent_id } => {
+                self.state.control_disconnected.insert(agent_id.clone());
                 self.state.agent_capabilities.remove(&agent_id);
                 // Close overlay if open for the disconnecting agent.
                 if let Some(ref ov) = self.state.overlay {

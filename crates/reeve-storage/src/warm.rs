@@ -47,6 +47,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         4,
         include_str!("../../../migrations/0004_policy_cooldowns.sql"),
     ),
+    (
+        5,
+        include_str!("../../../migrations/0005_resumable_traces.sql"),
+    ),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -307,6 +311,16 @@ impl WarmStore {
         Ok(result?)
     }
 
+    pub async fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>, StorageError> {
+        let id = id.clone();
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare("SELECT * FROM agents WHERE id = ?1")?;
+            let mut rows = stmt.query_map(params![id.as_str()], row_to_agent)?;
+            rows.next().transpose()
+        })
+        .await
+    }
+
     pub async fn upsert_agent(&self, agent: Agent) -> Result<(), StorageError> {
         let integration = enum_to_text(&agent.integration)?;
         let status = enum_to_text(&agent.status)?;
@@ -328,6 +342,47 @@ impl WarmStore {
                 ],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Flags a stored trace as resumable: interrupted by connection loss
+    /// rather than silence, eligible for the startup rescan.
+    pub async fn mark_resumable(&self, trace_id: &TraceId) -> Result<(), StorageError> {
+        let trace_id = trace_id.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE traces SET resumable = 1 WHERE id = ?1",
+                params![trace_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Interrupted-and-resumable traces newer than the window, for the
+    /// startup rescan. Claiming clears the flag so a second restart does
+    /// not resume the same trace twice.
+    pub async fn claim_resumable_traces(&self, within_ms: i64) -> Result<Vec<Trace>, StorageError> {
+        self.with_conn(move |conn| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_millis() as i64;
+            let traces: Vec<Trace> = conn
+                .prepare(
+                    "SELECT * FROM traces
+                     WHERE status = 'interrupted' AND resumable = 1
+                       AND completed_at IS NOT NULL AND completed_at > ?1",
+                )?
+                .query_map(params![now - within_ms], row_to_trace)?
+                .collect::<rusqlite::Result<_>>()?;
+            conn.execute(
+                "UPDATE traces SET resumable = 0
+                 WHERE status = 'interrupted' AND resumable = 1",
+                [],
+            )?;
+            Ok(traces)
         })
         .await
     }
@@ -1206,6 +1261,31 @@ mod tests {
         CT::Redirect {
             instruction: "steer".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn resumable_claim_returns_recent_and_clears_the_flag() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        let mut t = trace("t1");
+        t.status = TraceStatus::Interrupted;
+        t.end_time = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+        );
+        store.save_trace(t).await.unwrap();
+        store.mark_resumable(&TraceId::from("t1")).await.unwrap();
+
+        let claimed = store.claim_resumable_traces(5 * 60 * 1000).await.unwrap();
+        assert_eq!(claimed.len(), 1, "recent resumable trace is claimed");
+
+        let again = store.claim_resumable_traces(5 * 60 * 1000).await.unwrap();
+        assert!(
+            again.is_empty(),
+            "claiming clears the flag so a second restart does not double-resume"
+        );
     }
 
     #[tokio::test]

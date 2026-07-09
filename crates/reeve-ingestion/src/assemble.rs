@@ -15,6 +15,17 @@ use tokio::sync::mpsc;
 /// that silence must not be mistaken for an interrupted trace.
 pub type PausedAgents = Arc<Mutex<HashSet<AgentId>>>;
 
+/// Agents whose control stream has dropped, and when. Written by the
+/// control server on disconnect and reconnect, read here on every tick:
+/// the same shared-state pattern as the paused set. Proxy agents never
+/// appear (no control channel) and keep the plain idle timeout.
+pub type DisconnectedAgents = Arc<Mutex<std::collections::HashMap<AgentId, Instant>>>;
+
+/// How long a disconnected agent's traces survive before flushing as
+/// Interrupted and resumable. Generous relative to the idle timeout
+/// because a dropped connection is diagnosable, unlike plain silence.
+const DISCONNECT_GRACE: Duration = Duration::from_secs(60);
+
 const STRAGGLER_WINDOW: Duration = Duration::from_secs(2);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -23,8 +34,13 @@ pub enum CompletionState {
     InFlight,
     /// Root span arrived and the straggler window has elapsed.
     Completed,
-    /// No root span arrived within the idle timeout.
+    /// No root span arrived within the idle timeout. The agent was
+    /// connected and simply went quiet, so nothing more is coming and
+    /// the trace is not resumable.
     Interrupted,
+    /// The agent's connection dropped and the grace period expired.
+    /// Flushed as resumable: the agent may return and continue.
+    InterruptedResumable,
 }
 
 pub struct InFlightTrace {
@@ -155,13 +171,24 @@ impl InFlightTrace {
 pub struct Assembler {
     traces: HashMap<TraceId, InFlightTrace>,
     paused: PausedAgents,
+    disconnected: DisconnectedAgents,
 }
 
 impl Assembler {
-    pub fn new(paused: PausedAgents) -> Self {
+    pub fn new(paused: PausedAgents, disconnected: DisconnectedAgents) -> Self {
         Self {
             traces: HashMap::new(),
             paused,
+            disconnected,
+        }
+    }
+
+    /// Rebuilds an in-flight trace from stored spans, for resuming after
+    /// a restart. The idle clock starts fresh, giving the returning
+    /// agent a full window to continue.
+    pub fn reload(&mut self, spans: Vec<(InternalSpan, Vec<SpanEvent>)>, agent: Agent) {
+        for (span, events) in spans {
+            self.receive(span, events, agent.clone());
         }
     }
 
@@ -193,17 +220,47 @@ impl Assembler {
             }
         }
 
+        // A dropped connection is not silence: while the grace period
+        // runs, the idle timeout is held off (same mechanism as pause);
+        // when it expires, the flush below picks the trace up as
+        // resumable. Reconnection removes the map entry and the idle
+        // clock starts fresh from the refreshes done here.
+        let grace_expired: HashSet<AgentId> = {
+            let disconnected = self.disconnected.lock().unwrap();
+            for trace in self.traces.values_mut() {
+                if let Some(since) = disconnected.get(&trace.agent.id) {
+                    if since.elapsed() < DISCONNECT_GRACE {
+                        trace.last_updated = Instant::now();
+                    }
+                }
+            }
+            disconnected
+                .iter()
+                .filter(|(_, since)| since.elapsed() >= DISCONNECT_GRACE)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+
         let to_finalize: Vec<TraceId> = self
             .traces
             .keys()
-            .filter(|tid| self.traces[*tid].check_completion() != CompletionState::InFlight)
+            .filter(|tid| {
+                grace_expired.contains(&self.traces[*tid].agent.id)
+                    || self.traces[*tid].check_completion() != CompletionState::InFlight
+            })
             .cloned()
             .collect();
 
         let mut finalized = Vec::new();
         for tid in to_finalize {
             if let Some(trace) = self.traces.remove(&tid) {
-                let state = trace.check_completion();
+                let state = if grace_expired.contains(&trace.agent.id)
+                    && trace.check_completion() != CompletionState::Completed
+                {
+                    CompletionState::InterruptedResumable
+                } else {
+                    trace.check_completion()
+                };
                 finalized.push((trace, state));
             }
         }
@@ -218,7 +275,10 @@ impl Assembler {
 
 impl Default for Assembler {
     fn default() -> Self {
-        Self::new(Arc::new(Mutex::new(HashSet::new())))
+        Self::new(
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+        )
     }
 }
 
@@ -227,8 +287,9 @@ pub async fn run(
     tick_ms: u64,
     tx: mpsc::Sender<(InFlightTrace, CompletionState)>,
     paused: PausedAgents,
+    disconnected: DisconnectedAgents,
 ) {
-    let mut assembler = Assembler::new(paused);
+    let mut assembler = Assembler::new(paused, disconnected);
     let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
 
     loop {
@@ -464,7 +525,10 @@ mod tests {
         let paused: PausedAgents = Arc::new(Mutex::new(HashSet::new()));
         paused.lock().unwrap().insert("agent-1".into());
 
-        let mut assembler = Assembler::new(paused);
+        let mut assembler = Assembler::new(
+            paused,
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+        );
         assembler.receive(
             make_span("child-1", "trace-1", Some("never-arrives")),
             vec![],
@@ -483,7 +547,10 @@ mod tests {
         let paused: PausedAgents = Arc::new(Mutex::new(HashSet::new()));
         paused.lock().unwrap().insert("agent-1".into());
 
-        let mut assembler = Assembler::new(paused.clone());
+        let mut assembler = Assembler::new(
+            paused.clone(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+        );
         assembler.receive(
             make_span("child-1", "trace-1", Some("never-arrives")),
             vec![],
@@ -514,7 +581,10 @@ mod tests {
         let paused: PausedAgents = Arc::new(Mutex::new(HashSet::new()));
         paused.lock().unwrap().insert("agent-1".into());
 
-        let mut assembler = Assembler::new(paused);
+        let mut assembler = Assembler::new(
+            paused,
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+        );
         assembler.receive(make_span("root-1", "trace-1", None), vec![], make_agent());
 
         // Backdate the straggler window so the trace is due for completion.
@@ -527,6 +597,109 @@ mod tests {
             finalized[0].1,
             CompletionState::Completed,
             "a trace whose root arrived completes regardless of pause state"
+        );
+    }
+
+    #[test]
+    fn disconnect_grace_holds_the_idle_timeout() {
+        let disconnected: DisconnectedAgents =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut assembler =
+            Assembler::new(Arc::new(Mutex::new(HashSet::new())), disconnected.clone());
+        assembler.receive(
+            make_span("child", "t1", Some("missing")),
+            vec![],
+            make_agent(),
+        );
+
+        // Disconnected just now: within grace, the trace must stay in
+        // flight even if the idle clock would otherwise have expired.
+        disconnected
+            .lock()
+            .unwrap()
+            .insert("agent-1".into(), Instant::now());
+        if let Some(trace) = assembler.traces.get_mut(&TraceId::from("t1")) {
+            trace.last_updated = Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+        }
+        assert!(
+            assembler.tick().is_empty(),
+            "grace period must hold off the idle timeout"
+        );
+    }
+
+    #[test]
+    fn expired_grace_flushes_as_resumable() {
+        let disconnected: DisconnectedAgents =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut assembler =
+            Assembler::new(Arc::new(Mutex::new(HashSet::new())), disconnected.clone());
+        assembler.receive(
+            make_span("child", "t1", Some("missing")),
+            vec![],
+            make_agent(),
+        );
+
+        disconnected.lock().unwrap().insert(
+            "agent-1".into(),
+            Instant::now() - DISCONNECT_GRACE - Duration::from_secs(1),
+        );
+        let finalized = assembler.tick();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(
+            finalized[0].1,
+            CompletionState::InterruptedResumable,
+            "grace expiry flushes the trace as resumable"
+        );
+    }
+
+    #[test]
+    fn reconnect_within_grace_resumes_the_idle_clock() {
+        let disconnected: DisconnectedAgents =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut assembler =
+            Assembler::new(Arc::new(Mutex::new(HashSet::new())), disconnected.clone());
+        assembler.receive(
+            make_span("child", "t1", Some("missing")),
+            vec![],
+            make_agent(),
+        );
+
+        disconnected
+            .lock()
+            .unwrap()
+            .insert("agent-1".into(), Instant::now());
+        assert!(assembler.tick().is_empty());
+
+        // The control server clears the entry on reconnect; the refresh
+        // done during grace means the idle clock starts fresh from here.
+        disconnected.lock().unwrap().clear();
+        assert!(
+            assembler.tick().is_empty(),
+            "a reconnected agent's trace stays in flight"
+        );
+    }
+
+    #[test]
+    fn completed_trace_is_never_downgraded_by_grace_expiry() {
+        let disconnected: DisconnectedAgents =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut assembler =
+            Assembler::new(Arc::new(Mutex::new(HashSet::new())), disconnected.clone());
+        // Root arrived: the straggler window governs, not the grace.
+        assembler.receive(make_span("root", "t1", None), vec![], make_agent());
+        if let Some(trace) = assembler.traces.get_mut(&TraceId::from("t1")) {
+            trace.completion_timer = Some(Instant::now() - STRAGGLER_WINDOW);
+        }
+        disconnected.lock().unwrap().insert(
+            "agent-1".into(),
+            Instant::now() - DISCONNECT_GRACE - Duration::from_secs(1),
+        );
+        let finalized = assembler.tick();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(
+            finalized[0].1,
+            CompletionState::Completed,
+            "a root that arrived before disconnect still completes normally"
         );
     }
 }
