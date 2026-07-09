@@ -28,6 +28,8 @@ pub struct SseAccumulator {
     pub cache_creation_tokens: u64,
     pub content: String,
     pub stop_reason: Option<String>,
+    /// tool_use blocks the assistant opened: (id, name).
+    pub tool_uses: Vec<(String, String)>,
 }
 
 impl SseAccumulator {
@@ -69,6 +71,19 @@ impl SseAccumulator {
                     self.input_tokens = get("input_tokens");
                     self.cache_read_tokens = get("cache_read_input_tokens");
                     self.cache_creation_tokens = get("cache_creation_input_tokens");
+                }
+            }
+            Some("content_block_start") => {
+                if let Some(block) = data
+                    .get("content_block")
+                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                {
+                    if let (Some(id), Some(name)) = (
+                        block.get("id").and_then(|v| v.as_str()),
+                        block.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        self.tool_uses.push((id.to_string(), name.to_string()));
+                    }
                 }
             }
             Some("content_block_delta") => {
@@ -158,6 +173,16 @@ mod tests {
         acc.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":10}}\n\n");
         acc.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":25}}\n\n");
         assert_eq!(acc.output_tokens, 25, "the wire count is cumulative");
+    }
+
+    #[test]
+    fn tool_use_blocks_are_collected() {
+        let mut acc = SseAccumulator::default();
+        acc.feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"bash\"}}\n\n");
+        assert_eq!(
+            acc.tool_uses,
+            vec![("toolu_1".to_string(), "bash".to_string())]
+        );
     }
 
     #[test]
