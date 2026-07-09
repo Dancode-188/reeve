@@ -104,6 +104,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Ports are checked before anything binds them for real: a taken port
+    // must be a loud fatal card, never a cockpit that renders and starves.
+    loop {
+        match check_ports_available(&[
+            (4316, "control channel"),
+            (addr.port(), "OTel ingestion"),
+            (4318, "HTTP proxy"),
+        ]) {
+            Ok(()) => break,
+            Err(err) => match reeve_renderer::show_fatal(&err)? {
+                reeve_renderer::FatalOutcome::Retry => continue,
+                reeve_renderer::FatalOutcome::Quit => return Ok(()),
+            },
+        }
+    }
+
     let engine_ingestion_rx = ingestion_tx.subscribe();
     let proxy_addr: std::net::SocketAddr = "127.0.0.1:4318"
         .parse()
@@ -184,5 +200,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
+    Ok(())
+}
+
+/// Best-effort lookup of which process holds a local TCP port: the
+/// socket inode from /proc/net/tcp, then a scan of same-user /proc fds.
+/// Same-user visibility only, which covers the common case of a second
+/// Reeve instance; anything else reports as unknown.
+fn port_holder(port: u16) -> Option<String> {
+    let tcp = std::fs::read_to_string("/proc/net/tcp").ok()?;
+    let inode = tcp.lines().skip(1).find_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let local = cols.get(1)?;
+        let port_hex = local.split(':').nth(1)?;
+        if u16::from_str_radix(port_hex, 16).ok()? == port {
+            cols.get(9).map(|s| s.to_string())
+        } else {
+            None
+        }
+    })?;
+    let target = format!("socket:[{inode}]");
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let pid = entry.file_name();
+        let Some(pid_str) = pid.to_str() else { continue };
+        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if let Ok(link) = std::fs::read_link(fd.path()) {
+                if link.to_string_lossy() == target {
+                    let comm = std::fs::read_to_string(entry.path().join("comm"))
+                        .unwrap_or_default();
+                    return Some(format!("{} (pid {})", comm.trim(), pid_str));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Binding every port Reeve needs is a startup precondition. A port
+/// already held used to produce a normal-looking cockpit that silently
+/// received nothing, because the bind failure happened inside a spawned
+/// task; checking up front turns that dead cockpit into a fatal card
+/// that names the port and, when visible, the holder.
+fn check_ports_available(ports: &[(u16, &str)]) -> Result<(), reeve_renderer::app::FatalError> {
+    for (port, purpose) in ports {
+        let addr = format!("127.0.0.1:{port}");
+        if std::net::TcpListener::bind(&addr).is_err() {
+            let holder = port_holder(*port)
+                .map(|h| format!("held by {h}"))
+                .unwrap_or_else(|| "held by another process".to_string());
+            return Err(reeve_renderer::app::FatalError {
+                message: format!("port {port} ({purpose}) is already in use, {holder}"),
+                hint: Some(
+                    "another Reeve may already be running; close it or wait for the port to free"
+                        .to_string(),
+                ),
+            });
+        }
+    }
     Ok(())
 }
