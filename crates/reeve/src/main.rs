@@ -222,7 +222,9 @@ fn port_holder(port: u16) -> Option<String> {
     let target = format!("socket:[{inode}]");
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let pid = entry.file_name();
-        let Some(pid_str) = pid.to_str() else { continue };
+        let Some(pid_str) = pid.to_str() else {
+            continue;
+        };
         if !pid_str.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
@@ -232,8 +234,8 @@ fn port_holder(port: u16) -> Option<String> {
         for fd in fds.flatten() {
             if let Ok(link) = std::fs::read_link(fd.path()) {
                 if link.to_string_lossy() == target {
-                    let comm = std::fs::read_to_string(entry.path().join("comm"))
-                        .unwrap_or_default();
+                    let comm =
+                        std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
                     return Some(format!("{} (pid {})", comm.trim(), pid_str));
                 }
             }
