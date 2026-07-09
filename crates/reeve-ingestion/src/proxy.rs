@@ -8,6 +8,7 @@
 
 use crate::normalize::PipelineSpan;
 use crate::sse::SseAccumulator;
+use crate::threading::{ConversationTracker, ResponseInfo, ToolCall, TurnPlacement, TurnRoot};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
@@ -36,6 +37,8 @@ struct ProxyState {
     /// Overrides User-Agent derivation when set (REEVE_PROXY_AGENT_NAME).
     agent_name_override: Option<String>,
     stream_chunk_timeout: std::time::Duration,
+    /// Conversation threading state; see the threading module.
+    tracker: std::sync::Mutex<ConversationTracker>,
 }
 
 pub async fn run(
@@ -71,6 +74,7 @@ pub async fn run_with(
         signal_tx,
         agent_name_override,
         stream_chunk_timeout,
+        tracker: std::sync::Mutex::new(ConversationTracker::default()),
     });
 
     let app = axum::Router::new()
@@ -99,6 +103,35 @@ async fn forward(
         .map(|pq| pq.as_str())
         .unwrap_or(uri.path());
     let url = format!("{}{}", state.upstream, path);
+
+    // Threading placement happens before the forward so tool spans render
+    // while the model is still thinking; its cost lands inside the
+    // measured overhead below, honestly.
+    let agent_name = state
+        .agent_name_override
+        .clone()
+        .unwrap_or_else(|| derive_agent_name(&headers));
+    let placement = if method == Method::POST && uri.path().ends_with("/v1/messages") {
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|req_json| {
+                let messages = req_json.get("messages")?.as_array()?.clone();
+                Some(
+                    state
+                        .tracker
+                        .lock()
+                        .expect("tracker mutex poisoned")
+                        .place_request(&agent_name, &messages, arrived, random_bytes),
+                )
+            })
+    } else {
+        None
+    };
+    if let Some(ref placement) = placement {
+        for tool in &placement.tools {
+            emit_tool_span(&state, &agent_name, placement, tool).await;
+        }
+    }
 
     let mut req = state.client.request(method.clone(), &url);
     for (name, value) in headers.iter() {
@@ -139,7 +172,8 @@ async fn forward(
         let body = stream_and_accumulate(
             state.clone(),
             upstream_resp,
-            headers.clone(),
+            agent_name,
+            placement,
             arrived,
             overhead_ms,
         );
@@ -160,7 +194,8 @@ async fn forward(
     if method == Method::POST && uri.path().ends_with("/v1/messages") {
         synthesize_span(
             &state,
-            &headers,
+            &agent_name,
+            placement,
             &resp_body,
             status.as_u16(),
             arrived,
@@ -226,7 +261,8 @@ impl StreamOutcome {
 fn stream_and_accumulate(
     state: Arc<ProxyState>,
     upstream_resp: reqwest::Response,
-    req_headers: HeaderMap,
+    agent_name: String,
+    placement: Option<TurnPlacement>,
     arrived: SystemTime,
     overhead_ms: f64,
 ) -> Body {
@@ -235,7 +271,10 @@ fn stream_and_accumulate(
     tokio::spawn(async move {
         let mut upstream = upstream_resp.bytes_stream();
         let mut acc = SseAccumulator::default();
-        let trace_id = random_bytes(16);
+        let (trace_id, parent_span_id) = match &placement {
+            Some(p) => (p.trace_id.clone(), p.root_span_id.clone()),
+            None => (random_bytes(16), Vec::new()),
+        };
         let span_id = random_bytes(8);
         let span_id_hex: String = span_id.iter().map(|b| format!("{:02x}", b)).collect();
         let trace_id_hex: String = trace_id.iter().map(|b| format!("{:02x}", b)).collect();
@@ -290,10 +329,12 @@ fn stream_and_accumulate(
         });
         finalize_stream_span(
             &state,
-            &req_headers,
+            &agent_name,
+            placement,
             acc,
             outcome,
             trace_id,
+            parent_span_id,
             span_id,
             arrived,
             ttft_ms,
@@ -310,10 +351,12 @@ fn stream_and_accumulate(
 #[allow(clippy::too_many_arguments)]
 async fn finalize_stream_span(
     state: &ProxyState,
-    req_headers: &HeaderMap,
+    agent_name: &str,
+    placement: Option<TurnPlacement>,
     acc: SseAccumulator,
     outcome: StreamOutcome,
     trace_id: Vec<u8>,
+    parent_span_id: Vec<u8>,
     span_id: Vec<u8>,
     arrived: SystemTime,
     ttft_ms: Option<f64>,
@@ -335,6 +378,12 @@ async fn finalize_stream_span(
     ];
     if let Some(ttft) = ttft_ms {
         attributes.push(kv_double("reeve.proxy.ttft_ms", ttft));
+    }
+    if let Some(ref p) = placement {
+        attributes.push(kv_int(
+            "reeve.proxy.context_messages",
+            p.message_count as i64,
+        ));
     }
     if acc.cache_read_tokens > 0 {
         attributes.push(kv_int(
@@ -359,12 +408,14 @@ async fn finalize_stream_span(
         StreamOutcome::Completed | StreamOutcome::ClientDisconnected => 1,
     };
 
+    let ended = SystemTime::now();
     let span = OtlpSpan {
         trace_id,
-        span_id,
+        span_id: span_id.clone(),
+        parent_span_id,
         name: "gen_ai.chat".to_string(),
         start_time_unix_nano: to_nanos(arrived),
-        end_time_unix_nano: to_nanos(SystemTime::now()),
+        end_time_unix_nano: to_nanos(ended),
         attributes,
         status: Some(OtlpStatus {
             code: status_code,
@@ -372,15 +423,46 @@ async fn finalize_stream_span(
         }),
         ..Default::default()
     };
+    emit_pipeline_span(state, agent_name, span, arrived).await;
 
-    let service_name = state
-        .agent_name_override
-        .clone()
-        .unwrap_or_else(|| derive_agent_name(req_headers));
+    if placement.is_some() {
+        // A dead stream still ends its turn: whatever the outcome, the
+        // assistant is not going to request more tools on this round trip,
+        // so an outcome other than tool_use closes the turn honestly.
+        let stop_reason = match outcome {
+            StreamOutcome::Completed => acc.stop_reason,
+            _ => Some(format!("proxy:{}", outcome.label())),
+        };
+        let root = state
+            .tracker
+            .lock()
+            .expect("tracker mutex poisoned")
+            .record_response(
+                agent_name,
+                ResponseInfo {
+                    chat_span_id: span_id,
+                    tool_uses: acc.tool_uses,
+                    stop_reason,
+                    ended_at: ended,
+                },
+            );
+        if let Some(root) = root {
+            emit_turn_root(state, agent_name, root).await;
+        }
+    }
+}
 
+/// Sends one synthesized span into the pipeline under the proxy agent's
+/// identity.
+async fn emit_pipeline_span(
+    state: &ProxyState,
+    agent_name: &str,
+    span: OtlpSpan,
+    arrived: SystemTime,
+) {
     let ps = PipelineSpan {
         span,
-        service_name,
+        service_name: agent_name.to_string(),
         service_instance_id: "proxy".to_string(),
         framework: "proxy".to_string(),
         arrived_at: to_millis(arrived),
@@ -388,24 +470,73 @@ async fn finalize_stream_span(
         integration: IntegrationPath::Proxy,
     };
     if state.pipeline_tx.send(ps).await.is_err() {
-        tracing::warn!("normalize stage unavailable, stream span discarded");
+        tracing::warn!("normalize stage unavailable, proxy span discarded");
     }
 }
 
+/// A reconstructed tool call becomes a child span of the chat span whose
+/// response requested it, covering the gap between that response and the
+/// request that carried the result.
+async fn emit_tool_span(
+    state: &ProxyState,
+    agent_name: &str,
+    placement: &TurnPlacement,
+    tool: &ToolCall,
+) {
+    let span = OtlpSpan {
+        trace_id: placement.trace_id.clone(),
+        span_id: random_bytes(8),
+        parent_span_id: tool.parent_span_id.clone(),
+        name: format!("gen_ai.tool:{}", tool.name),
+        start_time_unix_nano: to_nanos(tool.started_at),
+        end_time_unix_nano: to_nanos(tool.ended_at),
+        attributes: vec![
+            kv_str("gen_ai.system", "anthropic"),
+            kv_str("gen_ai.operation.name", "execute_tool"),
+        ],
+        status: Some(OtlpStatus {
+            code: if tool.is_error { 2 } else { 1 },
+            message: String::new(),
+        }),
+        ..Default::default()
+    };
+    emit_pipeline_span(state, agent_name, span, tool.ended_at).await;
+}
+
+/// The synthetic turn root: the no-parent span whose arrival tells the
+/// assembler the trace is complete, emitted only when the turn ends,
+/// exactly as SDK agents emit their task root last.
+async fn emit_turn_root(state: &ProxyState, agent_name: &str, root: TurnRoot) {
+    let span = OtlpSpan {
+        trace_id: root.trace_id,
+        span_id: root.span_id,
+        name: root.name,
+        start_time_unix_nano: to_nanos(root.started_at),
+        end_time_unix_nano: to_nanos(root.ended_at),
+        attributes: vec![kv_str("gen_ai.operation.name", "chat")],
+        status: Some(OtlpStatus {
+            code: 1,
+            message: String::new(),
+        }),
+        ..Default::default()
+    };
+    emit_pipeline_span(state, agent_name, span, root.ended_at).await;
+}
+
 /// One Messages API round trip becomes one gen_ai.chat span carrying the
-/// model, token usage, and estimated cost, fed through the same pipeline
-/// as SDK spans. Upstream failures (429s, 5xx) synthesize a failed span
-/// so retry storms render visibly.
+/// model, token usage, and estimated cost, threaded into its turn's trace
+/// as a child of the turn root. Upstream failures (429s, 5xx) synthesize
+/// failed spans so retry storms render visibly.
 async fn synthesize_span(
     state: &ProxyState,
-    req_headers: &HeaderMap,
+    agent_name: &str,
+    placement: Option<TurnPlacement>,
     resp_body: &[u8],
     http_status: u16,
     arrived: SystemTime,
     overhead_ms: f64,
 ) {
     let ended = SystemTime::now();
-    let arrived_ms = to_millis(arrived);
 
     let parsed: serde_json::Value = serde_json::from_slice(resp_body).unwrap_or_default();
     let model = parsed
@@ -424,6 +555,26 @@ async fn synthesize_span(
     let output_tokens = get_u64("output_tokens");
     let cache_read = get_u64("cache_read_input_tokens");
     let cache_creation = get_u64("cache_creation_input_tokens");
+    let stop_reason = parsed
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let tool_uses: Vec<(String, String)> = parsed
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                .filter_map(|b| {
+                    Some((
+                        b.get("id")?.as_str()?.to_string(),
+                        b.get("name")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut attributes = vec![
         kv_str("gen_ai.system", "anthropic"),
@@ -438,6 +589,12 @@ async fn synthesize_span(
         kv_int("http.response.status_code", http_status as i64),
         kv_double("reeve.proxy.overhead_ms", overhead_ms),
     ];
+    if let Some(ref p) = placement {
+        attributes.push(kv_int(
+            "reeve.proxy.context_messages",
+            p.message_count as i64,
+        ));
+    }
     if cache_read > 0 {
         attributes.push(kv_int("gen_ai.usage.cache_read_tokens", cache_read as i64));
     }
@@ -451,13 +608,20 @@ async fn synthesize_span(
         attributes.push(kv_double("gen_ai.usage.cost", cost));
     }
 
-    // STATUS_CODE_ERROR = 2: upstream refusals and failures render as
-    // failed spans, which is what makes a retry storm visible.
     let status_code = if http_status >= 400 { 2 } else { 1 };
+    let chat_span_id = random_bytes(8);
+    // A request without a parseable conversation synthesizes a standalone
+    // span, its own root in its own trace: the pre-threading behavior,
+    // kept as the fallback so unusual clients still render.
+    let (trace_id, parent_span_id) = match &placement {
+        Some(p) => (p.trace_id.clone(), p.root_span_id.clone()),
+        None => (random_bytes(16), Vec::new()),
+    };
 
     let span = OtlpSpan {
-        trace_id: random_bytes(16),
-        span_id: random_bytes(8),
+        trace_id,
+        span_id: chat_span_id.clone(),
+        parent_span_id,
         name: "gen_ai.chat".to_string(),
         start_time_unix_nano: to_nanos(arrived),
         end_time_unix_nano: to_nanos(ended),
@@ -468,23 +632,25 @@ async fn synthesize_span(
         }),
         ..Default::default()
     };
+    emit_pipeline_span(state, agent_name, span, arrived).await;
 
-    let service_name = state
-        .agent_name_override
-        .clone()
-        .unwrap_or_else(|| derive_agent_name(req_headers));
-
-    let ps = PipelineSpan {
-        span,
-        service_name,
-        service_instance_id: "proxy".to_string(),
-        framework: "proxy".to_string(),
-        arrived_at: arrived_ms,
-        clock_offset_ms: 0,
-        integration: IntegrationPath::Proxy,
-    };
-    if state.pipeline_tx.send(ps).await.is_err() {
-        tracing::warn!("normalize stage unavailable, proxy span discarded");
+    if placement.is_some() {
+        let root = state
+            .tracker
+            .lock()
+            .expect("tracker mutex poisoned")
+            .record_response(
+                agent_name,
+                ResponseInfo {
+                    chat_span_id,
+                    tool_uses,
+                    stop_reason,
+                    ended_at: ended,
+                },
+            );
+        if let Some(root) = root {
+            emit_turn_root(state, agent_name, root).await;
+        }
     }
 }
 
@@ -541,6 +707,11 @@ fn to_nanos(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) fn test_random_bytes(n: usize) -> Vec<u8> {
+    random_bytes(n)
 }
 
 /// Unique ids without a rand dependency: a process-wide counter hashed

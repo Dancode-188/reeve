@@ -5,6 +5,7 @@ pub mod proxy;
 pub mod receive;
 pub mod route;
 pub mod sse;
+pub mod threading;
 
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
 use receive::OtlpReceiver;
