@@ -368,10 +368,21 @@ impl AppState {
             .get(agent_id)
             .is_some_and(|a| a.agent.integration == reeve_model::entity::IntegrationPath::Proxy);
         if is_proxy {
-            vec!["redirect".to_string(), "inject_context".to_string()]
+            vec![
+                "redirect".to_string(),
+                "inject_context".to_string(),
+                "kill".to_string(),
+            ]
         } else {
             Vec::new()
         }
+    }
+
+    /// Whether the agent arrived via the proxy path.
+    pub fn is_proxy_agent(&self, agent_id: &AgentId) -> bool {
+        self.agents
+            .get(agent_id)
+            .is_some_and(|a| a.agent.integration == reeve_model::entity::IntegrationPath::Proxy)
     }
 
     /// Compact fleet summary for the terminal tab title: agent count and
@@ -1351,18 +1362,22 @@ impl App {
                     // can be killed; anything else gets told up front rather
                     // than walked through a confirmation the SDK will refuse.
                     Action::VimUp if caps.contains(&"kill".to_string()) => {
-                        let killable = self
-                            .state
-                            .overlay
-                            .as_ref()
-                            .and_then(|ov| self.state.agents.get(&ov.agent_id))
-                            .is_some_and(|a| {
-                                matches!(
-                                    a.agent.status,
-                                    reeve_model::entity::AgentStatus::Running
-                                        | reeve_model::entity::AgentStatus::Paused
-                                )
-                            });
+                        // A proxy agent between requests shows idle, and the
+                        // breaker's whole point is stopping the next request,
+                        // so proxy agents are killable in any state.
+                        let killable = self.state.is_proxy_agent(&agent_id)
+                            || self
+                                .state
+                                .overlay
+                                .as_ref()
+                                .and_then(|ov| self.state.agents.get(&ov.agent_id))
+                                .is_some_and(|a| {
+                                    matches!(
+                                        a.agent.status,
+                                        reeve_model::entity::AgentStatus::Running
+                                            | reeve_model::entity::AgentStatus::Paused
+                                    )
+                                });
                         if killable {
                             if let Some(ref mut ov) = self.state.overlay {
                                 ov.mode = OverlayMode::KillConfirm;

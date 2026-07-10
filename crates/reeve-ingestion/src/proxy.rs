@@ -119,6 +119,32 @@ async fn forward(
         .agent_name_override
         .clone()
         .unwrap_or_else(|| derive_agent_name(&headers));
+
+    // The circuit breaker: a killed agent's Messages requests are refused
+    // instead of forwarded. Enforcement is local, so the agent cannot
+    // spend another token no matter how broken its loop is. Only the
+    // Messages path is refused, since that is where money burns.
+    if method == Method::POST && uri.path().ends_with("/v1/messages") {
+        let killed = state.interventions.as_ref().is_some_and(|iv| {
+            iv.lock()
+                .expect("interventions mutex poisoned")
+                .killed
+                .contains(&reeve_model::ids::agent_id_from_service(
+                    &agent_name,
+                    "proxy",
+                ))
+        });
+        if killed {
+            tracing::info!(agent = %agent_name, "circuit breaker refused a request from a killed agent");
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    "{\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"an operator killed this agent via Reeve; API access is stopped until Reeve restarts\"}}",
+                ))
+                .expect("static response construction cannot fail");
+        }
+    }
     let placement = if method == Method::POST && uri.path().ends_with("/v1/messages") {
         serde_json::from_slice::<serde_json::Value>(&body)
             .ok()
@@ -845,16 +871,19 @@ mod tests {
         upstream_status: u16,
         upstream_body: &'static str,
     ) -> (String, mpsc::Receiver<PipelineSpan>, ProxyInterventions) {
-        let upstream_app = axum::Router::new().route(
-            "/v1/messages",
-            post(move || async move {
-                Response::builder()
-                    .status(upstream_status)
-                    .header("content-type", "application/json")
-                    .body(Body::from(upstream_body))
-                    .unwrap()
-            }),
-        );
+        let upstream_app = axum::Router::new()
+            .route(
+                "/v1/messages",
+                post(move || async move {
+                    Response::builder()
+                        .status(upstream_status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(upstream_body))
+                        .unwrap()
+                }),
+            )
+            // A non-Messages endpoint the breaker must never touch.
+            .route("/v1/messages/count_tokens", post(|| async { "{}" }));
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1359,6 +1388,64 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             other => panic!("context attr missing: {other:?}"),
         }
         let _ = first;
+    }
+
+    #[tokio::test]
+    async fn engaged_breaker_refuses_messages_requests() {
+        let (base, _rx, interventions) = spawn_proxy_with_interventions(200, OK_BODY).await;
+        let agent_id = reeve_model::ids::agent_id_from_service("claude-cli", "proxy");
+        let client = reqwest::Client::new();
+
+        // Before the kill: requests flow.
+        let ok = client
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+
+        interventions.lock().unwrap().killed.insert(agent_id);
+
+        // After: refused with a clean API error naming the operator kill.
+        let refused = client
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 403);
+        let body = refused.text().await.unwrap();
+        assert!(body.contains("killed this agent via Reeve"));
+
+        // A different agent through the same proxy is untouched.
+        let other = client
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "other-tool/1.0")
+            .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(other.status(), 200, "other agents keep flowing");
+
+        // The breaker cuts the money path only. Token counting is not
+        // where tokens are spent, so a killed agent's count_tokens call
+        // still reaches the upstream and succeeds; blocking it would break
+        // clients for nothing.
+        let count = client
+            .post(format!("{base}/v1/messages/count_tokens"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            count.status(),
+            200,
+            "the breaker is messages-only; count_tokens must still forward"
+        );
     }
 
     #[test]
