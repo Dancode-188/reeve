@@ -638,6 +638,9 @@ async fn emit_tool_span(
         attributes: vec![
             kv_str("gen_ai.system", "anthropic"),
             kv_str("gen_ai.operation.name", "execute_tool"),
+            // The clean tool name, so the judge scores [bash, read]
+            // rather than raw operation names.
+            kv_str("gen_ai.tool.name", &tool.name),
         ],
         status: Some(OtlpStatus {
             code: if tool.is_error { 2 } else { 1 },
@@ -1113,6 +1116,54 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             other => panic!("cost attribute missing: {other:?}"),
         }
         assert_eq!(ps.span.status.as_ref().map(|s| s.code), Some(1));
+    }
+
+    #[tokio::test]
+    async fn tool_spans_carry_the_clean_tool_name() {
+        const TOOL_USE_BODY: &str = r#"{
+            "id": "msg_tool",
+            "model": "claude-opus-4-8",
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "toolu_T1", "name": "bash",
+                         "input": {"command": "ls"}}],
+            "usage": {"input_tokens": 100, "output_tokens": 10}
+        }"#;
+        let (base, mut rx) = spawn_proxy(200, TOOL_USE_BODY).await;
+        let client = reqwest::Client::new();
+
+        client
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"ls"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        let _chat1 = rx.recv().await.expect("first chat span");
+
+        client
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(
+                r#"{"model":"claude-opus-4-8","messages":[
+                    {"role":"user","content":"ls"},
+                    {"role":"assistant","content":[{"type":"tool_use","id":"toolu_T1","name":"bash","input":{"command":"ls"}}]},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_T1","content":"a.txt"}]}
+                ]}"#,
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let tool = rx.recv().await.expect("tool span");
+        assert_eq!(tool.span.name, "gen_ai.tool:bash");
+        // The judge prefers this attribute over the raw operation name;
+        // it must survive from here through normalization (which has its
+        // own whitelist test) to reach the prompt as [bash], not
+        // [gen_ai.tool:bash].
+        match attr(&tool.span, "gen_ai.tool.name") {
+            Some(any_value::Value::StringValue(n)) => assert_eq!(n, "bash"),
+            other => panic!("gen_ai.tool.name missing on tool span: {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -97,6 +97,7 @@ impl AttributeTranslator for V1AttributeTranslator {
             "gen_ai.usage.cache_creation_tokens",
             "gen_ai.usage.cache_saved",
             "gen_ai.usage.cost",
+            "gen_ai.tool.name",
         ];
 
         let mut known = serde_json::Map::new();
@@ -294,6 +295,7 @@ mod tests {
                 string_kv("gen_ai.request.model", "claude-3-5-sonnet"),
                 int_kv("gen_ai.usage.input_tokens", 512),
                 int_kv("gen_ai.usage.cache_read_tokens", 2048),
+                string_kv("gen_ai.tool.name", "search"),
                 string_kv("custom.my_app.version", "1.0"),
             ],
             ..Default::default()
@@ -313,6 +315,13 @@ mod tests {
         assert_eq!(
             internal.attributes["gen_ai.usage.cache_read_tokens"],
             serde_json::json!(2048i64)
+        );
+        // The judge's extract_tool_calls reads this from queryable
+        // attributes; dropping it here silently degrades tool-selection
+        // prompts to raw operation names.
+        assert_eq!(
+            internal.attributes["gen_ai.tool.name"],
+            serde_json::Value::String("search".to_string())
         );
         assert!(
             internal.attributes.get("custom.my_app.version").is_none(),

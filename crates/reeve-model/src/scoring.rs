@@ -129,6 +129,28 @@ mod tests {
     }
 
     #[test]
+    fn proxy_shape_with_judge_covers_seventy_percent() {
+        // A proxy agent with the judge available: tool_selection scores
+        // from operation names, but faithfulness needs captured content
+        // no agent has at privacy tier 1. Coverage is honestly 0.70,
+        // never quietly 1.0.
+        let s = scores(&[
+            ("tool_selection", 0.8),
+            ("loop_detection", 1.0),
+            ("cost_efficiency", 1.0),
+            ("latency_normality", 1.0),
+        ]);
+        let hs = compute(&s).unwrap();
+        assert!((hs.weight_coverage - 0.70).abs() < 0.001);
+        assert!(
+            hs.tier2_pending,
+            "missing faithfulness keeps tier 2 pending"
+        );
+        // (0.8*0.25 + 1.0*0.45) / 0.70 = 0.9286
+        assert!((hs.value - 92.857).abs() < 0.01);
+    }
+
+    #[test]
     fn single_metric_carries_full_weight() {
         // Only loop_detection at 0.5 — should give score of 50.
         let s = scores(&[("loop_detection", 0.5)]);
