@@ -179,7 +179,15 @@ async fn forward(
     let mut req = state.client.request(method.clone(), &url);
     for (name, value) in headers.iter() {
         // Host belongs to the upstream; hyper sets the rest correctly.
-        if name == axum::http::header::HOST || name == axum::http::header::CONTENT_LENGTH {
+        // Accept-Encoding is stripped so the upstream answers in plain
+        // text: the proxy reads what passes through, and a compressed
+        // body is unreadable to the tee while the client decompresses
+        // happily. Real Claude Code sends gzip/br/zstd; every span went
+        // model-unknown and cost-less until this was dropped.
+        if name == axum::http::header::HOST
+            || name == axum::http::header::CONTENT_LENGTH
+            || name == axum::http::header::ACCEPT_ENCODING
+        {
             continue;
         }
         req = req.header(name, value);
@@ -1116,6 +1124,68 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             other => panic!("cost attribute missing: {other:?}"),
         }
         assert_eq!(ps.span.status.as_ref().map(|s| s.code), Some(1));
+    }
+
+    #[tokio::test]
+    async fn accept_encoding_never_reaches_the_upstream() {
+        // An upstream that answers compressed when invited would blind
+        // the tee (the real API does exactly that; caught by the first
+        // Claude Code dogfood run). This one refuses the invitation
+        // outright, so the test fails loudly if the header ever leaks
+        // through again.
+        let upstream_app = axum::Router::new().route(
+            "/v1/messages",
+            post(|headers: HeaderMap| async move {
+                if headers.contains_key(axum::http::header::ACCEPT_ENCODING) {
+                    return Response::builder()
+                        .status(500)
+                        .body(Body::from("accept-encoding leaked to upstream"))
+                        .unwrap();
+                }
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(Body::from(OK_BODY))
+                    .unwrap()
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let (signal_tx, _) = broadcast::channel(64);
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+        tokio::spawn(run_with(
+            proxy_addr,
+            format!("http://{}", upstream_addr),
+            None,
+            std::time::Duration::from_millis(500),
+            tx,
+            signal_tx,
+            None,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .header("accept-encoding", "gzip, deflate, br, zstd")
+            .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "upstream must never see the header");
+
+        let ps = rx.recv().await.expect("span synthesized");
+        match attr(&ps.span, "gen_ai.request.model") {
+            Some(any_value::Value::StringValue(m)) => assert_eq!(m, "claude-opus-4-8"),
+            other => panic!("a readable response must price the span: {other:?}"),
+        }
     }
 
     #[tokio::test]
