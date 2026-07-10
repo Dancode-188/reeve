@@ -285,9 +285,28 @@ fn close_tools(
 
 /// Per-message fingerprint. DefaultHasher is deterministic within a
 /// process, which is the only scope this state lives in.
+///
+/// `cache_control` is stripped before hashing: prompt-caching clients
+/// move the breakpoint marker forward to newer messages on every
+/// request, so a resent message is byte-identical except for the marker
+/// appearing or vanishing. The fingerprint covers what was said, not
+/// how the API was told to cache it. Real Claude Code broke on this.
 fn hash_message(msg: &serde_json::Value) -> u64 {
     let mut hasher = DefaultHasher::new();
-    msg.to_string().hash(&mut hasher);
+    match msg.get("content").and_then(|c| c.as_array()) {
+        Some(blocks) if blocks.iter().any(|b| b.get("cache_control").is_some()) => {
+            let mut clean = msg.clone();
+            if let Some(arr) = clean.get_mut("content").and_then(|c| c.as_array_mut()) {
+                for block in arr.iter_mut() {
+                    if let Some(obj) = block.as_object_mut() {
+                        obj.remove("cache_control");
+                    }
+                }
+            }
+            clean.to_string().hash(&mut hasher);
+        }
+        _ => msg.to_string().hash(&mut hasher),
+    }
     hasher.finish()
 }
 
@@ -361,6 +380,49 @@ mod tests {
         let root = root.expect("end_turn closes the turn");
         assert_eq!(root.trace_id, p1.trace_id);
         assert_eq!(root.name, "agent.turn.1");
+    }
+
+    #[test]
+    fn a_moving_cache_control_marker_does_not_break_the_prefix() {
+        // The shape real Claude Code sends (#178): request 1 marks its
+        // last content block as a cache breakpoint; request 2 resends
+        // the same message WITHOUT the marker, because the breakpoint
+        // moved forward to the newly appended messages.
+        let mut t = ConversationTracker::default();
+        let now = SystemTime::now();
+
+        let marked = serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": "list the files",
+             "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+        ]});
+        let unmarked = serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": "list the files"}
+        ]});
+
+        let p1 = t.place_request("claude-cli", &[marked], now, ids);
+        assert!(p1.new_conversation);
+        t.record_response(
+            "claude-cli",
+            ResponseInfo {
+                chat_span_id: vec![1; 8],
+                tool_uses: vec![("toolu_1".into(), "bash".into())],
+                stop_reason: Some("tool_use".into()),
+                ended_at: now,
+            },
+        );
+
+        let m2 = vec![
+            unmarked,
+            msg("assistant", "running bash"),
+            tool_result("toolu_1", false),
+        ];
+        let p2 = t.place_request("claude-cli", &m2, now, ids);
+        assert!(
+            !p2.new_conversation,
+            "a moved cache marker must not read as a new conversation"
+        );
+        assert_eq!(p2.trace_id, p1.trace_id, "same turn, same trace");
+        assert_eq!(p2.tools.len(), 1, "the tool span survives the marker move");
     }
 
     #[test]
