@@ -356,10 +356,28 @@ fn stream_and_accumulate(
                 // upstream closes the stream on its own terms.
             }
             if update.content_changed {
+                // The wire only reports output tokens at stream end, so
+                // the running estimate counts what is already committed
+                // (input and cache, usually the bulk for agentic clients)
+                // plus the accumulated text at roughly four chars per
+                // token. The final span cost, from real usage, corrects
+                // whatever this guessed.
+                let output_estimate = (acc.content.len() as u64 / 4).max(acc.output_tokens);
+                let cost_so_far = acc.model.as_deref().and_then(|m| {
+                    crate::pricing::estimate(
+                        m,
+                        acc.input_tokens,
+                        output_estimate,
+                        acc.cache_read_tokens,
+                        acc.cache_creation_tokens,
+                    )
+                });
                 let _ = state.signal_tx.send(IngestionEvent::StreamingUpdate {
                     trace_id: trace_id_hex.clone().into(),
                     span_id: span_id_hex.clone().into(),
+                    agent_id: reeve_model::ids::agent_id_from_service(&agent_name, "proxy"),
                     content: acc.content.clone(),
+                    cost_so_far,
                 });
             }
         }
@@ -433,6 +451,19 @@ async fn finalize_stream_span(
             "gen_ai.usage.cache_read_tokens",
             acc.cache_read_tokens as i64,
         ));
+    }
+    if acc.cache_creation_tokens > 0 {
+        attributes.push(kv_int(
+            "gen_ai.usage.cache_creation_tokens",
+            acc.cache_creation_tokens as i64,
+        ));
+    }
+    if acc.cache_read_tokens > 0 || acc.cache_creation_tokens > 0 {
+        if let Some(saved) =
+            crate::pricing::cache_saved(&model, acc.cache_read_tokens, acc.cache_creation_tokens)
+        {
+            attributes.push(kv_double("gen_ai.usage.cache_saved", saved));
+        }
     }
     if let Some(cost) = crate::pricing::estimate(
         &model,
@@ -711,6 +742,17 @@ async fn synthesize_span(
     }
     if cache_read > 0 {
         attributes.push(kv_int("gen_ai.usage.cache_read_tokens", cache_read as i64));
+    }
+    if cache_creation > 0 {
+        attributes.push(kv_int(
+            "gen_ai.usage.cache_creation_tokens",
+            cache_creation as i64,
+        ));
+    }
+    if cache_read > 0 || cache_creation > 0 {
+        if let Some(saved) = crate::pricing::cache_saved(&model, cache_read, cache_creation) {
+            attributes.push(kv_double("gen_ai.usage.cache_saved", saved));
+        }
     }
     if let Some(cost) = crate::pricing::estimate(
         &model,
@@ -1074,6 +1116,42 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
     }
 
     #[tokio::test]
+    async fn cache_tokens_land_as_attributes_with_net_savings() {
+        const CACHE_BODY: &str = r#"{
+            "id": "msg_cache",
+            "model": "claude-opus-4-8",
+            "content": [{"type": "text", "text": "hello"}],
+            "usage": {"input_tokens": 1000, "output_tokens": 500,
+                      "cache_read_input_tokens": 2000,
+                      "cache_creation_input_tokens": 1000}
+        }"#;
+        let (base, mut rx) = spawn_proxy(200, CACHE_BODY).await;
+        reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "claude-cli/1.5.0")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+
+        let ps = rx.recv().await.expect("a span must be synthesized");
+        match attr(&ps.span, "gen_ai.usage.cache_read_tokens") {
+            Some(any_value::Value::IntValue(n)) => assert_eq!(*n, 2000),
+            other => panic!("cache_read_tokens missing: {other:?}"),
+        }
+        match attr(&ps.span, "gen_ai.usage.cache_creation_tokens") {
+            Some(any_value::Value::IntValue(n)) => assert_eq!(*n, 1000),
+            other => panic!("cache_creation_tokens missing: {other:?}"),
+        }
+        // Opus input $5/MTok: 2000 reads save $0.009 (0.9 factor), 1000
+        // writes cost an extra $0.00125 (0.25 premium). Net $0.00775.
+        match attr(&ps.span, "gen_ai.usage.cache_saved") {
+            Some(any_value::Value::DoubleValue(s)) => assert!((s - 0.00775).abs() < 1e-9),
+            other => panic!("cache_saved missing: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn api_key_never_reaches_the_span() {
         let (base, mut rx) = spawn_proxy(200, OK_BODY).await;
         reqwest::Client::new()
@@ -1184,14 +1262,42 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
         }
         assert_eq!(ps.span.status.as_ref().map(|s| s.code), Some(1));
 
-        // The streaming box producer: accumulated content grows.
+        // The streaming box producer: accumulated content grows, each
+        // update names its agent and carries a running cost estimate for
+        // the header ticker.
         let mut last = String::new();
+        let mut last_cost = None;
+        let mut agent_id = None;
         while let Ok(ev) = signal_rx.try_recv() {
-            if let IngestionEvent::StreamingUpdate { content, .. } = ev {
+            if let IngestionEvent::StreamingUpdate {
+                content,
+                cost_so_far,
+                agent_id: aid,
+                ..
+            } = ev
+            {
                 last = content;
+                last_cost = cost_so_far;
+                agent_id = Some(aid);
             }
         }
         assert_eq!(last, "one two three ", "live updates accumulate the text");
+        assert_eq!(
+            agent_id,
+            Some(reeve_model::ids::agent_id_from_service(
+                "claude-cli",
+                "proxy"
+            )),
+            "the update names the agent the header will tick for"
+        );
+        // Opus, 1000 input tokens known from message_start: the running
+        // estimate is at least the committed input cost ($0.005) and no
+        // more than the final priced cost.
+        let cost = last_cost.expect("a priced model yields a running estimate");
+        assert!(
+            (0.005..=0.00575).contains(&cost),
+            "running estimate stays between committed input cost and final: {cost}"
+        );
     }
 
     #[tokio::test]

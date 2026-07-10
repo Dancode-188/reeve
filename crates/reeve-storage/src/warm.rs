@@ -22,6 +22,13 @@ pub struct CostSummary {
     pub by_agent: Vec<(String, f64)>,
     /// (model name, total cost), highest spend first.
     pub by_model: Vec<(String, f64)>,
+    /// Prompt tokens served from cache across all spans.
+    pub cache_read_tokens: u64,
+    /// All prompt tokens: input plus cache reads plus cache writes. The
+    /// hit rate is reads over this; zero means no cache data seen.
+    pub prompt_tokens: u64,
+    /// Net dollars the prompt cache saved, summed from span attributes.
+    pub cache_saved: f64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -745,11 +752,31 @@ impl WarmStore {
                 )?
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
+            let (cache_read_tokens, prompt_tokens, cache_saved): (i64, i64, f64) = conn.query_row(
+                "SELECT
+                         COALESCE(SUM(json_extract(attributes,
+                             '$.\"gen_ai.usage.cache_read_tokens\"')), 0),
+                         COALESCE(SUM(
+                             COALESCE(json_extract(attributes,
+                                 '$.\"gen_ai.usage.input_tokens\"'), 0)
+                             + COALESCE(json_extract(attributes,
+                                 '$.\"gen_ai.usage.cache_read_tokens\"'), 0)
+                             + COALESCE(json_extract(attributes,
+                                 '$.\"gen_ai.usage.cache_creation_tokens\"'), 0)), 0),
+                         COALESCE(SUM(json_extract(attributes,
+                             '$.\"gen_ai.usage.cache_saved\"')), 0.0)
+                     FROM spans",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
             Ok(CostSummary {
                 total,
                 trace_count,
                 by_agent,
                 by_model,
+                cache_read_tokens: cache_read_tokens.max(0) as u64,
+                prompt_tokens: prompt_tokens.max(0) as u64,
+                cache_saved,
             })
         })
         .await
@@ -1345,6 +1372,31 @@ mod tests {
             summary.by_model[1].0, "other",
             "spans without a model attribute group under other"
         );
+    }
+
+    #[tokio::test]
+    async fn cost_summary_sums_cache_efficiency() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t1")).await.unwrap();
+        let mut s1 = span("s1", "t1");
+        s1.attributes = serde_json::json!({
+            "gen_ai.usage.input_tokens": 1000,
+            "gen_ai.usage.cache_read_tokens": 3000,
+            "gen_ai.usage.cache_creation_tokens": 1000,
+            "gen_ai.usage.cache_saved": 0.012
+        });
+        store.save_span(s1).await.unwrap();
+        // A span with no cache attributes still counts its plain input
+        // toward the prompt total, diluting the hit rate honestly.
+        let mut s2 = span("s2", "t1");
+        s2.attributes = serde_json::json!({"gen_ai.usage.input_tokens": 5000});
+        store.save_span(s2).await.unwrap();
+
+        let summary = store.cost_summary().await.unwrap();
+        assert_eq!(summary.cache_read_tokens, 3000);
+        assert_eq!(summary.prompt_tokens, 10_000);
+        assert!((summary.cache_saved - 0.012).abs() < 1e-9);
     }
 
     #[tokio::test]

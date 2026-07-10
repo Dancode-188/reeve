@@ -93,6 +93,9 @@ impl AttributeTranslator for V1AttributeTranslator {
             "gen_ai.usage.input_tokens",
             "gen_ai.usage.output_tokens",
             "gen_ai.usage.total_tokens",
+            "gen_ai.usage.cache_read_tokens",
+            "gen_ai.usage.cache_creation_tokens",
+            "gen_ai.usage.cache_saved",
             "gen_ai.usage.cost",
         ];
 
@@ -290,6 +293,7 @@ mod tests {
             attributes: vec![
                 string_kv("gen_ai.request.model", "claude-3-5-sonnet"),
                 int_kv("gen_ai.usage.input_tokens", 512),
+                int_kv("gen_ai.usage.cache_read_tokens", 2048),
                 string_kv("custom.my_app.version", "1.0"),
             ],
             ..Default::default()
@@ -302,6 +306,13 @@ mod tests {
         assert_eq!(
             internal.attributes["gen_ai.usage.input_tokens"],
             serde_json::json!(512i64)
+        );
+        // Cache usage is queryable, not raw: the cost view aggregates it
+        // by SQL over the attributes column. This gap shipped once (the
+        // proxy recorded cache reads that never survived normalization).
+        assert_eq!(
+            internal.attributes["gen_ai.usage.cache_read_tokens"],
+            serde_json::json!(2048i64)
         );
         assert!(
             internal.attributes.get("custom.my_app.version").is_none(),

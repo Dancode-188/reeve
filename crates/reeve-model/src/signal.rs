@@ -14,10 +14,17 @@ pub enum IngestionEvent {
         span_count: usize,
         cost: f64,
     },
+    /// A live generation tick. `content` is the full accumulated text so
+    /// far, not a delta: consumers assign rather than append, so a missed
+    /// update self-heals on the next one.
     StreamingUpdate {
         trace_id: TraceId,
         span_id: SpanId,
+        agent_id: AgentId,
         content: String,
+        /// Running cost estimate for the in-flight response, when the
+        /// model is priceable. Corrected by the final span cost.
+        cost_so_far: Option<f64>,
     },
     AgentConnected {
         agent: Agent,
