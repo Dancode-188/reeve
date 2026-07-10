@@ -74,3 +74,37 @@ pub struct AppliedCommand {
     pub command_type: CommandType,
     pub applied_at_ms: Timestamp,
 }
+
+/// A command destined for a proxy-path agent, waiting for that agent's
+/// next request to pass through the proxy. Queued by the dispatcher,
+/// drained by the proxy: the same shared-state pattern as the paused
+/// set and the applied-commands feed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProxyCommand {
+    pub id: crate::ids::CommandId,
+    pub payload: ProxyPayload,
+    /// Expiry inherited from the intervention command; the proxy drops
+    /// rather than applies a command whose moment has passed.
+    pub valid_until_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProxyPayload {
+    Redirect { instruction: String },
+    InjectContext { context: String },
+}
+
+/// One applied proxy command, reported back for ack processing:
+/// (command id, agent id, applied-at wall clock ms).
+pub type ProxyApplied = (crate::ids::CommandId, crate::ids::AgentId, i64);
+
+/// The two-sided queue: pending commands per agent, and applications
+/// waiting for the dispatcher to fold into its ack handling.
+#[derive(Debug, Default)]
+pub struct ProxyInterventionState {
+    pub pending:
+        std::collections::HashMap<crate::ids::AgentId, std::collections::VecDeque<ProxyCommand>>,
+    pub applied: Vec<ProxyApplied>,
+}
+
+pub type ProxyInterventions = std::sync::Arc<std::sync::Mutex<ProxyInterventionState>>;

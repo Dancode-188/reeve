@@ -354,6 +354,26 @@ impl AppState {
         })
     }
 
+    /// What the agent can actually do. SDK agents declare capabilities
+    /// in their control handshake; proxy agents have no handshake, and
+    /// their capabilities are what the request path supports: redirect
+    /// and inject-context, applied on the next request. Pause is absent
+    /// rather than present-but-broken.
+    pub fn effective_capabilities(&self, agent_id: &AgentId) -> Vec<String> {
+        if let Some(caps) = self.agent_capabilities.get(agent_id) {
+            return caps.clone();
+        }
+        let is_proxy = self
+            .agents
+            .get(agent_id)
+            .is_some_and(|a| a.agent.integration == reeve_model::entity::IntegrationPath::Proxy);
+        if is_proxy {
+            vec!["redirect".to_string(), "inject_context".to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Compact fleet summary for the terminal tab title: agent count and
     /// the worst band when anything is below healthy. A glance at the tab
     /// bar answers "is anything wrong" without switching to it.
@@ -1266,12 +1286,7 @@ impl App {
             },
             OverlayMode::Menu => {
                 let agent_id = overlay.agent_id.clone();
-                let caps = self
-                    .state
-                    .agent_capabilities
-                    .get(&agent_id)
-                    .cloned()
-                    .unwrap_or_default();
+                let caps = self.state.effective_capabilities(&agent_id);
 
                 // Suggestion keys take priority when a suggestion is active.
                 if self.state.active_suggestion.is_some() {

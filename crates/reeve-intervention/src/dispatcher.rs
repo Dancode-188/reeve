@@ -46,6 +46,9 @@ pub struct Dispatcher {
     audit_log: Arc<Mutex<File>>,
     paused: PausedAgents,
     applied_feed: AppliedFeed,
+    /// Commands for proxy-path agents, applied by the proxy on the
+    /// agent's next request. None only in tests.
+    proxy_interventions: Option<reeve_model::entity::ProxyInterventions>,
 }
 
 impl Dispatcher {
@@ -59,6 +62,7 @@ impl Dispatcher {
         audit_path: PathBuf,
         paused: PausedAgents,
         applied_feed: AppliedFeed,
+        proxy_interventions: Option<reeve_model::entity::ProxyInterventions>,
     ) -> Result<Arc<Self>, std::io::Error> {
         let audit_log = OpenOptions::new()
             .create(true)
@@ -76,6 +80,7 @@ impl Dispatcher {
             audit_log: Arc::new(Mutex::new(audit_log)),
             paused,
             applied_feed,
+            proxy_interventions,
         });
 
         let d = dispatcher.clone();
@@ -83,6 +88,15 @@ impl Dispatcher {
 
         let d = dispatcher.clone();
         tokio::spawn(async move { d.expiry_loop().await });
+
+        // Proxy applications arrive through the shared queue rather than
+        // the control channel; folding them into the same ack handling
+        // keeps audit, pending bookkeeping, and outcome measurement blind
+        // to which channel delivered the command.
+        if dispatcher.proxy_interventions.is_some() {
+            let d = dispatcher.clone();
+            tokio::spawn(async move { d.proxy_applied_loop().await });
+        }
 
         Ok(dispatcher)
     }
@@ -130,6 +144,23 @@ impl Dispatcher {
             .await;
 
         if !sent {
+            if self.queue_for_proxy(agent_id, &command).await {
+                command.status = CommandStatus::Delivered;
+                self.write_audit(format_args!(
+                    "{now_ms} DISPATCH cmd={command_id} agent={agent_id} \
+                     type={} by={} status=queued channel=proxy\n",
+                    command_type_tag(&command.command_type),
+                    command.issued_by,
+                ));
+                let warm = self.warm.clone();
+                let persisted = command.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = warm.save_intervention_command(persisted).await {
+                        tracing::warn!(error = %e, "failed to persist proxy command");
+                    }
+                });
+                return true;
+            }
             command.status = CommandStatus::Failed;
             self.write_audit(format_args!(
                 "{now_ms} DISPATCH cmd={command_id} agent={agent_id} \
@@ -166,6 +197,70 @@ impl Dispatcher {
         });
 
         true
+    }
+
+    /// Queues a command for proxy application when the target is a
+    /// proxy-path agent and the command type survives without a control
+    /// channel. Pause and kill do not: pause has no safe hold on this
+    /// path, and kill has different semantics owned elsewhere.
+    async fn queue_for_proxy(&self, agent_id: &AgentId, command: &InterventionCommand) -> bool {
+        let Some(ref queue) = self.proxy_interventions else {
+            return false;
+        };
+        let payload = match &command.command_type {
+            CommandType::Redirect { instruction } => reeve_model::entity::ProxyPayload::Redirect {
+                instruction: instruction.clone(),
+            },
+            CommandType::InjectContext { context } => {
+                reeve_model::entity::ProxyPayload::InjectContext {
+                    context: context.clone(),
+                }
+            }
+            _ => return false,
+        };
+        let is_proxy_agent = matches!(
+            self.warm.get_agent(agent_id).await,
+            Ok(Some(agent)) if agent.integration == reeve_model::entity::IntegrationPath::Proxy
+        );
+        if !is_proxy_agent {
+            return false;
+        }
+        queue
+            .lock()
+            .unwrap()
+            .pending
+            .entry(agent_id.clone())
+            .or_default()
+            .push_back(reeve_model::entity::ProxyCommand {
+                id: command.id.clone(),
+                payload,
+                valid_until_ms: command.valid_until_ms,
+            });
+        true
+    }
+
+    /// Folds proxy applications into the same ack handling the control
+    /// channel uses, so downstream bookkeeping cannot tell the channels
+    /// apart.
+    async fn proxy_applied_loop(&self) {
+        let queue = self
+            .proxy_interventions
+            .clone()
+            .expect("loop only spawned when the queue exists");
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            tick.tick().await;
+            let drained: Vec<reeve_model::entity::intervention::ProxyApplied> =
+                std::mem::take(&mut queue.lock().unwrap().applied);
+            for (command_id, agent_id, _applied_at_ms) in drained {
+                self.handle_ack(AckNotification {
+                    command_id,
+                    agent_id,
+                    status: AckStatus::Applied,
+                })
+                .await;
+            }
+        }
     }
 
     async fn ack_loop(&self, mut rx: mpsc::Receiver<AckNotification>) {
@@ -432,7 +527,7 @@ mod tests {
         let audit_path = std::env::temp_dir().join("reeve_test_audit.log");
         let paused = Arc::new(Mutex::new(HashSet::new()));
         let applied_feed = Arc::new(Mutex::new(Vec::new()));
-        Dispatcher::new(server, warm, audit_path, paused, applied_feed).unwrap()
+        Dispatcher::new(server, warm, audit_path, paused, applied_feed, None).unwrap()
     }
 
     fn pending_command(command_type: CommandType) -> InterventionCommand {
@@ -561,7 +656,7 @@ mod tests {
         let paused = Arc::new(Mutex::new(HashSet::new()));
         let applied_feed = Arc::new(Mutex::new(Vec::new()));
 
-        let result = Dispatcher::new(server, warm, audit_path, paused, applied_feed);
+        let result = Dispatcher::new(server, warm, audit_path, paused, applied_feed, None);
         assert!(
             result.is_err(),
             "an unopenable audit log must be an error, not a panic"

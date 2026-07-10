@@ -126,6 +126,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("static proxy address is valid");
     let disconnected_agents: reeve_ingestion::assemble::DisconnectedAgents =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let proxy_interventions: reeve_model::entity::ProxyInterventions =
+        std::sync::Arc::new(std::sync::Mutex::new(Default::default()));
     tokio::spawn(reeve_ingestion::serve(
         addr,
         proxy_addr,
@@ -134,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ntp_offsets.clone(),
         paused_agents.clone(),
         disconnected_agents.clone(),
+        proxy_interventions.clone(),
         privacy_tier >= 2,
     ));
     let reprobe_requested: reeve_engine::ReprobeRequested =
@@ -169,6 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             audit_path.clone(),
             paused_agents.clone(),
             applied_commands.clone(),
+            Some(proxy_interventions.clone()),
         ) {
             Ok(d) => break d,
             Err(e) => {

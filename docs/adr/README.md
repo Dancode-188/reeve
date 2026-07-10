@@ -42,6 +42,7 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0035](./0035-privacy-tier-read-once-fails-closed.md) | Privacy Tier Read Once at Startup, Failing Closed | Accepted | 2026-07-08 |
 | [0036](./0036-proxy-agent-identity-from-user-agent.md) | Proxy Agent Identity Derived from the User-Agent Product Token | Accepted | 2026-07-08 |
 | [0037](./0037-conversation-threading-from-message-prefixes.md) | Conversation Threading from Message Prefixes | Accepted | 2026-07-09 |
+| [0038](./0038-proxy-command-application-on-next-request.md) | Proxy Commands Apply on the Agent's Next Request | Accepted | 2026-07-10 |
 
 ## Format
 

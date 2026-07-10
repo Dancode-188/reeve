@@ -14,7 +14,8 @@ pub use agent::{Agent, AgentStatus, IntegrationPath};
 pub use cost::{CostEntityType, CostLedger};
 pub use evaluation::{EvaluationResult, EvaluatorType, TargetType};
 pub use intervention::{
-    AckStatus, AppliedCommand, CommandStatus, CommandType, InterventionCommand,
+    AckStatus, AppliedCommand, CommandStatus, CommandType, InterventionCommand, ProxyCommand,
+    ProxyInterventionState, ProxyInterventions, ProxyPayload,
 };
 pub use outcome::InterventionOutcome;
 pub use policy::{PolicyRule, RuleScope};
