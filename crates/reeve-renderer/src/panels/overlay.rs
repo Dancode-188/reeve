@@ -16,11 +16,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     };
 
-    let caps = state
-        .agent_capabilities
-        .get(&ov.agent_id)
-        .cloned()
-        .unwrap_or_default();
+    let caps = state.effective_capabilities(&ov.agent_id);
 
     match &ov.mode {
         OverlayMode::Menu => render_menu(

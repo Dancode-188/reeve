@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::trace::v1::Span as OtlpSpan;
 use opentelemetry_proto::tonic::trace::v1::Status as OtlpStatus;
-use reeve_model::entity::IntegrationPath;
+use reeve_model::entity::{IntegrationPath, ProxyInterventions, ProxyPayload};
 use reeve_model::signal::IngestionEvent;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -39,12 +39,16 @@ struct ProxyState {
     stream_chunk_timeout: std::time::Duration,
     /// Conversation threading state; see the threading module.
     tracker: std::sync::Mutex<ConversationTracker>,
+    /// Commands queued by the dispatcher for proxy-path agents, applied
+    /// here by modifying the next request before it forwards.
+    interventions: Option<ProxyInterventions>,
 }
 
 pub async fn run(
     addr: SocketAddr,
     pipeline_tx: mpsc::Sender<PipelineSpan>,
     signal_tx: broadcast::Sender<IngestionEvent>,
+    interventions: ProxyInterventions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let upstream =
         std::env::var("REEVE_PROXY_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
@@ -55,10 +59,12 @@ pub async fn run(
         std::time::Duration::from_millis(DEFAULT_STREAM_CHUNK_TIMEOUT_MS),
         pipeline_tx,
         signal_tx,
+        Some(interventions),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_with(
     addr: SocketAddr,
     upstream: String,
@@ -66,6 +72,7 @@ pub async fn run_with(
     stream_chunk_timeout: std::time::Duration,
     pipeline_tx: mpsc::Sender<PipelineSpan>,
     signal_tx: broadcast::Sender<IngestionEvent>,
+    interventions: Option<ProxyInterventions>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = Arc::new(ProxyState {
         client: reqwest::Client::new(),
@@ -75,6 +82,7 @@ pub async fn run_with(
         agent_name_override,
         stream_chunk_timeout,
         tracker: std::sync::Mutex::new(ConversationTracker::default()),
+        interventions,
     });
 
     let app = axum::Router::new()
@@ -132,6 +140,15 @@ async fn forward(
             emit_tool_span(&state, &agent_name, placement, tool).await;
         }
     }
+
+    // Queued interventions apply here, after threading fingerprinted the
+    // ORIGINAL body: the client never resends what it never sent, so the
+    // injection cannot disturb prefix matching.
+    let body = if placement.is_some() {
+        apply_interventions(&state, &agent_name, body)
+    } else {
+        body
+    };
 
     let mut req = state.client.request(method.clone(), &url);
     for (name, value) in headers.iter() {
@@ -452,6 +469,77 @@ async fn finalize_stream_span(
     }
 }
 
+/// Drains this agent's queued interventions into the outgoing request
+/// body: each command appends an operator message, most recent last.
+/// Expired commands drop silently here; the dispatcher's expiry loop
+/// owns the audit line. Applications are reported through the shared
+/// queue for the dispatcher to fold into its ack handling.
+fn apply_interventions(
+    state: &ProxyState,
+    agent_name: &str,
+    body: axum::body::Bytes,
+) -> axum::body::Bytes {
+    let Some(ref interventions) = state.interventions else {
+        return body;
+    };
+    let agent_id = reeve_model::ids::agent_id_from_service(agent_name, "proxy");
+    let now_ms = to_millis(SystemTime::now());
+
+    let commands: Vec<reeve_model::entity::ProxyCommand> = {
+        let mut q = interventions.lock().expect("interventions mutex poisoned");
+        match q.pending.get_mut(&agent_id) {
+            Some(queue) => std::mem::take(queue).into_iter().collect(),
+            None => return body,
+        }
+    };
+    if commands.is_empty() {
+        return body;
+    }
+
+    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        // Unparseable body: put the commands back rather than losing them.
+        let mut q = interventions.lock().expect("interventions mutex poisoned");
+        q.pending.entry(agent_id).or_default().extend(commands);
+        return body;
+    };
+    let Some(messages) = parsed.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        let mut q = interventions.lock().expect("interventions mutex poisoned");
+        q.pending.entry(agent_id).or_default().extend(commands);
+        return body;
+    };
+
+    let mut applied_any = false;
+    for cmd in commands {
+        if cmd.valid_until_ms < now_ms {
+            tracing::info!(command_id = %cmd.id, "queued proxy command expired before application");
+            continue;
+        }
+        let text = match &cmd.payload {
+            ProxyPayload::Redirect { instruction } => format!(
+                "[Operator redirect via Reeve] Disregard the current approach and instead: {instruction}"
+            ),
+            ProxyPayload::InjectContext { context } => {
+                format!("[Operator context via Reeve] {context}")
+            }
+        };
+        messages.push(serde_json::json!({"role": "user", "content": text}));
+        applied_any = true;
+        interventions
+            .lock()
+            .expect("interventions mutex poisoned")
+            .applied
+            .push((cmd.id, agent_id.clone(), now_ms));
+    }
+
+    if !applied_any {
+        return body;
+    }
+    match serde_json::to_vec(&parsed) {
+        Ok(modified) => axum::body::Bytes::from(modified),
+        Err(_) => body,
+    }
+}
+
 /// Sends one synthesized span into the pipeline under the proxy agent's
 /// identity.
 async fn emit_pipeline_span(
@@ -749,6 +837,14 @@ mod tests {
         upstream_status: u16,
         upstream_body: &'static str,
     ) -> (String, mpsc::Receiver<PipelineSpan>) {
+        let (base, rx, _iv) = spawn_proxy_with_interventions(upstream_status, upstream_body).await;
+        (base, rx)
+    }
+
+    async fn spawn_proxy_with_interventions(
+        upstream_status: u16,
+        upstream_body: &'static str,
+    ) -> (String, mpsc::Receiver<PipelineSpan>, ProxyInterventions) {
         let upstream_app = axum::Router::new().route(
             "/v1/messages",
             post(move || async move {
@@ -767,6 +863,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(8);
         let (signal_tx, _) = broadcast::channel(64);
+        let interventions: ProxyInterventions = Arc::new(std::sync::Mutex::new(Default::default()));
         let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         drop(proxy_listener);
@@ -777,9 +874,10 @@ mod tests {
             std::time::Duration::from_millis(500),
             tx,
             signal_tx,
+            Some(interventions.clone()),
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        (format!("http://{}", proxy_addr), rx)
+        (format!("http://{}", proxy_addr), rx, interventions)
     }
 
     /// A mock upstream that speaks SSE with controllable behavior, plus
@@ -883,6 +981,7 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             std::time::Duration::from_millis(500),
             tx,
             signal_tx,
+            None,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         (format!("http://{}", proxy_addr), rx, signal_rx)
@@ -1140,6 +1239,126 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             Some(1),
             "closing a tool is behavior, not breakage"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_intervention_applies_on_the_next_request() {
+        let (base, _rx, interventions) = spawn_proxy_with_interventions(200, OK_BODY).await;
+        let agent_id = reeve_model::ids::agent_id_from_service("claude-cli", "proxy");
+        interventions
+            .lock()
+            .unwrap()
+            .pending
+            .entry(agent_id.clone())
+            .or_default()
+            .push_back(reeve_model::entity::ProxyCommand {
+                id: "cmd-1".into(),
+                payload: ProxyPayload::Redirect {
+                    instruction: "focus on the tests".to_string(),
+                },
+                valid_until_ms: i64::MAX,
+            });
+
+        reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        let q = interventions.lock().unwrap();
+        assert!(
+            q.pending.get(&agent_id).is_none_or(|d| d.is_empty()),
+            "the queue drains on the next request"
+        );
+        assert_eq!(q.applied.len(), 1, "the application is reported back");
+        assert_eq!(q.applied[0].0, reeve_model::ids::CommandId::from("cmd-1"));
+    }
+
+    #[tokio::test]
+    async fn expired_intervention_drops_instead_of_applying() {
+        let (base, _rx, interventions) = spawn_proxy_with_interventions(200, OK_BODY).await;
+        let agent_id = reeve_model::ids::agent_id_from_service("claude-cli", "proxy");
+        interventions
+            .lock()
+            .unwrap()
+            .pending
+            .entry(agent_id.clone())
+            .or_default()
+            .push_back(reeve_model::entity::ProxyCommand {
+                id: "cmd-old".into(),
+                payload: ProxyPayload::InjectContext {
+                    context: "too late".to_string(),
+                },
+                valid_until_ms: 1,
+            });
+
+        reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        let q = interventions.lock().unwrap();
+        assert!(q.applied.is_empty(), "an expired command never applies");
+    }
+
+    #[tokio::test]
+    async fn intervention_does_not_disturb_threading() {
+        let (base, mut rx, interventions) = spawn_proxy_with_interventions(200, OK_BODY).await;
+        let agent_id = reeve_model::ids::agent_id_from_service("claude-cli", "proxy");
+        let client = reqwest::Client::new();
+
+        // Request 1 establishes the conversation.
+        client
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"start"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        let first = rx.recv().await.unwrap();
+
+        // Queue an intervention; request 2 extends the ORIGINAL history.
+        interventions
+            .lock()
+            .unwrap()
+            .pending
+            .entry(agent_id)
+            .or_default()
+            .push_back(reeve_model::entity::ProxyCommand {
+                id: "cmd-2".into(),
+                payload: ProxyPayload::Redirect {
+                    instruction: "change course".to_string(),
+                },
+                valid_until_ms: i64::MAX,
+            });
+        client
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"start"},{"role":"assistant","content":"ok"},{"role":"user","content":"next"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        // Skip the turn root emitted between the chat spans if present.
+        let mut second = rx.recv().await.unwrap();
+        while second.span.name != "gen_ai.chat" {
+            second = rx.recv().await.unwrap();
+        }
+        // OK_BODY has no stop_reason, so each request ends its own turn:
+        // traces differ, but both requests threaded the same conversation,
+        // which the message_count attr proves (3 = original, not 4).
+        match attr(&second.span, "reeve.proxy.context_messages") {
+            Some(any_value::Value::IntValue(n)) => assert_eq!(
+                *n, 3,
+                "threading fingerprinted the original body, not the injected one"
+            ),
+            other => panic!("context attr missing: {other:?}"),
+        }
+        let _ = first;
     }
 
     #[test]

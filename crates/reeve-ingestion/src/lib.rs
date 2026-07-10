@@ -27,6 +27,7 @@ pub async fn serve(
     ntp_offsets: receive::NtpOffsets,
     paused: assemble::PausedAgents,
     disconnected: assemble::DisconnectedAgents,
+    proxy_interventions: reeve_model::entity::ProxyInterventions,
     capture_content: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let hot = Arc::new(Mutex::new(HotStore::new(10_000)));
@@ -43,7 +44,14 @@ pub async fn serve(
     let proxy_pipeline_tx = pipeline_tx.clone();
     let proxy_signal_tx = signal_tx.clone();
     tokio::spawn(async move {
-        if let Err(e) = proxy::run(proxy_addr, proxy_pipeline_tx, proxy_signal_tx).await {
+        if let Err(e) = proxy::run(
+            proxy_addr,
+            proxy_pipeline_tx,
+            proxy_signal_tx,
+            proxy_interventions,
+        )
+        .await
+        {
             tracing::error!(error = %e, "HTTP proxy exited");
         }
     });

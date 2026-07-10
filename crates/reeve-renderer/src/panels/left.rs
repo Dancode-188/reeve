@@ -91,7 +91,10 @@ fn render_agents(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         // A dropped control stream shows on the row: the grace period is
         // exactly when a developer wants to know the agent may come back.
         let offline = state.control_disconnected.contains(agent_id);
-        let max_name = w.saturating_sub(if offline { 11 } else { 3 });
+        let via_proxy =
+            agent_state.agent.integration == reeve_model::entity::IntegrationPath::Proxy;
+        let tag_width = if offline { 11 } else { 0 } + if via_proxy { 8 } else { 0 };
+        let max_name = w.saturating_sub(3 + tag_width);
         let name = truncate(&agent_state.agent.name, max_name);
 
         let flash_color = state.flash_color(&FlashTarget::AgentRow(agent_id.clone()), theme);
@@ -127,6 +130,12 @@ fn render_agents(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             Span::raw(" "),
             Span::styled(name, name_style),
         ];
+        if via_proxy {
+            row.push(Span::styled(
+                " [proxy]",
+                Style::default().fg(theme.subtext()),
+            ));
+        }
         if offline {
             row.push(Span::styled(
                 " [offline]",
