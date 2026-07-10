@@ -52,6 +52,10 @@ pub struct AgentState {
     pub last_trace_id: Option<TraceId>,
     pub trace_count: u32,
     pub total_cost: f64,
+    /// Running estimate for an in-flight streamed response, ticking the
+    /// header during generation. Folded into `total_cost` (from real
+    /// usage) when the trace completes, so this resets to zero there.
+    pub live_cost: f64,
     pub cost_history: Vec<f64>,
     pub cost_trend: Option<CostTrend>,
 }
@@ -63,6 +67,7 @@ impl AgentState {
             last_trace_id: None,
             trace_count: 0,
             total_cost: 0.0,
+            live_cost: 0.0,
             cost_history: Vec::new(),
             cost_trend: None,
         }
@@ -541,6 +546,9 @@ impl App {
                     s.last_trace_id = Some(trace_id.clone());
                     s.trace_count += 1;
                     s.total_cost += cost;
+                    // The real cost just landed; the live estimate it
+                    // was standing in for retires.
+                    s.live_cost = 0.0;
                     s.cost_history.push(cost);
                     if s.cost_history.len() > 60 {
                         s.cost_history.remove(0);
@@ -573,8 +581,37 @@ impl App {
                     .flash_targets
                     .insert(FlashTarget::AlertSection, (FlashDirection::Alert, 2));
             }
-            IngestionEvent::StreamingUpdate { content, .. } => {
-                self.state.streaming.content.push_str(&content);
+            IngestionEvent::StreamingUpdate {
+                content,
+                agent_id,
+                cost_so_far,
+                ..
+            } => {
+                // The update carries the full accumulated text, not a
+                // delta: assign, so a missed broadcast message self-heals
+                // on the next update instead of losing text (appending
+                // here also duplicated content, since the producer has
+                // always sent the accumulated form).
+                self.state.streaming.content = content;
+                if let Some(s) = self.state.agents.get_mut(&agent_id) {
+                    if let Some(cost) = cost_so_far {
+                        s.live_cost = cost;
+                    }
+                    // The pipeline only reports agent status when a trace
+                    // completes, so between traces the fleet reads idle
+                    // even while tokens are visibly streaming. A live
+                    // generation is what running means; the completion
+                    // signal puts the status back afterward. Paused is
+                    // left alone so a pause issued mid-stream keeps
+                    // rendering as paused.
+                    if matches!(
+                        s.agent.status,
+                        reeve_model::entity::AgentStatus::Idle
+                            | reeve_model::entity::AgentStatus::Error
+                    ) {
+                        s.agent.status = reeve_model::entity::AgentStatus::Running;
+                    }
+                }
             }
             IngestionEvent::SpanCompleted { .. } => {}
         }

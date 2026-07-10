@@ -47,6 +47,23 @@ pub fn estimate(
     )
 }
 
+/// Net dollars the prompt cache saved on one round trip, or None when
+/// the model is not in the table. Each read token would have billed at
+/// the full input rate, so it saves the difference; each write token
+/// bills a premium over plain input, which is subtracted. Negative when
+/// writes outweigh reads: building cache is an investment, and the
+/// number should say so rather than hide it.
+pub fn cache_saved(model: &str, cache_read_tokens: u64, cache_creation_tokens: u64) -> Option<f64> {
+    let (_, input_rate, _) = PRICES
+        .iter()
+        .find(|(needle, _, _)| model.contains(needle))?;
+    let per_tok_in = input_rate / 1_000_000.0;
+    Some(
+        cache_read_tokens as f64 * per_tok_in * (1.0 - CACHE_READ_FACTOR)
+            - cache_creation_tokens as f64 * per_tok_in * (CACHE_WRITE_FACTOR - 1.0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +94,22 @@ mod tests {
     #[test]
     fn unknown_model_prices_nothing() {
         assert_eq!(estimate("gpt-analog-9", 1000, 1000, 0, 0), None);
+    }
+
+    #[test]
+    fn cache_saved_nets_reads_against_write_premium() {
+        // Sonnet: 1M reads save $2.70 (0.9 x $3), 1M writes cost an
+        // extra $0.75 (0.25 x $3). Net $1.95.
+        let saved = cache_saved("claude-sonnet-5", 1_000_000, 1_000_000).unwrap();
+        assert!((saved - 1.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cache_saved_goes_negative_when_write_heavy() {
+        // All writes, no reads: the cache cost money this round trip and
+        // the figure says so.
+        let saved = cache_saved("claude-sonnet-5", 0, 1_000_000).unwrap();
+        assert!((saved + 0.75).abs() < 1e-9);
+        assert_eq!(cache_saved("gpt-analog-9", 1_000_000, 0), None);
     }
 }

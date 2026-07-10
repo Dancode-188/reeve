@@ -21,11 +21,42 @@ pub fn render(frame: &mut Frame, area: Rect, summary: &CostSummary, theme: &Them
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Percentage(50),
             Constraint::Fill(1),
         ])
         .split(area);
+
+    // The cache line answers "is my prompt cache working": hit rate is
+    // cached reads over all prompt tokens, saved is the net dollar figure
+    // summed from spans (negative while the cache is being built, and
+    // shown as such rather than clamped).
+    let cache_line = if summary.prompt_tokens == 0 || summary.cache_read_tokens == 0 {
+        Line::from(vec![
+            Span::styled("CACHE", Style::default().fg(theme.get("blue"))),
+            Span::styled(
+                "  no cache traffic seen",
+                Style::default().fg(theme.subtext()),
+            ),
+        ])
+    } else {
+        let hit_rate = 100.0 * summary.cache_read_tokens as f64 / summary.prompt_tokens as f64;
+        Line::from(vec![
+            Span::styled("CACHE", Style::default().fg(theme.get("blue"))),
+            Span::styled(
+                format!("  {hit_rate:.0}% hit rate"),
+                Style::default().fg(theme.text()),
+            ),
+            Span::styled(
+                format!("  \u{00B7}  ${:.3} saved", summary.cache_saved),
+                Style::default().fg(if summary.cache_saved >= 0.0 {
+                    theme.get("teal")
+                } else {
+                    theme.subtext()
+                }),
+            ),
+        ])
+    };
 
     let headline = vec![
         Line::from(vec![
@@ -39,6 +70,7 @@ pub fn render(frame: &mut Frame, area: Rect, summary: &CostSummary, theme: &Them
                 Style::default().fg(theme.subtext()),
             ),
         ]),
+        cache_line,
         Line::raw(""),
     ];
     frame.render_widget(Paragraph::new(headline), sections[0]);

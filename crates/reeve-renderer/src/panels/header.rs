@@ -65,7 +65,9 @@ fn build_right_line(state: &AppState, theme: &Theme) -> Line<'static> {
             ) =>
         {
             let name = agent_state.agent.name.clone();
-            let cost_str = format!("${:.3}", agent_state.total_cost);
+            // The live estimate makes the figure tick during a streamed
+            // generation; it retires when the trace's real cost lands.
+            let cost_str = format!("${:.3}", agent_state.total_cost + agent_state.live_cost);
 
             let mut spans: Vec<Span<'static>> = vec![
                 Span::styled("\u{25CF} ", Style::default().fg(theme.health_ok())),
