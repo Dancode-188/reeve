@@ -208,14 +208,18 @@ impl Dispatcher {
             return false;
         };
         let payload = match &command.command_type {
-            CommandType::Redirect { instruction } => reeve_model::entity::ProxyPayload::Redirect {
-                instruction: instruction.clone(),
-            },
-            CommandType::InjectContext { context } => {
-                reeve_model::entity::ProxyPayload::InjectContext {
-                    context: context.clone(),
-                }
+            CommandType::Redirect { instruction } => {
+                Some(reeve_model::entity::ProxyPayload::Redirect {
+                    instruction: instruction.clone(),
+                })
             }
+            CommandType::InjectContext { context } => {
+                Some(reeve_model::entity::ProxyPayload::InjectContext {
+                    context: context.clone(),
+                })
+            }
+            // Kill is the circuit breaker: engaged below, not queued.
+            CommandType::Kill => None,
             _ => return false,
         };
         let is_proxy_agent = matches!(
@@ -225,17 +229,30 @@ impl Dispatcher {
         if !is_proxy_agent {
             return false;
         }
-        queue
-            .lock()
-            .unwrap()
-            .pending
-            .entry(agent_id.clone())
-            .or_default()
-            .push_back(reeve_model::entity::ProxyCommand {
-                id: command.id.clone(),
-                payload,
-                valid_until_ms: command.valid_until_ms,
-            });
+        match payload {
+            Some(payload) => {
+                queue
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .entry(agent_id.clone())
+                    .or_default()
+                    .push_back(reeve_model::entity::ProxyCommand {
+                        id: command.id.clone(),
+                        payload,
+                        valid_until_ms: command.valid_until_ms,
+                    });
+            }
+            None => {
+                // The breaker is effective the moment it is set, so the
+                // application is reported immediately: enforcement is
+                // local, not on the agent.
+                let mut q = queue.lock().unwrap();
+                q.killed.insert(agent_id.clone());
+                q.applied
+                    .push((command.id.clone(), agent_id.clone(), current_ms()));
+            }
+        }
         true
     }
 
@@ -521,13 +538,28 @@ mod tests {
     use tokio::sync::broadcast;
 
     fn make_dispatcher() -> Arc<Dispatcher> {
+        make_dispatcher_with_queue(None).0
+    }
+
+    fn make_dispatcher_with_queue(
+        queue: Option<reeve_model::entity::ProxyInterventions>,
+    ) -> (Arc<Dispatcher>, Arc<WarmStore>) {
         let (engine_tx, _rx) = broadcast::channel(8);
         let server = crate::server::new_for_test(engine_tx);
         let warm = Arc::new(WarmStore::open_in_memory().unwrap());
         let audit_path = std::env::temp_dir().join("reeve_test_audit.log");
         let paused = Arc::new(Mutex::new(HashSet::new()));
         let applied_feed = Arc::new(Mutex::new(Vec::new()));
-        Dispatcher::new(server, warm, audit_path, paused, applied_feed, None).unwrap()
+        let d = Dispatcher::new(
+            server,
+            warm.clone(),
+            audit_path,
+            paused,
+            applied_feed,
+            queue,
+        )
+        .unwrap();
+        (d, warm)
     }
 
     fn pending_command(command_type: CommandType) -> InterventionCommand {
@@ -789,6 +821,53 @@ mod tests {
         assert!(
             !d.paused.lock().unwrap().contains(&agent_id),
             "pause state flips on Applied, not on Received"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_against_a_proxy_agent_engages_the_breaker() {
+        let queue: reeve_model::entity::ProxyInterventions =
+            Arc::new(Mutex::new(Default::default()));
+        let (d, warm) = make_dispatcher_with_queue(Some(queue.clone()));
+
+        let agent_id = reeve_model::ids::agent_id_from_service("claude-cli", "proxy");
+        warm.upsert_agent(reeve_model::entity::Agent {
+            id: agent_id.clone(),
+            name: "claude-cli".to_string(),
+            framework: "proxy".to_string(),
+            integration: reeve_model::entity::IntegrationPath::Proxy,
+            status: reeve_model::entity::AgentStatus::Idle,
+            first_seen_at: 0,
+            last_seen_at: 0,
+        })
+        .await
+        .unwrap();
+
+        let command = InterventionCommand {
+            id: CommandId::from("cmd-kill"),
+            trace_id: TraceId::from("trace-1"),
+            span_id: None,
+            policy_id: None,
+            command_type: CommandType::Kill,
+            status: CommandStatus::Pending,
+            requires_confirmation: false,
+            issued_at: current_ms(),
+            acknowledged_at: None,
+            issued_by: "human".to_string(),
+            valid_until_ms: i64::MAX,
+        };
+        assert!(d.dispatch(&agent_id, command).await);
+
+        let q = queue.lock().unwrap();
+        assert!(q.killed.contains(&agent_id), "the breaker is engaged");
+        assert_eq!(
+            q.applied.len(),
+            1,
+            "kill reports applied immediately: enforcement is local"
+        );
+        assert!(
+            q.pending.get(&agent_id).is_none_or(|p| p.is_empty()),
+            "kill is a breaker, never a queued payload"
         );
     }
 }

@@ -105,6 +105,9 @@ pub struct ProxyInterventionState {
     pub pending:
         std::collections::HashMap<crate::ids::AgentId, std::collections::VecDeque<ProxyCommand>>,
     pub applied: Vec<ProxyApplied>,
+    /// The circuit breaker: agents here have their Messages requests
+    /// refused instead of forwarded.
+    pub killed: std::collections::HashSet<crate::ids::AgentId>,
 }
 
 pub type ProxyInterventions = std::sync::Arc<std::sync::Mutex<ProxyInterventionState>>;

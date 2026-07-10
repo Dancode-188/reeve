@@ -30,7 +30,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         OverlayMode::TextInput { command, buffer } => {
             render_text_input(frame, area, ov, *command, buffer, theme)
         }
-        OverlayMode::KillConfirm => render_kill_confirm(frame, area, ov, theme),
+        OverlayMode::KillConfirm => render_kill_confirm(frame, area, ov, state, theme),
     }
 }
 
@@ -204,6 +204,7 @@ fn render_kill_confirm(
     frame: &mut Frame,
     area: Rect,
     ov: &InterventionOverlayState,
+    state: &AppState,
     theme: &Theme,
 ) {
     let popup = centered(54, 8, area);
@@ -211,12 +212,18 @@ fn render_kill_confirm(
     let warn = Style::default().fg(theme.health_crit());
     let hint = Style::default().fg(theme.subtext());
 
+    // On the proxy path kill is a circuit breaker: it stops API access,
+    // not the process, and the confirmation should say which one the
+    // developer is about to do.
+    let prompt = if state.is_proxy_agent(&ov.agent_id) {
+        "Kill this agent? Its API requests will be refused."
+    } else {
+        "Kill this agent? This cannot be undone."
+    };
+
     let lines = vec![
         Line::raw(""),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled("Kill this agent? This cannot be undone.", warn),
-        ]),
+        Line::from(vec![Span::raw("  "), Span::styled(prompt, warn)]),
         Line::raw(""),
         Line::from(vec![
             Span::raw("  "),

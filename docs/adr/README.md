@@ -43,6 +43,7 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0036](./0036-proxy-agent-identity-from-user-agent.md) | Proxy Agent Identity Derived from the User-Agent Product Token | Accepted | 2026-07-08 |
 | [0037](./0037-conversation-threading-from-message-prefixes.md) | Conversation Threading from Message Prefixes | Accepted | 2026-07-09 |
 | [0038](./0038-proxy-command-application-on-next-request.md) | Proxy Commands Apply on the Agent's Next Request | Accepted | 2026-07-10 |
+| [0039](./0039-circuit-breaker-kill-on-the-proxy-path.md) | Kill on the Proxy Path Is a Circuit Breaker | Accepted | 2026-07-10 |
 
 ## Format
 
