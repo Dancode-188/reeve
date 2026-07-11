@@ -76,7 +76,10 @@ impl Router {
         }
         let trace_id = trace.trace_id.clone();
         let agent_id = trace.agent.id.clone();
-        let span_count = trace.spans.len();
+        // Pending spans count and persist like attached ones everywhere
+        // below: a span that entered the pipeline must reach storage,
+        // even when its parent (the turn root, emitted last) never came.
+        let span_count = trace.spans.len() + trace.pending_attachment.len();
         let cost = trace.cost_accumulator;
 
         let status = match state {
@@ -111,9 +114,14 @@ impl Router {
             .and_then(|id| trace.spans.get(id))
             .map(|root| (root.start_time, root.end_time))
             .unwrap_or_else(|| {
+                // A rootless flush is usually all-pending (children of an
+                // unarrived turn root), so the earliest must look there
+                // too: this used to fall through to 0 and render as a
+                // 56-year duration in history.
                 let earliest = trace
                     .spans
                     .values()
+                    .chain(trace.pending_attachment.values())
                     .map(|s| s.start_time)
                     .min()
                     .unwrap_or(0);
@@ -136,7 +144,11 @@ impl Router {
         {
             let mut hot = self.hot.lock().expect("hot store mutex poisoned");
             hot.upsert_trace(trace_entity.clone());
-            for span in trace.spans.values() {
+            for span in trace
+                .spans
+                .values()
+                .chain(trace.pending_attachment.values())
+            {
                 if let Some(e) = hot.push_span(span.clone()) {
                     evicted.push(e);
                 }
@@ -171,7 +183,7 @@ impl Router {
             }
         }
 
-        for (_, span) in trace.spans {
+        for (_, span) in trace.spans.into_iter().chain(trace.pending_attachment) {
             if let Err(e) = self.warm.save_span(span).await {
                 tracing::error!(trace_id = %trace_id, error = %e, "failed to save span");
             }
@@ -291,6 +303,42 @@ mod tests {
 
         let span = warm.get_span(&SpanId::from("root-1")).await.unwrap();
         assert!(span.is_some(), "spans must be flushed to warm store");
+    }
+
+    #[tokio::test]
+    async fn interrupted_flush_persists_pending_spans() {
+        // The #182 shape: a long turn's chats parent to a root that has
+        // not arrived, so at flush time every span is pending. A real
+        // session lost ~30 round trips of spans here.
+        let (mut router, warm) = make_router(10_000);
+        let mut trace = InFlightTrace::new("trace-1".into(), make_agent());
+        trace.receive_span(
+            make_span("chat-1", "trace-1", Some("unarrived-root")),
+            vec![],
+        );
+        trace.receive_span(
+            make_span("chat-2", "trace-1", Some("unarrived-root")),
+            vec![],
+        );
+        assert!(trace.spans.is_empty(), "everything waits in pending");
+
+        router.route(trace, CompletionState::Interrupted).await;
+
+        for id in ["chat-1", "chat-2"] {
+            assert!(
+                warm.get_span(&SpanId::from(id)).await.unwrap().is_some(),
+                "pending span {id} must survive the flush"
+            );
+        }
+        let saved = warm
+            .get_trace(&TraceId::from("trace-1"))
+            .await
+            .unwrap()
+            .expect("trace saved");
+        assert_eq!(
+            saved.start_time, 1000,
+            "started_at comes from the pending spans, never 0"
+        );
     }
 
     #[tokio::test]

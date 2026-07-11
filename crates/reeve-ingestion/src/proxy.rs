@@ -42,6 +42,34 @@ struct ProxyState {
     /// Commands queued by the dispatcher for proxy-path agents, applied
     /// here by modifying the next request before it forwards.
     interventions: Option<ProxyInterventions>,
+    /// Traces with a Messages round trip currently in flight, shared with
+    /// the assembler so a trace mid-generation is never called idle. The
+    /// count handles concurrent requests on one turn.
+    active_streams: Option<crate::assemble::ActiveStreams>,
+}
+
+/// Marks a trace's round trip in flight for the assembler's idle check.
+/// Increment when the upstream request departs, decrement on EVERY exit
+/// path: a leaked entry would hold a dead trace in flight forever.
+fn mark_stream(state: &ProxyState, trace_id: &[u8], delta: i64) {
+    let Some(ref streams) = state.active_streams else {
+        return;
+    };
+    let key: reeve_model::ids::TraceId = trace_id
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>()
+        .into();
+    let mut map = streams.lock().expect("active streams mutex poisoned");
+    let count = map.entry(key.clone()).or_insert(0);
+    if delta > 0 {
+        *count += 1;
+    } else {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            map.remove(&key);
+        }
+    }
 }
 
 pub async fn run(
@@ -49,6 +77,7 @@ pub async fn run(
     pipeline_tx: mpsc::Sender<PipelineSpan>,
     signal_tx: broadcast::Sender<IngestionEvent>,
     interventions: ProxyInterventions,
+    active_streams: crate::assemble::ActiveStreams,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let upstream =
         std::env::var("REEVE_PROXY_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
@@ -60,6 +89,7 @@ pub async fn run(
         pipeline_tx,
         signal_tx,
         Some(interventions),
+        Some(active_streams),
     )
     .await
 }
@@ -73,6 +103,7 @@ pub async fn run_with(
     pipeline_tx: mpsc::Sender<PipelineSpan>,
     signal_tx: broadcast::Sender<IngestionEvent>,
     interventions: Option<ProxyInterventions>,
+    active_streams: Option<crate::assemble::ActiveStreams>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = Arc::new(ProxyState {
         client: reqwest::Client::new(),
@@ -83,6 +114,7 @@ pub async fn run_with(
         stream_chunk_timeout,
         tracker: std::sync::Mutex::new(ConversationTracker::default()),
         interventions,
+        active_streams,
     });
 
     let app = axum::Router::new()
@@ -199,10 +231,20 @@ async fn forward(
         .map(|d| d.as_secs_f64() * 1e3)
         .unwrap_or(0.0);
 
+    // From here until the span is synthesized, the turn's trace must not
+    // be called idle no matter how long the model takes: the assembler's
+    // timeout once flushed mid-turn and dropped a session's spans (#182).
+    if let Some(ref p) = placement {
+        mark_stream(&state, &p.trace_id, 1);
+    }
+
     let upstream_resp = match req.body(body.clone()).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "proxy could not reach upstream");
+            if let Some(ref p) = placement {
+                mark_stream(&state, &p.trace_id, -1);
+            }
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from(format!(
@@ -235,6 +277,9 @@ async fn forward(
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "proxy failed reading upstream response");
+            if let Some(ref p) = placement {
+                mark_stream(&state, &p.trace_id, -1);
+            }
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from("upstream response read failed"))
@@ -242,6 +287,9 @@ async fn forward(
         }
     };
 
+    // Unmark only after the span has entered the pipeline: the trace
+    // stays exempt from the idle timeout until its evidence is in.
+    let placement_trace_id = placement.as_ref().map(|p| p.trace_id.clone());
     if method == Method::POST && uri.path().ends_with("/v1/messages") {
         synthesize_span(
             &state,
@@ -253,6 +301,9 @@ async fn forward(
             overhead_ms,
         )
         .await;
+    }
+    if let Some(tid) = placement_trace_id {
+        mark_stream(&state, &tid, -1);
     }
 
     build_response(status, &resp_headers, Body::from(resp_body))
@@ -396,6 +447,9 @@ fn stream_and_accumulate(
                 .ok()
                 .map(|d| d.as_secs_f64() * 1e3)
         });
+        // The idle exemption holds through every stream outcome; drop it
+        // only once the finalized span has entered the pipeline.
+        let placement_trace_id = placement.as_ref().map(|p| p.trace_id.clone());
         finalize_stream_span(
             &state,
             &agent_name,
@@ -410,6 +464,9 @@ fn stream_and_accumulate(
             overhead_ms,
         )
         .await;
+        if let Some(tid) = placement_trace_id {
+            mark_stream(&state, &tid, -1);
+        }
     });
 
     Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(body_rx))
@@ -959,6 +1016,7 @@ mod tests {
             tx,
             signal_tx,
             Some(interventions.clone()),
+            None,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         (format!("http://{}", proxy_addr), rx, interventions)
@@ -1066,6 +1124,7 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             tx,
             signal_tx,
             None,
+            None,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         (format!("http://{}", proxy_addr), rx, signal_rx)
@@ -1169,6 +1228,7 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             std::time::Duration::from_millis(500),
             tx,
             signal_tx,
+            None,
             None,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
