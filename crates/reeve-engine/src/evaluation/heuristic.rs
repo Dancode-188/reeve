@@ -21,19 +21,36 @@ impl Evaluator for LoopDetector {
         "loop_detection"
     }
 
+    /// A loop is one action DOMINATING the trace, not the trace being
+    /// long. The original absolute count scored a real 20-minute Claude
+    /// Code turn (46 chat spans, a healthy mix of tools) as critical,
+    /// because it assumed one trace holds a handful of spans; on the
+    /// proxy path one trace is a whole turn. Carrier spans (the chat
+    /// per round trip, the turn root) are structural and excluded;
+    /// among the remaining actions, the threshold is the minimum
+    /// evidence before dominance is judged, and the score falls as one
+    /// action's share climbs past half of everything the agent did.
     fn evaluate(&self, ctx: &TraceContext<'_>) -> Option<f64> {
         let mut counts: HashMap<&str, usize> = HashMap::new();
+        let mut total = 0usize;
         for span in ctx.spans {
-            *counts.entry(span.operation.as_str()).or_insert(0) += 1;
+            let op = span.operation.as_str();
+            if op == "gen_ai.chat" || op.starts_with("agent.turn") {
+                continue;
+            }
+            *counts.entry(op).or_insert(0) += 1;
+            total += 1;
         }
         let max = counts.values().copied().max().unwrap_or(0);
-        if max < self.threshold {
-            Some(1.0)
-        } else {
-            // Each repeat above the threshold drops the score by 0.15.
-            let excess = (max - self.threshold + 1) as f64;
-            Some((1.0 - excess * 0.15).max(0.0))
+        if total == 0 || max < self.threshold {
+            return Some(1.0);
         }
+        let share = max as f64 / total as f64;
+        if share < 0.5 {
+            return Some(1.0);
+        }
+        // Share 0.5 scores 1.0, share 0.9+ scores 0.0.
+        Some((1.0 - (share - 0.5) / 0.4).clamp(0.0, 1.0))
     }
 }
 
@@ -184,6 +201,52 @@ mod tests {
             .evaluate(&ctx(&spans, 0.01, None))
             .unwrap();
         assert!(score < 1.0);
+    }
+
+    #[test]
+    fn loop_detector_scores_a_real_turn_shape_healthy() {
+        // The #191 shape from a live 20-minute Claude Code build: many
+        // chat carriers plus a healthy MIX of tools. Volume is work,
+        // not a loop; the old absolute count scored this critical.
+        let mut spans: Vec<InternalSpan> = Vec::new();
+        for i in 0..46 {
+            spans.push(make_span("gen_ai.chat", i, i + 1));
+        }
+        for (op, n) in [
+            ("gen_ai.tool:Write", 16),
+            ("gen_ai.tool:TaskUpdate", 16),
+            ("gen_ai.tool:Bash", 14),
+            ("gen_ai.tool:TaskCreate", 8),
+            ("gen_ai.tool:Read", 4),
+            ("gen_ai.tool:WebSearch", 3),
+        ] {
+            for i in 0..n {
+                spans.push(make_span(op, 100 + i, 101 + i));
+            }
+        }
+        spans.push(make_span("agent.turn.1", 0, 200));
+        let score = LoopDetector::new(3)
+            .evaluate(&ctx(&spans, 1.9, None))
+            .unwrap();
+        assert_eq!(score, 1.0, "a mixed 100-span turn is work, not a loop");
+    }
+
+    #[test]
+    fn loop_detector_scores_a_dominated_trace_critical() {
+        // An actual runaway: one tool hammered over and over with
+        // almost nothing else. Dominance, not volume, is the signal.
+        let mut spans: Vec<InternalSpan> = Vec::new();
+        for i in 0..20 {
+            spans.push(make_span("gen_ai.tool:Bash", i, i + 1));
+        }
+        spans.push(make_span("gen_ai.tool:Read", 50, 51));
+        for i in 0..21 {
+            spans.push(make_span("gen_ai.chat", 100 + i, 101 + i));
+        }
+        let score = LoopDetector::new(3)
+            .evaluate(&ctx(&spans, 0.5, None))
+            .unwrap();
+        assert!(score < 0.2, "one tool at 95% share is a loop: {score}");
     }
 
     #[test]
