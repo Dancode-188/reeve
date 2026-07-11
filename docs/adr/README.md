@@ -44,6 +44,8 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0037](./0037-conversation-threading-from-message-prefixes.md) | Conversation Threading from Message Prefixes | Accepted | 2026-07-09 |
 | [0038](./0038-proxy-command-application-on-next-request.md) | Proxy Commands Apply on the Agent's Next Request | Accepted | 2026-07-10 |
 | [0039](./0039-circuit-breaker-kill-on-the-proxy-path.md) | Kill on the Proxy Path Is a Circuit Breaker | Accepted | 2026-07-10 |
+| [0040](./0040-loop-detection-by-dominance.md) | Loop Detection Judges Dominance, Not Volume | Accepted | 2026-07-11 |
+| [0041](./0041-a-streaming-trace-is-not-idle.md) | A Streaming Trace Is Not Idle | Accepted | 2026-07-11 |
 
 ## Format
 
