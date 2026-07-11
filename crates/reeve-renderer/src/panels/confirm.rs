@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn render(frame: &mut Frame, area: Rect, pc: &PendingConfirmation, theme: &Theme) {
     let has_countdown = pc.auto_confirm_after_secs.is_some();
-    let height = if has_countdown { 13 } else { 10 };
+    let height = if has_countdown { 13 } else { 10 } + if pc.supported { 0 } else { 2 };
     let popup = centered(58, height, area);
 
     let warn = Style::default().fg(theme.health_warn());
@@ -49,18 +49,40 @@ pub fn render(frame: &mut Frame, area: Rect, pc: &PendingConfirmation, theme: &T
         Line::raw(""),
     ];
 
+    // The target cannot apply the suggested command (a proxy agent has
+    // no pause): say so, and offer the intervention menu instead of a
+    // confirm that would dispatch a dead letter.
+    if !pc.supported {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("this agent does not support {cmd_display}"), warn),
+        ]));
+        lines.push(Line::raw(""));
+    }
+
     if has_countdown {
         lines.push(Line::raw(""));
     }
 
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("[Enter]", hint),
-        Span::styled(" confirm", hint),
-        Span::raw("    "),
-        Span::styled("[Esc]", hint),
-        Span::styled(" dismiss", hint),
-    ]));
+    if pc.supported {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("[Enter]", hint),
+            Span::styled(" confirm", hint),
+            Span::raw("    "),
+            Span::styled("[Esc]", hint),
+            Span::styled(" dismiss", hint),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("[Enter]", hint),
+            Span::styled(" intervene instead", hint),
+            Span::raw("    "),
+            Span::styled("[Esc]", hint),
+            Span::styled(" dismiss", hint),
+        ]));
+    }
     lines.push(Line::raw(""));
 
     let block = Block::default()
