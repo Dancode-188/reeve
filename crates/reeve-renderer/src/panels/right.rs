@@ -379,6 +379,35 @@ fn render_span_detail(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
 
     lines.push(section_label("SPAN DETAIL", theme));
 
+    // While the live view owns the panel, it owns this section too:
+    // detail from the hidden loaded trace would describe a span that is
+    // not on screen. A live selection knows its name and nothing else
+    // yet, and says so.
+    if let Some(lv) = state.live_view_for_selected() {
+        match lv.selected.as_ref().and_then(|id| lv.names.get(id)) {
+            Some(name) => {
+                lines.push(Line::from(Span::styled(
+                    name.clone(),
+                    Style::default()
+                        .fg(theme.text())
+                        .add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(Span::styled(
+                    " in flight; detail lands when the span completes",
+                    Style::default().fg(theme.subtext()),
+                )));
+            }
+            None => {
+                lines.push(Line::from(Span::styled(
+                    " select a span",
+                    Style::default().fg(theme.subtext()),
+                )));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
     match state
         .trace
         .as_ref()

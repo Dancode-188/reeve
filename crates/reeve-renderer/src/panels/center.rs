@@ -92,7 +92,7 @@ pub fn render(
                 spans: &lv.spans,
                 root: lv.root.as_ref(),
                 orphans: &lv.orphans,
-                selected: None,
+                selected: lv.selected.as_ref(),
                 scroll: lv.scroll,
                 title: if right_hidden {
                     "TRACE · live [SPAN ▷]"
