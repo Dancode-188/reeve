@@ -217,10 +217,31 @@ pub async fn run(
     mut rx: mpsc::Receiver<PipelineSpan>,
     capture_content: bool,
     tx: mpsc::Sender<NormalizedSpan>,
+    signal_tx: tokio::sync::broadcast::Sender<reeve_model::signal::IngestionEvent>,
 ) {
     let translator = V1AttributeTranslator::new(capture_content);
+    let mut seen_agents = std::collections::HashSet::new();
     while let Some(ps) = rx.recv().await {
         let (span, events, agent) = translator.translate(ps);
+        // A brand-new agent appears in the fleet on its FIRST span, not
+        // when its first trace completes: a long first turn otherwise
+        // renders an empty cockpit exactly while the newcomer works.
+        // The route announces again at finalize; the handler upserts.
+        if seen_agents.insert(agent.id.clone()) {
+            let _ = signal_tx.send(reeve_model::signal::IngestionEvent::AgentConnected {
+                agent: agent.clone(),
+            });
+        }
+        // The live-view feed: every span announces itself the moment it
+        // is normalized, so the cockpit can render an open turn without
+        // waiting for the root that only arrives when the turn ends.
+        let _ = signal_tx.send(reeve_model::signal::IngestionEvent::SpanObserved {
+            agent_id: agent.id.clone(),
+            trace_id: span.trace_id.clone(),
+            span_id: span.id.clone(),
+            parent_span_id: span.parent_id.clone(),
+            operation: span.operation.clone(),
+        });
         tracing::debug!(
             span_id = %span.id,
             trace_id = %span.trace_id,

@@ -37,7 +37,12 @@ pub async fn serve(
     let (route_tx, route_rx) = tokio::sync::mpsc::channel(1024);
 
     let resume_tx = assemble_tx.clone();
-    tokio::spawn(normalize::run(pipeline_rx, capture_content, assemble_tx));
+    tokio::spawn(normalize::run(
+        pipeline_rx,
+        capture_content,
+        assemble_tx,
+        signal_tx.clone(),
+    ));
 
     // Traces mid-generation are exempt from the idle timeout: the proxy
     // marks them here while a Messages round trip is in flight, and the

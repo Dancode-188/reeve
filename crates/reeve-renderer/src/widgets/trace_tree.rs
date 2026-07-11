@@ -33,6 +33,9 @@ pub struct TraceTree<'a> {
     pub selected: Option<&'a SpanId>,
     pub scroll: u16,
     pub title: &'a str,
+    /// A turn still in flight: rootless is the normal state, so orphans
+    /// render as subtrees rather than "awaiting parent" rows.
+    pub live: bool,
     pub focused: bool,
     pub theme: &'a Theme,
     pub ascii: &'a AsciiMode,
@@ -64,14 +67,21 @@ impl<'a> Widget for TraceTree<'a> {
             )));
         }
         for orphan in self.orphans {
-            let name = self.names.get(orphan).map(String::as_str).unwrap_or("span");
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {name} "), Style::default().fg(self.theme.text())),
-                Span::styled(
-                    "awaiting parent span",
-                    Style::default().fg(self.theme.subtext()),
-                ),
-            ]));
+            if self.live {
+                // An open turn's spans all await the root by design;
+                // each renders as its own subtree so tool calls nest
+                // under the chat that requested them.
+                self.build_lines(orphan, "", true, true, &mut lines);
+            } else {
+                let name = self.names.get(orphan).map(String::as_str).unwrap_or("span");
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {name} "), Style::default().fg(self.theme.text())),
+                    Span::styled(
+                        "awaiting parent span",
+                        Style::default().fg(self.theme.subtext()),
+                    ),
+                ]));
+            }
         }
 
         Widget::render(Paragraph::new(lines).scroll((self.scroll, 0)), inner, buf);
@@ -264,6 +274,7 @@ mod tests {
                     selected: None,
                     scroll: 0,
                     title: "TRACE",
+                    live: false,
                     focused: false,
                     theme: &theme,
                     ascii: &ascii,
@@ -327,6 +338,7 @@ mod tests {
                     selected: None,
                     scroll: 0,
                     title: "TRACE",
+                    live: false,
                     focused: false,
                     theme: &theme,
                     ascii: &ascii,
@@ -387,6 +399,7 @@ mod tests {
                     selected: None,
                     scroll: 0,
                     title: "TRACE",
+                    live: false,
                     focused: false,
                     theme: &theme,
                     ascii: &ascii,
@@ -411,6 +424,73 @@ mod tests {
         assert!(
             !content.contains("no trace selected"),
             "arrived spans mean the empty-state message is wrong"
+        );
+    }
+
+    #[test]
+    fn live_mode_renders_orphans_as_subtrees() {
+        // A live turn: the chat's parent (the turn root) has not arrived,
+        // but the tool call parents to the chat. Live mode renders the
+        // chat as a subtree with the tool nested, no awaiting labels.
+        let chat: SpanId = "chat-1".into();
+        let tool: SpanId = "tool-1".into();
+        let mut names: HashMap<SpanId, String> = HashMap::new();
+        names.insert(chat.clone(), "gen_ai.chat".to_string());
+        names.insert(tool.clone(), "gen_ai.tool:Bash".to_string());
+        let mut children: HashMap<SpanId, Vec<SpanId>> = HashMap::new();
+        children.insert(chat.clone(), vec![tool]);
+        let orphans = vec![chat];
+
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let collapsed = HashSet::new();
+        let scores: HashMap<SpanId, f64> = HashMap::new();
+        terminal
+            .draw(|frame| {
+                let theme = make_theme();
+                let ascii = make_ascii();
+                let annotated: HashMap<SpanId, String> = HashMap::new();
+                let empty_spans: HashMap<SpanId, reeve_model::entity::span::InternalSpan> =
+                    HashMap::new();
+                let widget = TraceTree {
+                    annotated: &annotated,
+                    filter: None,
+                    spans: &empty_spans,
+                    children: &children,
+                    names: &names,
+                    collapsed: &collapsed,
+                    span_health_scores: &scores,
+                    outcome_lines: &[],
+                    root: None,
+                    orphans: &orphans,
+                    selected: None,
+                    scroll: 0,
+                    title: "TRACE · live",
+                    live: true,
+                    focused: false,
+                    theme: &theme,
+                    ascii: &ascii,
+                };
+                frame.render_widget(widget, frame.area());
+            })
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect::<String>();
+
+        assert!(content.contains("gen_ai.chat"), "the chat renders");
+        assert!(
+            content.contains("gen_ai.tool:Bash"),
+            "the tool nests under its chat"
+        );
+        assert!(
+            !content.contains("awaiting parent span"),
+            "rootless is normal for a live turn, not a condition to label"
         );
     }
 }
