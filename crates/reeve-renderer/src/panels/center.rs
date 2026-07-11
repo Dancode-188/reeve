@@ -17,7 +17,8 @@ pub fn render(
     ascii: &AsciiMode,
     right_hidden: bool,
 ) {
-    let has_streaming = !state.streaming.content.is_empty();
+    let streaming_text = state.streaming_display();
+    let has_streaming = !streaming_text.is_empty();
     let filter_text = state
         .filter_input
         .as_deref()
@@ -163,7 +164,7 @@ pub fn render(
         let cursor_on = (state.streaming.cursor_tick / 8) % 2 == 0;
         frame.render_widget(
             StreamingBox {
-                content: &state.streaming.content,
+                content: streaming_text,
                 cursor_on,
                 scroll: state.streaming.scroll,
                 auto_scroll: state.streaming.auto_scroll,
