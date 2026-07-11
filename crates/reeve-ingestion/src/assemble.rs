@@ -21,6 +21,13 @@ pub type PausedAgents = Arc<Mutex<HashSet<AgentId>>>;
 /// appear (no control channel) and keep the plain idle timeout.
 pub type DisconnectedAgents = Arc<Mutex<std::collections::HashMap<AgentId, Instant>>>;
 
+/// Traces with a response currently streaming (or a Messages round trip
+/// otherwise in flight) through the proxy, with a count of concurrent
+/// requests. Written by the proxy, read by the assembler's tick: a trace
+/// is not idle while tokens are flowing, no matter how long the model
+/// takes. Same shared-map pattern as the paused set.
+pub type ActiveStreams = Arc<Mutex<std::collections::HashMap<TraceId, usize>>>;
+
 /// How long a disconnected agent's traces survive before flushing as
 /// Interrupted and resumable. Generous relative to the idle timeout
 /// because a dropped connection is diagnosable, unlike plain silence.
@@ -54,7 +61,11 @@ pub struct InFlightTrace {
     pub spans: HashMap<SpanId, InternalSpan>,
     pub children: HashMap<SpanId, Vec<SpanId>>,
     pub span_events: HashMap<SpanId, Vec<SpanEvent>>,
-    pending_attachment: HashMap<SpanId, InternalSpan>,
+    /// Spans whose parent has not arrived yet. On the threading path the
+    /// parent is the turn root, which is emitted LAST, so during a live
+    /// turn everything waits here. Every flush path must persist these:
+    /// dropping them cost a real session ~30 round trips of spans (#182).
+    pub pending_attachment: HashMap<SpanId, InternalSpan>,
     pub root_span_id: Option<SpanId>,
     last_updated: Instant,
     completion_timer: Option<Instant>,
@@ -190,15 +201,21 @@ pub struct Assembler {
     traces: HashMap<TraceId, InFlightTrace>,
     paused: PausedAgents,
     disconnected: DisconnectedAgents,
+    active_streams: ActiveStreams,
     ceiling_bytes: usize,
 }
 
 impl Assembler {
-    pub fn new(paused: PausedAgents, disconnected: DisconnectedAgents) -> Self {
+    pub fn new(
+        paused: PausedAgents,
+        disconnected: DisconnectedAgents,
+        active_streams: ActiveStreams,
+    ) -> Self {
         Self {
             traces: HashMap::new(),
             paused,
             disconnected,
+            active_streams,
             ceiling_bytes: IN_FLIGHT_CEILING_BYTES,
         }
     }
@@ -278,6 +295,21 @@ impl Assembler {
             }
         }
 
+        // A response actively streaming through the proxy is the opposite
+        // of idleness, however long the model takes: refresh those traces
+        // the same way pause does. A real 8-minute Claude Code turn hit
+        // the idle timeout repeatedly mid-turn without this (#182).
+        {
+            let streaming = self.active_streams.lock().unwrap();
+            if !streaming.is_empty() {
+                for trace in self.traces.values_mut() {
+                    if streaming.contains_key(&trace.trace_id) {
+                        trace.last_updated = Instant::now();
+                    }
+                }
+            }
+        }
+
         // A dropped connection is not silence: while the grace period
         // runs, the idle timeout is held off (same mechanism as pause);
         // when it expires, the flush below picks the trace up as
@@ -336,6 +368,7 @@ impl Default for Assembler {
         Self::new(
             Arc::new(Mutex::new(HashSet::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         )
     }
 }
@@ -346,8 +379,9 @@ pub async fn run(
     tx: mpsc::Sender<(InFlightTrace, CompletionState)>,
     paused: PausedAgents,
     disconnected: DisconnectedAgents,
+    active_streams: ActiveStreams,
 ) {
-    let mut assembler = Assembler::new(paused, disconnected);
+    let mut assembler = Assembler::new(paused, disconnected, active_streams);
     let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
 
     loop {
@@ -583,12 +617,47 @@ mod tests {
     }
 
     #[test]
+    fn actively_streaming_trace_survives_idle_timeout() {
+        // A model can stream a single response for minutes while the
+        // trace's spans only arrive at stream end: the proxy marks the
+        // round trip in flight, and that must hold the idle timeout the
+        // same way pause does (#182).
+        let active: ActiveStreams = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        active.lock().unwrap().insert("trace-1".into(), 1);
+
+        let mut assembler = Assembler::new(
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+            active.clone(),
+        );
+        assembler.receive(
+            make_span("chat-1", "trace-1", Some("unarrived-root")),
+            vec![],
+            make_agent(),
+        );
+        make_idle(&mut assembler, "trace-1");
+        assert!(
+            assembler.tick().is_empty(),
+            "a streaming trace is not idle, however long the model takes"
+        );
+
+        // Stream ends, the exemption ends: a full idle window later the
+        // plain timeout applies again.
+        active.lock().unwrap().remove(&TraceId::from("trace-1"));
+        make_idle(&mut assembler, "trace-1");
+        let finalized = assembler.tick();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].1, CompletionState::Interrupted);
+    }
+
+    #[test]
     fn paused_agent_trace_survives_idle_timeout() {
         let paused: PausedAgents = Arc::new(Mutex::new(HashSet::new()));
         paused.lock().unwrap().insert("agent-1".into());
 
         let mut assembler = Assembler::new(
             paused,
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
         assembler.receive(
@@ -611,6 +680,7 @@ mod tests {
 
         let mut assembler = Assembler::new(
             paused.clone(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
         assembler.receive(
@@ -646,6 +716,7 @@ mod tests {
         let mut assembler = Assembler::new(
             paused,
             Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
         assembler.receive(make_span("root-1", "trace-1", None), vec![], make_agent());
 
@@ -666,8 +737,11 @@ mod tests {
     fn disconnect_grace_holds_the_idle_timeout() {
         let disconnected: DisconnectedAgents =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let mut assembler =
-            Assembler::new(Arc::new(Mutex::new(HashSet::new())), disconnected.clone());
+        let mut assembler = Assembler::new(
+            Arc::new(Mutex::new(HashSet::new())),
+            disconnected.clone(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+        );
         assembler.receive(
             make_span("child", "t1", Some("missing")),
             vec![],
@@ -693,8 +767,11 @@ mod tests {
     fn expired_grace_flushes_as_resumable() {
         let disconnected: DisconnectedAgents =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let mut assembler =
-            Assembler::new(Arc::new(Mutex::new(HashSet::new())), disconnected.clone());
+        let mut assembler = Assembler::new(
+            Arc::new(Mutex::new(HashSet::new())),
+            disconnected.clone(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+        );
         assembler.receive(
             make_span("child", "t1", Some("missing")),
             vec![],
@@ -718,8 +795,11 @@ mod tests {
     fn reconnect_within_grace_resumes_the_idle_clock() {
         let disconnected: DisconnectedAgents =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let mut assembler =
-            Assembler::new(Arc::new(Mutex::new(HashSet::new())), disconnected.clone());
+        let mut assembler = Assembler::new(
+            Arc::new(Mutex::new(HashSet::new())),
+            disconnected.clone(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+        );
         assembler.receive(
             make_span("child", "t1", Some("missing")),
             vec![],
@@ -745,8 +825,11 @@ mod tests {
     fn completed_trace_is_never_downgraded_by_grace_expiry() {
         let disconnected: DisconnectedAgents =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let mut assembler =
-            Assembler::new(Arc::new(Mutex::new(HashSet::new())), disconnected.clone());
+        let mut assembler = Assembler::new(
+            Arc::new(Mutex::new(HashSet::new())),
+            disconnected.clone(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+        );
         // Root arrived: the straggler window governs, not the grace.
         assembler.receive(make_span("root", "t1", None), vec![], make_agent());
         if let Some(trace) = assembler.traces.get_mut(&TraceId::from("t1")) {
@@ -769,6 +852,7 @@ mod tests {
     fn ceiling_evicts_the_stalest_trace_first() {
         let mut assembler = Assembler::new(
             Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
         assembler.ceiling_bytes = 2_000;
@@ -797,6 +881,7 @@ mod tests {
     fn a_single_oversized_trace_is_never_self_evicted() {
         let mut assembler = Assembler::new(
             Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
         assembler.ceiling_bytes = 500;

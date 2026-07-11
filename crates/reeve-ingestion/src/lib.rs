@@ -39,16 +39,24 @@ pub async fn serve(
     let resume_tx = assemble_tx.clone();
     tokio::spawn(normalize::run(pipeline_rx, capture_content, assemble_tx));
 
+    // Traces mid-generation are exempt from the idle timeout: the proxy
+    // marks them here while a Messages round trip is in flight, and the
+    // assembler treats them as alive however long the model streams.
+    let active_streams: assemble::ActiveStreams =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+
     // The HTTP proxy is a second producer into the same pipeline: spans it
     // synthesizes are normalized, assembled, and routed like SDK spans.
     let proxy_pipeline_tx = pipeline_tx.clone();
     let proxy_signal_tx = signal_tx.clone();
+    let proxy_active_streams = active_streams.clone();
     tokio::spawn(async move {
         if let Err(e) = proxy::run(
             proxy_addr,
             proxy_pipeline_tx,
             proxy_signal_tx,
             proxy_interventions,
+            proxy_active_streams,
         )
         .await
         {
@@ -92,6 +100,7 @@ pub async fn serve(
         route_tx,
         paused,
         disconnected,
+        active_streams,
     ));
     tokio::spawn(route::run(route_rx, hot, warm, signal_tx));
 
