@@ -134,6 +134,7 @@ pub fn render(
                 content: &state.streaming.content,
                 cursor_on,
                 scroll: state.streaming.scroll,
+                auto_scroll: state.streaming.auto_scroll,
                 focused,
                 theme,
                 ascii,
