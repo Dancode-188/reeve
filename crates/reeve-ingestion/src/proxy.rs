@@ -507,7 +507,7 @@ async fn finalize_stream_span(
     };
     emit_pipeline_span(state, agent_name, span, arrived).await;
 
-    if placement.is_some() {
+    if let Some(ref p) = placement {
         // A dead stream still ends its turn: whatever the outcome, the
         // assistant is not going to request more tools on this round trip,
         // so an outcome other than tool_use closes the turn honestly.
@@ -521,6 +521,7 @@ async fn finalize_stream_span(
             .expect("tracker mutex poisoned")
             .record_response(
                 agent_name,
+                &p.trace_id,
                 ResponseInfo {
                     chat_span_id: span_id,
                     tool_uses: acc.tool_uses,
@@ -801,13 +802,14 @@ async fn synthesize_span(
     };
     emit_pipeline_span(state, agent_name, span, arrived).await;
 
-    if placement.is_some() {
+    if let Some(ref p) = placement {
         let root = state
             .tracker
             .lock()
             .expect("tracker mutex poisoned")
             .record_response(
                 agent_name,
+                &p.trace_id,
                 ResponseInfo {
                     chat_span_id,
                     tool_uses,

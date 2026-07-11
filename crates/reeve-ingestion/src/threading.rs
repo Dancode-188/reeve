@@ -201,13 +201,22 @@ impl ConversationTracker {
     /// Records a finished response. Returns the turn root to emit when
     /// the response ended the turn (the assistant stopped requesting
     /// tools), or None while the turn stays open.
-    pub fn record_response(&mut self, agent: &str, info: ResponseInfo) -> Option<TurnRoot> {
+    /// Records a finished response against the exact turn its request
+    /// opened, identified by the trace id the placement returned. A
+    /// recency guess sat here once; Claude Code's side calls run
+    /// concurrently with the main conversation, and a side response
+    /// closing the main turn was the first thing real traffic proved.
+    pub fn record_response(
+        &mut self,
+        agent: &str,
+        trace_id: &[u8],
+        info: ResponseInfo,
+    ) -> Option<TurnRoot> {
         let conv = self
             .conversations
             .get_mut(agent)?
             .iter_mut()
-            .filter(|c| c.turn.is_some())
-            .max_by_key(|c| c.last_seen)?;
+            .find(|c| c.turn.as_ref().is_some_and(|t| t.trace_id == trace_id))?;
         let turn = conv.turn.as_mut()?;
 
         turn.last_chat_span = info.chat_span_id;
@@ -341,6 +350,7 @@ mod tests {
         // Response 1: assistant requests a tool.
         let root = t.record_response(
             "claude-cli",
+            &p1.trace_id,
             ResponseInfo {
                 chat_span_id: vec![1; 8],
                 tool_uses: vec![("toolu_1".into(), "bash".into())],
@@ -370,6 +380,7 @@ mod tests {
         // Response 2: assistant finishes.
         let root = t.record_response(
             "claude-cli",
+            &p2.trace_id,
             ResponseInfo {
                 chat_span_id: vec![2; 8],
                 tool_uses: vec![],
@@ -403,6 +414,7 @@ mod tests {
         assert!(p1.new_conversation);
         t.record_response(
             "claude-cli",
+            &p1.trace_id,
             ResponseInfo {
                 chat_span_id: vec![1; 8],
                 tool_uses: vec![("toolu_1".into(), "bash".into())],
@@ -426,6 +438,58 @@ mod tests {
     }
 
     #[test]
+    fn a_concurrent_side_call_cannot_close_the_main_turn() {
+        // The shape from real Claude Code (#179): a side call (topic
+        // detection) runs in parallel with the main conversation, and
+        // its fast end_turn response arrives while the main response is
+        // still streaming. It must close its own turn and only its own.
+        let mut t = ConversationTracker::default();
+        let now = SystemTime::now();
+
+        let side = t.place_request("claude-cli", &[msg("user", "<session> topic?")], now, ids);
+        let main = t.place_request("claude-cli", &[msg("user", "list the files")], now, ids);
+
+        // The side response lands first, after the MAIN conversation was
+        // the most recently seen: a recency guess closes the wrong turn.
+        let root = t
+            .record_response(
+                "claude-cli",
+                &side.trace_id,
+                ResponseInfo {
+                    chat_span_id: vec![9; 8],
+                    tool_uses: vec![],
+                    stop_reason: Some("end_turn".into()),
+                    ended_at: now,
+                },
+            )
+            .expect("the side turn closes");
+        assert_eq!(root.trace_id, side.trace_id, "its own trace, not main's");
+
+        // The main response then keeps its turn open with a tool request,
+        // and the follow-up threads into the SAME main trace.
+        let root = t.record_response(
+            "claude-cli",
+            &main.trace_id,
+            ResponseInfo {
+                chat_span_id: vec![1; 8],
+                tool_uses: vec![("toolu_1".into(), "Bash".into())],
+                stop_reason: Some("tool_use".into()),
+                ended_at: now,
+            },
+        );
+        assert!(root.is_none(), "main turn survives the side call");
+
+        let m2 = vec![
+            msg("user", "list the files"),
+            msg("assistant", "running"),
+            tool_result("toolu_1", false),
+        ];
+        let p2 = t.place_request("claude-cli", &m2, now, ids);
+        assert_eq!(p2.trace_id, main.trace_id, "the tool loop stays one trace");
+        assert_eq!(p2.tools.len(), 1, "and the tool span is reconstructed");
+    }
+
+    #[test]
     fn the_next_user_message_starts_a_new_trace() {
         let mut t = ConversationTracker::default();
         let now = SystemTime::now();
@@ -434,6 +498,7 @@ mod tests {
         let p1 = t.place_request("cli", &m1, now, ids);
         t.record_response(
             "cli",
+            &p1.trace_id,
             ResponseInfo {
                 chat_span_id: vec![1; 8],
                 tool_uses: vec![],
@@ -454,6 +519,7 @@ mod tests {
         let root = t
             .record_response(
                 "cli",
+                &p2.trace_id,
                 ResponseInfo {
                     chat_span_id: vec![2; 8],
                     tool_uses: vec![],
@@ -500,9 +566,10 @@ mod tests {
     fn errored_tool_results_mark_the_tool_failed() {
         let mut t = ConversationTracker::default();
         let now = SystemTime::now();
-        t.place_request("cli", &[msg("user", "go")], now, ids);
+        let p1 = t.place_request("cli", &[msg("user", "go")], now, ids);
         t.record_response(
             "cli",
+            &p1.trace_id,
             ResponseInfo {
                 chat_span_id: vec![1; 8],
                 tool_uses: vec![("toolu_9".into(), "web_search".into())],
