@@ -98,6 +98,46 @@ pub struct TraceView {
     pub notes: HashMap<SpanId, String>,
 }
 
+impl TraceView {
+    /// An empty view for a turn that just opened; spans fold in as they
+    /// are observed.
+    pub fn empty(trace_id: TraceId) -> Self {
+        Self {
+            trace_id,
+            root: None,
+            spans: HashMap::new(),
+            children: HashMap::new(),
+            names: HashMap::new(),
+            span_order: Vec::new(),
+            scroll: 0,
+            selected: None,
+            collapsed: HashSet::new(),
+            span_health_scores: HashMap::new(),
+            outcome_lines: Vec::new(),
+            orphans: Vec::new(),
+            notes: HashMap::new(),
+        }
+    }
+
+    /// Folds one observed span into a live view. Spans whose parent has
+    /// not arrived become top-level rows (the parent is usually the turn
+    /// root, which only arrives when the turn ends); a parentless span
+    /// IS that root.
+    pub fn observe(&mut self, span_id: SpanId, parent_span_id: Option<SpanId>, operation: String) {
+        self.names.insert(span_id.clone(), operation);
+        if let Some(pid) = parent_span_id {
+            if self.names.contains_key(&pid) {
+                self.children.entry(pid).or_default().push(span_id.clone());
+            } else {
+                self.orphans.push(span_id.clone());
+            }
+        } else {
+            self.root = Some(span_id.clone());
+        }
+        self.span_order.push(span_id);
+    }
+}
+
 pub struct StreamingState {
     pub content: String,
     pub scroll: u16,
@@ -212,6 +252,12 @@ pub struct AppState {
     pub agents: IndexMap<AgentId, AgentState>,
     pub selected_agent: Option<usize>,
     pub trace: Option<TraceView>,
+    /// The open turn per agent, built from SpanObserved events as spans
+    /// enter the pipeline. The trace panel prefers this over the loaded
+    /// completed trace, so the cockpit is never blank while an agent
+    /// works; TraceCompleted retires the entry and the loaded trace
+    /// takes over.
+    pub live_turns: HashMap<AgentId, TraceView>,
     pub streaming: StreamingState,
     pub health_score: Option<f64>,
     pub prev_health_score: Option<f64>,
@@ -384,6 +430,37 @@ impl AppState {
     }
 
     /// Whether the agent arrived via the proxy path.
+    /// The live view the trace panel shows for the selected agent, when
+    /// a turn is open. None once the turn completes (TraceCompleted
+    /// retires the entry) or when nothing is in flight.
+    pub fn live_view_for_selected(&self) -> Option<&TraceView> {
+        let (agent_id, _) = self.agents.get_index(self.selected_agent?)?;
+        self.live_turns.get(agent_id)
+    }
+
+    /// Folds an observed span into its agent's live turn. A span from a
+    /// different trace than the stored one starts a fresh live view: a
+    /// new turn began.
+    pub fn observe_span(
+        &mut self,
+        agent_id: AgentId,
+        trace_id: TraceId,
+        span_id: SpanId,
+        parent_span_id: Option<SpanId>,
+        operation: String,
+    ) {
+        let view = self
+            .live_turns
+            .entry(agent_id)
+            .and_modify(|v| {
+                if v.trace_id != trace_id {
+                    *v = TraceView::empty(trace_id.clone());
+                }
+            })
+            .or_insert_with(|| TraceView::empty(trace_id.clone()));
+        view.observe(span_id, parent_span_id, operation);
+    }
+
     pub fn is_proxy_agent(&self, agent_id: &AgentId) -> bool {
         self.agents
             .get(agent_id)
@@ -471,6 +548,7 @@ impl App {
                 agents,
                 selected_agent,
                 trace: None,
+                live_turns: HashMap::new(),
                 streaming: StreamingState::default(),
                 health_score: None,
                 prev_health_score: None,
@@ -554,6 +632,9 @@ impl App {
                         s.cost_history.remove(0);
                     }
                 }
+                // The turn is over: the live view retires and the loaded
+                // completed trace takes the panel back.
+                self.state.live_turns.retain(|_, v| v.trace_id != trace_id);
                 let is_selected = self
                     .state
                     .selected_agent
@@ -612,6 +693,16 @@ impl App {
                         s.agent.status = reeve_model::entity::AgentStatus::Running;
                     }
                 }
+            }
+            IngestionEvent::SpanObserved {
+                agent_id,
+                trace_id,
+                span_id,
+                parent_span_id,
+                operation,
+            } => {
+                self.state
+                    .observe_span(agent_id, trace_id, span_id, parent_span_id, operation);
             }
             IngestionEvent::SpanCompleted { .. } => {}
         }
@@ -811,6 +902,10 @@ impl App {
 
     async fn load_trace(&mut self, trace_id: TraceId) {
         match self.warm.list_spans_for_trace(&trace_id).await {
+            Ok(spans) if spans.is_empty() => {
+                // Nothing stored for this trace: keep whatever the panel
+                // is showing rather than replacing it with a blank view.
+            }
             Ok(spans) => {
                 let mut span_map: HashMap<SpanId, InternalSpan> = HashMap::new();
                 let mut children: HashMap<SpanId, Vec<SpanId>> = HashMap::new();
@@ -2659,6 +2754,39 @@ mod tests {
             Some(CommandType::InjectContext { context }) => assert_eq!(context, "extra facts"),
             other => panic!("inject_context must map with its context, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_live_turn_folds_observed_spans_into_a_tree() {
+        // The interactive-session shape: chats parent to a root that has
+        // not arrived, tools parent to their chat, the root lands last.
+        let mut v = TraceView::empty("t1".into());
+        v.observe("chat-1".into(), Some("root".into()), "gen_ai.chat".into());
+        v.observe(
+            "tool-1".into(),
+            Some("chat-1".into()),
+            "gen_ai.tool:Bash".into(),
+        );
+        v.observe("chat-2".into(), Some("root".into()), "gen_ai.chat".into());
+
+        assert_eq!(
+            v.orphans,
+            vec![SpanId::from("chat-1"), SpanId::from("chat-2")],
+            "chats are top-level rows while the root is unarrived"
+        );
+        assert_eq!(
+            v.children.get(&SpanId::from("chat-1")),
+            Some(&vec![SpanId::from("tool-1")]),
+            "the tool nests under the chat that requested it"
+        );
+        assert!(v.root.is_none(), "no root while the turn is open");
+
+        v.observe("root".into(), None, "agent.turn.1".into());
+        assert_eq!(
+            v.root,
+            Some(SpanId::from("root")),
+            "the arriving root completes the shape"
+        );
     }
 
     #[test]

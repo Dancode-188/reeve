@@ -8,6 +8,16 @@ pub enum IngestionEvent {
         trace_id: TraceId,
         span_id: SpanId,
     },
+    /// A span entered the pipeline, before assembly. The cockpit builds
+    /// its live view of an open turn from these: without them a long
+    /// turn renders nothing until its root arrives at the very end.
+    SpanObserved {
+        agent_id: AgentId,
+        trace_id: TraceId,
+        span_id: SpanId,
+        parent_span_id: Option<SpanId>,
+        operation: String,
+    },
     TraceCompleted {
         trace_id: TraceId,
         agent_id: AgentId,

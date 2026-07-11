@@ -75,7 +75,37 @@ pub fn render(
         "TRACE"
     };
 
-    if let Some(tv) = state.trace.as_ref() {
+    // An open turn outranks the loaded completed trace: the cockpit
+    // shows what the agent is doing NOW, and falls back to the finished
+    // trace when the turn completes and its live view retires.
+    if let Some(lv) = state.live_view_for_selected() {
+        frame.render_widget(
+            TraceTree {
+                children: &lv.children,
+                names: &lv.names,
+                collapsed: &lv.collapsed,
+                span_health_scores: &lv.span_health_scores,
+                outcome_lines: &[],
+                annotated: &lv.notes,
+                filter: filter_text,
+                spans: &lv.spans,
+                root: lv.root.as_ref(),
+                orphans: &lv.orphans,
+                selected: None,
+                scroll: lv.scroll,
+                title: if right_hidden {
+                    "TRACE · live [SPAN ▷]"
+                } else {
+                    "TRACE · live"
+                },
+                live: true,
+                focused,
+                theme,
+                ascii,
+            },
+            tree_area,
+        );
+    } else if let Some(tv) = state.trace.as_ref() {
         frame.render_widget(
             TraceTree {
                 children: &tv.children,
@@ -91,6 +121,7 @@ pub fn render(
                 selected: tv.selected.as_ref(),
                 scroll: tv.scroll,
                 title,
+                live: false,
                 focused,
                 theme,
                 ascii,
@@ -119,6 +150,7 @@ pub fn render(
                 selected: None,
                 scroll: 0,
                 title,
+                live: false,
                 focused,
                 theme,
                 ascii,
