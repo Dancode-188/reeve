@@ -138,11 +138,30 @@ impl TraceView {
     }
 }
 
+/// One in-flight generation. The box shows the oldest active stream of
+/// the selected agent, so a quick side call can never displace the main
+/// generation the operator is watching.
+pub struct ActiveStream {
+    pub span_id: SpanId,
+    pub agent_id: AgentId,
+    pub content: String,
+    /// Arrival order; the lowest sequence among an agent's active
+    /// streams is the one being displayed.
+    pub seq: u64,
+}
+
 pub struct StreamingState {
+    /// Replay's display text. Live sessions derive their text from
+    /// `active` and `last_finished` instead; see streaming_display.
     pub content: String,
     pub scroll: u16,
     pub auto_scroll: bool,
     pub cursor_tick: u8,
+    pub active: Vec<ActiveStream>,
+    /// Per agent, the text of the last displayed stream that finished,
+    /// so the box holds the final response between turns.
+    pub last_finished: HashMap<AgentId, String>,
+    pub next_seq: u64,
 }
 
 impl Default for StreamingState {
@@ -152,7 +171,63 @@ impl Default for StreamingState {
             scroll: 0,
             auto_scroll: true,
             cursor_tick: 0,
+            active: Vec::new(),
+            last_finished: HashMap::new(),
+            next_seq: 0,
         }
+    }
+}
+
+impl StreamingState {
+    /// Folds a streaming tick into its span's active stream.
+    pub fn update(&mut self, span_id: SpanId, agent_id: AgentId, content: String) {
+        match self.active.iter_mut().find(|s| s.span_id == span_id) {
+            Some(s) => s.content = content,
+            None => {
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                self.active.push(ActiveStream {
+                    span_id,
+                    agent_id,
+                    content,
+                    seq,
+                });
+            }
+        }
+    }
+
+    /// Retires a finished span's stream. Its text becomes the agent's
+    /// between-turns display only if it was the one being shown;
+    /// otherwise a side call finishing would overwrite the main
+    /// response the operator was reading.
+    pub fn finish(&mut self, span_id: &SpanId) {
+        let Some(pos) = self.active.iter().position(|s| &s.span_id == span_id) else {
+            return;
+        };
+        let removed = self.active.remove(pos);
+        let was_displayed = !self
+            .active
+            .iter()
+            .any(|s| s.agent_id == removed.agent_id && s.seq < removed.seq);
+        if was_displayed {
+            self.last_finished.insert(removed.agent_id, removed.content);
+        }
+    }
+
+    /// The text an agent's box shows: its oldest active stream, else the
+    /// last displayed stream that finished.
+    pub fn display_for(&self, agent_id: &AgentId) -> &str {
+        self.active
+            .iter()
+            .filter(|s| &s.agent_id == agent_id)
+            .min_by_key(|s| s.seq)
+            .map(|s| s.content.as_str())
+            .unwrap_or_else(|| {
+                self.last_finished
+                    .get(agent_id)
+                    .map(String::as_str)
+                    .unwrap_or("")
+            })
     }
 }
 
@@ -430,6 +505,20 @@ impl AppState {
     }
 
     /// Whether the agent arrived via the proxy path.
+    /// What the streaming box shows. Replay owns the box while active;
+    /// live sessions show the selected agent's oldest active stream, so
+    /// a quick side call never displaces the main generation, falling
+    /// back to the last displayed stream that finished.
+    pub fn streaming_display(&self) -> &str {
+        if self.replay.is_some() {
+            return &self.streaming.content;
+        }
+        let Some((agent_id, _)) = self.selected_agent.and_then(|i| self.agents.get_index(i)) else {
+            return "";
+        };
+        self.streaming.display_for(agent_id)
+    }
+
     /// The live view the trace panel shows for the selected agent, when
     /// a turn is open. None once the turn completes (TraceCompleted
     /// retires the entry) or when nothing is in flight.
@@ -665,15 +754,18 @@ impl App {
             IngestionEvent::StreamingUpdate {
                 content,
                 agent_id,
+                span_id,
                 cost_so_far,
                 ..
             } => {
                 // The update carries the full accumulated text, not a
                 // delta: assign, so a missed broadcast message self-heals
-                // on the next update instead of losing text (appending
-                // here also duplicated content, since the producer has
-                // always sent the accumulated form).
-                self.state.streaming.content = content;
+                // on the next update instead of losing text. Keyed by
+                // span so concurrent side calls cannot stomp the main
+                // generation in the shared box.
+                self.state
+                    .streaming
+                    .update(span_id, agent_id.clone(), content);
                 if let Some(s) = self.state.agents.get_mut(&agent_id) {
                     if let Some(cost) = cost_so_far {
                         s.live_cost = cost;
@@ -701,6 +793,9 @@ impl App {
                 parent_span_id,
                 operation,
             } => {
+                // A span being observed means its round trip finalized:
+                // any stream it was feeding is over.
+                self.state.streaming.finish(&span_id);
                 self.state
                     .observe_span(agent_id, trace_id, span_id, parent_span_id, operation);
             }
@@ -2754,6 +2849,37 @@ mod tests {
             Some(CommandType::InjectContext { context }) => assert_eq!(context, "extra facts"),
             other => panic!("inject_context must map with its context, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_side_call_cannot_stomp_the_main_stream() {
+        // The live-session shape: a title-generation side call streams
+        // concurrently with the main response and used to overwrite it
+        // in the shared box (the operator watched their own prompt echo
+        // replace the generation they were reading).
+        let agent: AgentId = "claude-cli:proxy".into();
+        let mut s = StreamingState::default();
+
+        s.update("main".into(), agent.clone(), "the fix is".into());
+        s.update("side".into(), agent.clone(), "commit this".into());
+        s.update("main".into(), agent.clone(), "the fix is ready".into());
+        assert_eq!(
+            s.display_for(&agent),
+            "the fix is ready",
+            "the older main stream owns the box"
+        );
+
+        // The side call finishes first: the box does not adopt its text.
+        s.finish(&"side".into());
+        assert_eq!(s.display_for(&agent), "the fix is ready");
+
+        // The main stream finishes: its final text holds between turns.
+        s.finish(&"main".into());
+        assert_eq!(
+            s.display_for(&agent),
+            "the fix is ready",
+            "the displayed stream's final text lingers, not the side call's"
+        );
     }
 
     #[test]
