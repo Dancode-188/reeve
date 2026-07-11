@@ -98,6 +98,90 @@ pub struct TraceView {
     pub notes: HashMap<SpanId, String>,
 }
 
+/// One open turn's live view and its display ordering.
+pub struct LiveTurn {
+    pub agent_id: AgentId,
+    /// Arrival order; the lowest sequence among an agent's open turns
+    /// is the one the panel shows.
+    pub seq: u64,
+    pub view: TraceView,
+}
+
+/// Open turns keyed by trace. Keyed by trace and not by agent because
+/// one agent runs concurrent conversations (side calls): an agent-keyed
+/// slot let every side call destroy the main turn's view. Per agent the
+/// panel shows the OLDEST open turn, mirroring the streaming box rule.
+#[derive(Default)]
+pub struct LiveTurns {
+    entries: Vec<LiveTurn>,
+    seq: u64,
+}
+
+impl LiveTurns {
+    /// Folds an observed span into its turn's view, opening one for a
+    /// trace not seen before. Bounded: over 32 open turns, the oldest
+    /// is evicted, so traces that never complete cannot leak forever.
+    pub fn observe(
+        &mut self,
+        agent_id: AgentId,
+        trace_id: TraceId,
+        span_id: SpanId,
+        parent_span_id: Option<SpanId>,
+        operation: String,
+    ) {
+        let view = match self
+            .entries
+            .iter_mut()
+            .find(|t| t.view.trace_id == trace_id)
+        {
+            Some(t) => &mut t.view,
+            None => {
+                if self.entries.len() >= 32 {
+                    if let Some(pos) = self
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, t)| t.seq)
+                        .map(|(i, _)| i)
+                    {
+                        self.entries.remove(pos);
+                    }
+                }
+                let seq = self.seq;
+                self.seq += 1;
+                self.entries.push(LiveTurn {
+                    agent_id,
+                    seq,
+                    view: TraceView::empty(trace_id.clone()),
+                });
+                &mut self.entries.last_mut().expect("just pushed").view
+            }
+        };
+        view.observe(span_id, parent_span_id, operation);
+    }
+
+    /// The turn is over: its view retires.
+    pub fn retire(&mut self, trace_id: &TraceId) {
+        self.entries.retain(|t| &t.view.trace_id != trace_id);
+    }
+
+    pub fn oldest_for(&self, agent_id: &AgentId) -> Option<&TraceView> {
+        self.entries
+            .iter()
+            .filter(|t| &t.agent_id == agent_id)
+            .min_by_key(|t| t.seq)
+            .map(|t| &t.view)
+    }
+
+    pub fn oldest_for_mut(&mut self, agent_id: &AgentId) -> Option<&mut TraceView> {
+        self.entries
+            .iter_mut()
+            .filter(|t| &t.agent_id == agent_id)
+            .min_by_key(|t| t.seq)
+            .map(|t| &mut t.view)
+    }
+}
+
 impl TraceView {
     /// An empty view for a turn that just opened; spans fold in as they
     /// are observed.
@@ -327,12 +411,11 @@ pub struct AppState {
     pub agents: IndexMap<AgentId, AgentState>,
     pub selected_agent: Option<usize>,
     pub trace: Option<TraceView>,
-    /// The open turn per agent, built from SpanObserved events as spans
-    /// enter the pipeline. The trace panel prefers this over the loaded
-    /// completed trace, so the cockpit is never blank while an agent
-    /// works; TraceCompleted retires the entry and the loaded trace
-    /// takes over.
-    pub live_turns: HashMap<AgentId, TraceView>,
+    /// Open turns built from SpanObserved events as spans enter the
+    /// pipeline; the trace panel prefers these over the loaded
+    /// completed trace, and TraceCompleted retires entries so the
+    /// loaded trace takes over.
+    pub live_turns: LiveTurns,
     pub streaming: StreamingState,
     pub health_score: Option<f64>,
     pub prev_health_score: Option<f64>,
@@ -519,17 +602,37 @@ impl AppState {
         self.streaming.display_for(agent_id)
     }
 
-    /// The live view the trace panel shows for the selected agent, when
-    /// a turn is open. None once the turn completes (TraceCompleted
-    /// retires the entry) or when nothing is in flight.
+    /// The live view the trace panel shows for the selected agent: its
+    /// OLDEST open turn, so concurrent side calls never displace the
+    /// main conversation being watched. None once every turn completes.
     pub fn live_view_for_selected(&self) -> Option<&TraceView> {
         let (agent_id, _) = self.agents.get_index(self.selected_agent?)?;
-        self.live_turns.get(agent_id)
+        self.live_turns.oldest_for(agent_id)
     }
 
-    /// Folds an observed span into its agent's live turn. A span from a
-    /// different trace than the stored one starts a fresh live view: a
-    /// new turn began.
+    fn live_view_for_selected_mut(&mut self) -> Option<&mut TraceView> {
+        let (agent_id, _) = self.agents.get_index(self.selected_agent?)?;
+        let agent_id = agent_id.clone();
+        self.live_turns.oldest_for_mut(&agent_id)
+    }
+
+    /// The tree the center panel is actually showing: the live view
+    /// while a turn is open, else the loaded completed trace. Selection
+    /// and mouse hits must resolve against this, never against a tree
+    /// the panel is not displaying.
+    pub fn center_view(&self) -> Option<&TraceView> {
+        self.live_view_for_selected().or(self.trace.as_ref())
+    }
+
+    pub fn center_view_mut(&mut self) -> Option<&mut TraceView> {
+        if self.live_view_for_selected().is_some() {
+            return self.live_view_for_selected_mut();
+        }
+        self.trace.as_mut()
+    }
+
+    /// Folds an observed span into its turn's live view, opening one for
+    /// a trace not seen before.
     pub fn observe_span(
         &mut self,
         agent_id: AgentId,
@@ -538,16 +641,8 @@ impl AppState {
         parent_span_id: Option<SpanId>,
         operation: String,
     ) {
-        let view = self
-            .live_turns
-            .entry(agent_id)
-            .and_modify(|v| {
-                if v.trace_id != trace_id {
-                    *v = TraceView::empty(trace_id.clone());
-                }
-            })
-            .or_insert_with(|| TraceView::empty(trace_id.clone()));
-        view.observe(span_id, parent_span_id, operation);
+        self.live_turns
+            .observe(agent_id, trace_id, span_id, parent_span_id, operation);
     }
 
     pub fn is_proxy_agent(&self, agent_id: &AgentId) -> bool {
@@ -637,7 +732,7 @@ impl App {
                 agents,
                 selected_agent,
                 trace: None,
-                live_turns: HashMap::new(),
+                live_turns: LiveTurns::default(),
                 streaming: StreamingState::default(),
                 health_score: None,
                 prev_health_score: None,
@@ -723,7 +818,7 @@ impl App {
                 }
                 // The turn is over: the live view retires and the loaded
                 // completed trace takes the panel back.
-                self.state.live_turns.retain(|_, v| v.trace_id != trace_id);
+                self.state.live_turns.retire(&trace_id);
                 let is_selected = self
                     .state
                     .selected_agent
@@ -1006,6 +1101,7 @@ impl App {
                 let mut children: HashMap<SpanId, Vec<SpanId>> = HashMap::new();
                 let mut names: HashMap<SpanId, String> = HashMap::new();
                 let mut root: Option<SpanId> = None;
+                let mut arrival: Vec<SpanId> = Vec::new();
 
                 for span in spans {
                     if let Some(ref pid) = span.parent_id {
@@ -1017,14 +1113,26 @@ impl App {
                         root = Some(span.id.clone());
                     }
                     names.insert(span.id.clone(), span.operation.clone());
+                    arrival.push(span.id.clone());
                     span_map.insert(span.id.clone(), span);
                 }
 
                 let collapsed = HashSet::new();
-                let span_order = root
+                let mut span_order = root
                     .as_ref()
                     .map(|r| flatten_tree(r, &children, &collapsed))
                     .unwrap_or_default();
+                // Spans not reachable from the root: an interrupted trace
+                // is often rootless (the turn root only emits at turn
+                // end), and these used to vanish, rendering a trace full
+                // of spans as "no trace selected".
+                let reachable: HashSet<&SpanId> = span_order.iter().collect();
+                let orphans: Vec<SpanId> = arrival
+                    .iter()
+                    .filter(|id| !reachable.contains(id))
+                    .cloned()
+                    .collect();
+                span_order.extend(orphans.iter().cloned());
 
                 let raw_outcomes = self
                     .warm
@@ -1082,7 +1190,7 @@ impl App {
                     collapsed,
                     span_health_scores: HashMap::new(),
                     outcome_lines,
-                    orphans: Vec::new(),
+                    orphans,
                     notes,
                 });
             }
@@ -1276,7 +1384,7 @@ impl App {
                     }
                 }
                 PanelFocus::Center => {
-                    if let Some(ref mut tv) = self.state.trace {
+                    if let Some(tv) = self.state.center_view_mut() {
                         tv.selected = tv.span_order.first().cloned();
                         tv.scroll = 0;
                     }
@@ -1295,7 +1403,7 @@ impl App {
                     }
                 }
                 PanelFocus::Center => {
-                    if let Some(ref mut tv) = self.state.trace {
+                    if let Some(tv) = self.state.center_view_mut() {
                         tv.selected = tv.span_order.last().cloned();
                         tv.scroll = tv.span_order.len().saturating_sub(1) as u16;
                     }
@@ -1799,7 +1907,9 @@ impl App {
     }
 
     fn move_center_selection(&mut self, delta: i32) {
-        let Some(tv) = self.state.trace.as_mut() else {
+        // The displayed tree, live or loaded: selection on a tree the
+        // panel is not showing reads as dead keys.
+        let Some(tv) = self.state.center_view_mut() else {
             return;
         };
         if tv.span_order.is_empty() {
@@ -2299,12 +2409,19 @@ impl App {
                 }
             }
             MouseTarget::SelectSpan(span_id) => {
-                if let Some(ref mut tv) = self.state.trace {
+                if let Some(tv) = self.state.center_view_mut() {
                     tv.selected = Some(span_id);
                 }
             }
             MouseTarget::ToggleSpan(span_id) => {
-                if let Some(ref mut tv) = self.state.trace {
+                if let Some(tv) = self.state.center_view_mut() {
+                    // A live view has no root to re-flatten from; its
+                    // rows follow arrival order, so folding waits until
+                    // the trace completes.
+                    if tv.root.is_none() {
+                        tv.selected = Some(span_id);
+                        return;
+                    }
                     if tv.collapsed.contains(&span_id) {
                         tv.collapsed.remove(&span_id);
                     } else {
@@ -2879,6 +2996,49 @@ mod tests {
             s.display_for(&agent),
             "the fix is ready",
             "the displayed stream's final text lingers, not the side call's"
+        );
+    }
+
+    #[test]
+    fn a_side_call_cannot_destroy_the_main_live_view() {
+        // The real-session shape behind #190: side calls run concurrent
+        // conversations under the SAME agent. The old agent-keyed slot
+        // let every side-call span replace the main turn's view, and
+        // the panel went blank when the side call retired.
+        let agent: AgentId = "claude-cli:proxy".into();
+        let mut lt = LiveTurns::default();
+
+        lt.observe(
+            agent.clone(),
+            "main-trace".into(),
+            "chat-1".into(),
+            Some("root".into()),
+            "gen_ai.chat".into(),
+        );
+        lt.observe(
+            agent.clone(),
+            "side-trace".into(),
+            "side-chat".into(),
+            Some("side-root".into()),
+            "gen_ai.chat".into(),
+        );
+        assert_eq!(
+            lt.oldest_for(&agent).map(|v| v.trace_id.as_str()),
+            Some("main-trace"),
+            "the older main turn owns the panel"
+        );
+
+        lt.retire(&"side-trace".into());
+        assert_eq!(
+            lt.oldest_for(&agent).map(|v| v.trace_id.as_str()),
+            Some("main-trace"),
+            "the side call retiring leaves the main view standing"
+        );
+
+        lt.retire(&"main-trace".into());
+        assert!(
+            lt.oldest_for(&agent).is_none(),
+            "all turns closed: the loaded trace takes the panel back"
         );
     }
 

@@ -69,8 +69,9 @@ pub fn click_target(
         }
         // Trace tree: border+title row, then one line per visible row.
         // Outcome annotation lines interleave with span rows, so the click
-        // row maps through the same row list the tree draws.
-        let Some(tv) = state.trace.as_ref() else {
+        // row maps through the same row list the tree draws. Hits resolve
+        // against whichever tree the panel is showing, live or loaded.
+        let Some(tv) = state.center_view() else {
             return MouseTarget::None;
         };
         if y <= panels.center.y {
