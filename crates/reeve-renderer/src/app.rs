@@ -386,6 +386,22 @@ pub struct PendingConfirmation {
     pub command_type: String,
     pub auto_confirm_after_secs: Option<u64>,
     pub arrived_at_ms: i64,
+    /// Whether the target agent's integration can actually apply the
+    /// suggested command. When false, confirm opens the intervention
+    /// overlay instead of dispatching a guaranteed dead letter, and no
+    /// auto-confirm countdown runs.
+    pub supported: bool,
+}
+
+/// Whether a policy-suggested command can be dispatched to an agent
+/// with these capabilities. Resume rides the pause capability.
+pub fn suggestion_supported(caps: &[String], command_type: &str) -> bool {
+    let needed = if command_type == "resume" {
+        "pause"
+    } else {
+        command_type
+    };
+    caps.iter().any(|c| c == needed)
 }
 
 pub struct InterventionTemplate {
@@ -1059,13 +1075,21 @@ impl App {
                     self.state
                         .notify(&format!("policy alert needs confirmation: {description}"));
                     if let Some(agent_id) = self.state.selected_agent_id().cloned() {
+                        // A suggestion the target cannot apply must not
+                        // dispatch, and must never auto-dispatch: the
+                        // countdown would fire a guaranteed dead letter.
+                        let supported = suggestion_supported(
+                            &self.state.effective_capabilities(&agent_id),
+                            &command_type,
+                        );
                         self.state.pending_confirmation = Some(PendingConfirmation {
                             agent_id,
                             rule_id,
                             description,
                             command_type,
-                            auto_confirm_after_secs,
+                            auto_confirm_after_secs: auto_confirm_after_secs.filter(|_| supported),
                             arrived_at_ms: current_ms(),
+                            supported,
                         });
                     }
                 }
@@ -1748,6 +1772,16 @@ impl App {
         match action {
             Action::Select => {
                 if let Some(pc) = self.state.pending_confirmation.take() {
+                    if !pc.supported {
+                        // The suggestion cannot apply on this agent's
+                        // path: hand the operator the actions that can,
+                        // instead of dispatching a dead letter.
+                        self.state.overlay = Some(InterventionOverlayState {
+                            agent_id: pc.agent_id,
+                            mode: OverlayMode::Menu,
+                        });
+                        return;
+                    }
                     let issued_by = format!("policy:{}", pc.rule_id);
                     self.dispatch_confirmation(pc, issued_by).await;
                 }
@@ -2996,6 +3030,31 @@ mod tests {
             s.display_for(&agent),
             "the fix is ready",
             "the displayed stream's final text lingers, not the side call's"
+        );
+    }
+
+    #[test]
+    fn suggestions_check_the_target_capabilities() {
+        // The #192 shape: policy suggested pause for a proxy agent,
+        // whose path has no pause by design; confirming dead-lettered.
+        let proxy_caps = vec![
+            "redirect".to_string(),
+            "inject_context".to_string(),
+            "kill".to_string(),
+        ];
+        assert!(!suggestion_supported(&proxy_caps, "pause"));
+        assert!(suggestion_supported(&proxy_caps, "redirect"));
+        assert!(suggestion_supported(&proxy_caps, "kill"));
+
+        let sdk_caps = vec!["pause".to_string(), "redirect".to_string()];
+        assert!(suggestion_supported(&sdk_caps, "pause"));
+        assert!(
+            suggestion_supported(&sdk_caps, "resume"),
+            "resume rides the pause capability"
+        );
+        assert!(
+            !suggestion_supported(&[], "redirect"),
+            "no capabilities, no dispatchable suggestions"
         );
     }
 
