@@ -2051,11 +2051,18 @@ impl App {
                 true
             }
             Action::Select => {
+                // Loads full detail into the right panel from the warm
+                // store. The load alone was invisible: nothing was
+                // selected, so SPAN DETAIL kept saying "select a span".
+                // Selecting the root makes the detail land.
                 if let Some((trace, _)) =
                     self.state.history_entries.get(self.state.history_selected)
                 {
                     let id = trace.id.clone();
                     self.load_trace(id).await;
+                    if let Some(ref mut tv) = self.state.trace {
+                        tv.selected = tv.root.clone().or_else(|| tv.span_order.first().cloned());
+                    }
                 }
                 true
             }
