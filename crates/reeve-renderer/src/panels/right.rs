@@ -163,6 +163,17 @@ fn span_detail_height(state: &AppState) -> u16 {
             }
             if span.attributes.get("gen_ai.usage.output_tokens").is_some() {
                 h += 1;
+                // The thinking row renders only under an output row and
+                // only when the count is nonzero, so its height must
+                // follow the same gate or every other row shifts.
+                if span
+                    .attributes
+                    .get("gen_ai.usage.thinking_tokens")
+                    .and_then(|v| v.as_u64())
+                    .is_some_and(|t| t > 0)
+                {
+                    h += 1;
+                }
             }
             if span.attributes.get("gen_ai.usage.cost").is_some() {
                 h += 1;
@@ -172,6 +183,9 @@ fn span_detail_height(state: &AppState) -> u16 {
             }
             if span.raw_attributes.contains_key("reeve.proxy.overhead_ms") {
                 h += 1;
+            }
+            if span.raw_attributes.contains_key("reeve.context.edit_types") {
+                h += 1; // compacted
             }
             h + 1 // divider
         }
@@ -569,6 +583,36 @@ fn render_span_detail(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     "overhead",
                     &format!("{:.2} ms", overhead),
                     theme.subtext(),
+                    theme,
+                ));
+            }
+
+            // The API edited the conversation on this round trip: the
+            // moment threading legitimately restarts. Warn-colored so the
+            // span that explains the next new trace stands out. Display
+            // drops each type's trailing date revision to fit the panel;
+            // the attribute keeps the full type.
+            if let Some(types) = span
+                .raw_attributes
+                .get("reeve.context.edit_types")
+                .and_then(|v| v.as_str())
+            {
+                let display = types
+                    .split(',')
+                    .map(|t| match t.rsplit_once('_') {
+                        Some((base, rev))
+                            if rev.len() == 8 && rev.chars().all(|c| c.is_ascii_digit()) =>
+                        {
+                            base
+                        }
+                        _ => t,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(field_line(
+                    "compacted",
+                    &display,
+                    theme.health_warn(),
                     theme,
                 ));
             }
