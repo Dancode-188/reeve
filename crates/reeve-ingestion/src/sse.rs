@@ -24,6 +24,10 @@ pub struct SseAccumulator {
     pub model: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Reasoning tokens inside `output_tokens`, from
+    /// `output_tokens_details.thinking_tokens`. Zero when the response
+    /// carried none or the model does not report them.
+    pub thinking_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     pub content: String,
@@ -103,6 +107,13 @@ impl SseAccumulator {
                     if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
                         self.output_tokens = out;
                     }
+                    if let Some(thinking) = usage
+                        .get("output_tokens_details")
+                        .and_then(|d| d.get("thinking_tokens"))
+                        .and_then(|v| v.as_u64())
+                    {
+                        self.thinking_tokens = thinking;
+                    }
                 }
                 if let Some(reason) = data
                     .get("delta")
@@ -165,6 +176,19 @@ mod tests {
         let mut acc = SseAccumulator::default();
         let update = acc.feed(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n");
         assert!(update.api_failed);
+    }
+
+    #[test]
+    fn thinking_tokens_are_read_from_output_details() {
+        let mut acc = SseAccumulator::default();
+        // The exact usage shape live traffic carries in message_delta.
+        acc.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":131,\"output_tokens_details\":{\"thinking_tokens\":47}}}\n\n");
+        assert_eq!(acc.output_tokens, 131);
+        assert_eq!(acc.thinking_tokens, 47);
+        // A delta without the details block leaves the count alone
+        // rather than zeroing it.
+        acc.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":150}}\n\n");
+        assert_eq!(acc.thinking_tokens, 47);
     }
 
     #[test]

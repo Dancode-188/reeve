@@ -547,6 +547,12 @@ async fn finalize_stream_span(
             p.message_count as i64,
         ));
     }
+    if acc.thinking_tokens > 0 {
+        attributes.push(kv_int(
+            "gen_ai.usage.thinking_tokens",
+            acc.thinking_tokens as i64,
+        ));
+    }
     if acc.cache_read_tokens > 0 {
         attributes.push(kv_int(
             "gen_ai.usage.cache_read_tokens",
@@ -806,6 +812,11 @@ async fn synthesize_span(
     };
     let input_tokens = get_u64("input_tokens");
     let output_tokens = get_u64("output_tokens");
+    let thinking_tokens = usage
+        .and_then(|u| u.get("output_tokens_details"))
+        .and_then(|d| d.get("thinking_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let cache_read = get_u64("cache_read_input_tokens");
     let cache_creation = get_u64("cache_creation_input_tokens");
     let stop_reason = parsed
@@ -846,6 +857,12 @@ async fn synthesize_span(
         attributes.push(kv_int(
             "reeve.proxy.context_messages",
             p.message_count as i64,
+        ));
+    }
+    if thinking_tokens > 0 {
+        attributes.push(kv_int(
+            "gen_ai.usage.thinking_tokens",
+            thinking_tokens as i64,
         ));
     }
     if cache_read > 0 {
