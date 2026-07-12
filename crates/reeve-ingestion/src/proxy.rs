@@ -553,6 +553,7 @@ async fn finalize_stream_span(
             acc.thinking_tokens as i64,
         ));
     }
+    surface_compaction(state, agent_name, &acc.applied_edits, &mut attributes);
     if acc.cache_read_tokens > 0 {
         attributes.push(kv_int(
             "gen_ai.usage.cache_read_tokens",
@@ -865,6 +866,19 @@ async fn synthesize_span(
             thinking_tokens as i64,
         ));
     }
+    let applied_edits: Vec<String> = parsed
+        .get("context_management")
+        .and_then(|c| c.get("applied_edits"))
+        .and_then(|e| e.as_array())
+        .map(|edits| {
+            edits
+                .iter()
+                .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    surface_compaction(state, agent_name, &applied_edits, &mut attributes);
     if cache_read > 0 {
         attributes.push(kv_int("gen_ai.usage.cache_read_tokens", cache_read as i64));
     }
@@ -947,6 +961,40 @@ fn derive_agent_name(headers: &HeaderMap) -> String {
         .map(|token| token.split('/').next().unwrap_or(token).to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "proxy-agent".to_string())
+}
+
+/// Stamps applied context edits on the span and tells ALERTS. Compaction
+/// changes the conversation prefix underneath threading, so the next
+/// request legitimately starts a new trace; the notice is what keeps
+/// that from reading as a mystery. No-op when nothing was applied,
+/// which is every response seen on the wire so far.
+fn surface_compaction(
+    state: &ProxyState,
+    agent_name: &str,
+    applied_edits: &[String],
+    attributes: &mut Vec<KeyValue>,
+) {
+    if applied_edits.is_empty() {
+        return;
+    }
+    attributes.push(kv_int(
+        "reeve.context.applied_edits",
+        applied_edits.len() as i64,
+    ));
+    attributes.push(kv_str("reeve.context.edit_types", &applied_edits.join(",")));
+    // Display names drop the trailing date revision (clear_thinking_20251015
+    // reads as clear_thinking); the attribute keeps the full type.
+    let mut names: Vec<&str> = applied_edits
+        .iter()
+        .map(|t| match t.rsplit_once('_') {
+            Some((base, rev)) if rev.len() == 8 && rev.chars().all(|c| c.is_ascii_digit()) => base,
+            _ => t.as_str(),
+        })
+        .collect();
+    names.dedup();
+    let _ = state.signal_tx.send(IngestionEvent::PipelineWarning {
+        message: format!("{agent_name}: context compacted ({})", names.join(", ")),
+    });
 }
 
 fn kv_str(key: &str, value: &str) -> KeyValue {

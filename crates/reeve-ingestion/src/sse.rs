@@ -34,6 +34,9 @@ pub struct SseAccumulator {
     pub stop_reason: Option<String>,
     /// tool_use blocks the assistant opened: (id, name).
     pub tool_uses: Vec<(String, String)>,
+    /// Edit types the API applied from `context_management.applied_edits`,
+    /// e.g. "clear_thinking_20251015". Empty when no compaction happened.
+    pub applied_edits: Vec<String>,
 }
 
 impl SseAccumulator {
@@ -75,6 +78,13 @@ impl SseAccumulator {
                     self.input_tokens = get("input_tokens");
                     self.cache_read_tokens = get("cache_read_input_tokens");
                     self.cache_creation_tokens = get("cache_creation_input_tokens");
+                }
+                // Compaction applies to the request before generation, so
+                // the applied edits should ride the start event, but the
+                // delta arm also checks: the placement is beta surface, not
+                // settled convention.
+                if let Some(msg) = msg {
+                    self.collect_applied_edits(msg);
                 }
             }
             Some("content_block_start") => {
@@ -122,6 +132,7 @@ impl SseAccumulator {
                 {
                     self.stop_reason = Some(reason.to_string());
                 }
+                self.collect_applied_edits(&data);
             }
             Some("message_stop") => {
                 update.completed = true;
@@ -130,6 +141,24 @@ impl SseAccumulator {
                 update.api_failed = true;
             }
             _ => {}
+        }
+    }
+
+    /// Collects edit types out of a `context_management.applied_edits`
+    /// array on the given value, if one is there. Overwrites rather than
+    /// appends: the wire reports the full list, not deltas.
+    fn collect_applied_edits(&mut self, value: &serde_json::Value) {
+        if let Some(edits) = value
+            .get("context_management")
+            .and_then(|c| c.get("applied_edits"))
+            .and_then(|e| e.as_array())
+            .filter(|e| !e.is_empty())
+        {
+            self.applied_edits = edits
+                .iter()
+                .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
+                .map(str::to_string)
+                .collect();
         }
     }
 }
@@ -207,6 +236,24 @@ mod tests {
             acc.tool_uses,
             vec![("toolu_1".to_string(), "bash".to_string())]
         );
+    }
+
+    #[test]
+    fn applied_edits_are_collected_from_either_event() {
+        // On the start event, inside the message object.
+        let mut acc = SseAccumulator::default();
+        acc.feed(b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"context_management\":{\"applied_edits\":[{\"type\":\"clear_thinking_20251015\"}]}}}\n\n");
+        assert_eq!(acc.applied_edits, vec!["clear_thinking_20251015"]);
+
+        // On the delta event, at the top level.
+        let mut acc = SseAccumulator::default();
+        acc.feed(b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":5},\"context_management\":{\"applied_edits\":[{\"type\":\"clear_tool_uses_20250919\"}]}}\n\n");
+        assert_eq!(acc.applied_edits, vec!["clear_tool_uses_20250919"]);
+
+        // The empty array live traffic carries today stays empty.
+        let mut acc = SseAccumulator::default();
+        acc.feed(b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{},\"context_management\":{\"applied_edits\":[]}}\n\n");
+        assert!(acc.applied_edits.is_empty());
     }
 
     #[test]
