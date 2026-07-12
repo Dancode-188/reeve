@@ -35,6 +35,21 @@ not the trace being long.**
   score: below half, healthy; from half toward nine tenths, the score
   falls linearly to zero.
 
+**Addendum (2026-07-13): an action is the operation plus its input
+fingerprint.** Counting bare tool names made eight reads of eight
+different files the same evidence as eight identical reads of one
+file; a real session doing legitimate exploration scored 17 because
+of it. The proxy now hashes each tool's input in memory when
+threading closes the call and stamps only the fingerprint on the
+span, so tier 1 privacy holds: equal hashes say two calls did the
+same thing without saying what. Dominance counts (operation, hash)
+pairs where a fingerprint exists and falls back to the bare
+operation where none does, keeping the stricter behavior for spans
+that cannot carry one. A loop that varies a trivial argument each
+round evades the fingerprint; that is the same class of dilution
+already noted under what gets harder, and the same future work
+covers it.
+
 ## Consequences
 
 **What gets easier:**
