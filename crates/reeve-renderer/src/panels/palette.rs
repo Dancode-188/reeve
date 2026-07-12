@@ -40,7 +40,12 @@ pub fn render(
                     .fg(theme.get("blue"))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(buffer.to_string(), Style::default().fg(theme.text())),
+            Span::styled(
+                // Long commands keep their tail (and the cursor) in
+                // view; completions still match on the full buffer.
+                super::tail_view(buffer, (area.width as usize).saturating_sub(40)),
+                Style::default().fg(theme.text()),
+            ),
             Span::styled("\u{258C}", Style::default().fg(theme.text())),
         ];
         if let Some(hit) = matches.get(selected) {
