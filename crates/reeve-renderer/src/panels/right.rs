@@ -167,6 +167,12 @@ fn span_detail_height(state: &AppState) -> u16 {
             if span.attributes.get("gen_ai.usage.cost").is_some() {
                 h += 1;
             }
+            if span.raw_attributes.contains_key("reeve.proxy.ttft_ms") {
+                h += 1;
+            }
+            if span.raw_attributes.contains_key("reeve.proxy.overhead_ms") {
+                h += 1;
+            }
             h + 1 // divider
         }
     }
@@ -515,6 +521,34 @@ fn render_span_detail(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     "cost",
                     &format!("${:.4}", cost),
                     theme.get("teal"),
+                    theme,
+                ));
+            }
+
+            // Proxy-path measurements: time-to-first-token is the
+            // latency a developer feels, and the forwarding overhead is
+            // the zero-added-latency claim as a number.
+            if let Some(ttft) = span
+                .raw_attributes
+                .get("reeve.proxy.ttft_ms")
+                .and_then(|v| v.as_f64())
+            {
+                lines.push(field_line(
+                    "ttft",
+                    &format!("{:.0} ms", ttft),
+                    theme.subtext(),
+                    theme,
+                ));
+            }
+            if let Some(overhead) = span
+                .raw_attributes
+                .get("reeve.proxy.overhead_ms")
+                .and_then(|v| v.as_f64())
+            {
+                lines.push(field_line(
+                    "overhead",
+                    &format!("{:.2} ms", overhead),
+                    theme.subtext(),
                     theme,
                 ));
             }
