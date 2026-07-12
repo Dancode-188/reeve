@@ -58,6 +58,15 @@ path as human ones, a policy rule firing kill against a proxy agent
 engages the breaker with no extra wiring: a predicted-cost rule can stop
 a runaway session at the budget line with zero agent instrumentation.
 
+**Addendum (2026-07-12):** the breaker now clears two ways instead of
+one. Restart still clears it, and an operator Resume against a killed
+agent revives it: the breaker state is visible in the fleet as a
+`[killed]` marker, and the intervention overlay offers Revive where
+Kill stood. This extends the original decision rather than reversing
+it; what was rejected was persistence across restarts, not recovery.
+A guard that autonomous policy can fire must be visible and
+reversible, or operators will not trust it with a budget.
+
 ## Consequences
 
 **What gets easier:**

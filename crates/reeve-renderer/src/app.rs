@@ -513,6 +513,10 @@ pub struct AppState {
     /// offline marker until they reconnect. Proxy agents never appear
     /// here (no control channel).
     pub control_disconnected: HashSet<AgentId>,
+    /// Agents whose circuit breaker is engaged, mirrored from the
+    /// dispatcher each tick (same pattern as pause). Drives the
+    /// [killed] fleet marker and the overlay's Revive.
+    pub killed: HashSet<AgentId>,
     /// Desktop notifications opt-in, read from config at startup.
     pub notifications_enabled: bool,
     /// Last health score seen per agent, feeding the terminal-title
@@ -803,6 +807,7 @@ impl App {
                 filter_applied: None,
                 pending_theme: None,
                 control_disconnected: HashSet::new(),
+                killed: HashSet::new(),
                 notifications_enabled: false,
                 latest_agent_health: HashMap::new(),
                 sustained_alerts: HashMap::new(),
@@ -1783,6 +1788,15 @@ impl App {
                     // can be killed; anything else gets told up front rather
                     // than walked through a confirmation the SDK will refuse.
                     Action::VimUp if caps.contains(&"kill".to_string()) => {
+                        // An engaged breaker flips k to Revive: the one
+                        // recovery short of restarting Reeve. No confirm,
+                        // since revive is the safe direction.
+                        if self.state.killed.contains(&agent_id) {
+                            self.state.overlay = None;
+                            self.dispatch_command(agent_id, CommandType::Resume).await;
+                            self.state.toast("breaker cleared; agent may resume");
+                            return;
+                        }
                         // A proxy agent between requests shows idle, and the
                         // breaker's whole point is stopping the next request,
                         // so proxy agents are killable in any state.
@@ -1939,6 +1953,19 @@ impl App {
     /// state onto agent display status. The dispatcher is authoritative for
     /// pause because it processes the applied acks; ingestion events cannot
     /// carry pause state since a paused agent emits no spans.
+    /// Mirrors the dispatcher's breaker state into the fleet each tick,
+    /// so a kill from any source (operator or policy) becomes visible.
+    pub fn sync_killed_status(&mut self) {
+        let ids: Vec<AgentId> = self.state.agents.keys().cloned().collect();
+        for id in ids {
+            if self.dispatcher.is_killed(&id) {
+                self.state.killed.insert(id);
+            } else {
+                self.state.killed.remove(&id);
+            }
+        }
+    }
+
     pub fn sync_pause_status(&mut self) {
         use reeve_model::entity::agent::AgentStatus;
         for (agent_id, s) in self.state.agents.iter_mut() {

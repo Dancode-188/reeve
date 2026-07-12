@@ -187,6 +187,15 @@ fn render_agents(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                         .add_modifier(Modifier::DIM),
                 ),
             ]),
+            AgentStatus::Idle if state.killed.contains(agent_id) => Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("killed \u{00B7} ${:.3}", agent_state.display_cost()),
+                    Style::default()
+                        .fg(theme.health_crit())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
             AgentStatus::Idle => Line::from(vec![
                 Span::raw("  "),
                 Span::styled(

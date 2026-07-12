@@ -25,6 +25,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             ov,
             &caps,
             state.active_suggestion.as_ref(),
+            state.killed.contains(&ov.agent_id),
             theme,
         ),
         OverlayMode::TextInput { command, buffer } => {
@@ -40,6 +41,7 @@ fn render_menu(
     ov: &InterventionOverlayState,
     caps: &[String],
     suggestion: Option<&SuggestedIntervention>,
+    killed: bool,
     theme: &Theme,
 ) {
     let height = if suggestion.is_some() { 20 } else { 15 };
@@ -109,7 +111,13 @@ fn render_menu(
     lines.push(cmd_row("p", "Pause / Resume", "pause"));
     lines.push(cmd_row("r", "Redirect", "redirect"));
     lines.push(cmd_row("c", "Inject Context", "inject_context"));
-    lines.push(cmd_row("k", "Kill", "kill"));
+    // An engaged breaker flips the row: the operator sees the recovery,
+    // not a kill that already happened.
+    if killed {
+        lines.push(cmd_row("k", "Revive (clear the breaker)", "kill"));
+    } else {
+        lines.push(cmd_row("k", "Kill", "kill"));
+    }
     lines.push(Line::raw(""));
     for t in TEMPLATES {
         let style = if has("redirect") { active } else { dimmed };

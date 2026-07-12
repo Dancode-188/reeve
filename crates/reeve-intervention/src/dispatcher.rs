@@ -108,6 +108,15 @@ impl Dispatcher {
         self.paused.lock().unwrap().contains(agent_id)
     }
 
+    /// Whether the circuit breaker is engaged for this agent. The
+    /// renderer polls this to mark killed agents, the same way the
+    /// paused set drives the paused status.
+    pub fn is_killed(&self, agent_id: &AgentId) -> bool {
+        self.proxy_interventions
+            .as_ref()
+            .is_some_and(|q| q.lock().unwrap().killed.contains(agent_id))
+    }
+
     /// Route a command to the agent that owns the trace. Returns `true` if the
     /// command was sent on the wire. Returns `false` if the agent is not
     /// connected, the command is already past its `valid_until_ms`, or the
@@ -220,6 +229,18 @@ impl Dispatcher {
             }
             // Kill is the circuit breaker: engaged below, not queued.
             CommandType::Kill => None,
+            // Resume against an engaged breaker is the revive: the one
+            // recovery short of restarting Reeve. Anything else has no
+            // proxy meaning.
+            CommandType::Resume => {
+                let mut q = queue.lock().unwrap();
+                if q.killed.remove(agent_id) {
+                    q.applied
+                        .push((command.id.clone(), agent_id.clone(), current_ms()));
+                    return true;
+                }
+                return false;
+            }
             _ => return false,
         };
         let is_proxy_agent = matches!(
@@ -869,5 +890,43 @@ mod tests {
             q.pending.get(&agent_id).is_none_or(|p| p.is_empty()),
             "kill is a breaker, never a queued payload"
         );
+    }
+
+    #[tokio::test]
+    async fn resume_revives_a_killed_proxy_agent() {
+        // The one recovery short of restarting Reeve (#214): Resume
+        // against an engaged breaker clears it and reports applied.
+        let queue: reeve_model::entity::ProxyInterventions =
+            Arc::new(Mutex::new(Default::default()));
+        let (d, warm) = make_dispatcher_with_queue(Some(queue.clone()));
+
+        let agent_id = reeve_model::ids::agent_id_from_service("claude-cli", "proxy");
+        warm.upsert_agent(reeve_model::entity::Agent {
+            id: agent_id.clone(),
+            name: "claude-cli".to_string(),
+            framework: "proxy".to_string(),
+            integration: reeve_model::entity::IntegrationPath::Proxy,
+            status: reeve_model::entity::AgentStatus::Idle,
+            first_seen_at: 0,
+            last_seen_at: 0,
+        })
+        .await
+        .unwrap();
+        queue.lock().unwrap().killed.insert(agent_id.clone());
+        assert!(d.is_killed(&agent_id), "breaker visible through the query");
+
+        let revive = pending_command(CommandType::Resume);
+        assert!(d.dispatch(&agent_id, revive).await);
+        assert!(!d.is_killed(&agent_id), "the breaker is cleared");
+        assert_eq!(
+            queue.lock().unwrap().applied.len(),
+            1,
+            "revive reports applied immediately, like the kill it undoes"
+        );
+
+        // Resume against a proxy agent that is NOT killed has nothing to
+        // do and must not claim success.
+        let idle_resume = pending_command(CommandType::Resume);
+        assert!(!d.dispatch(&agent_id, idle_resume).await);
     }
 }
