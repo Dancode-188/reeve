@@ -40,6 +40,17 @@ no matter how long the model streams.
   reaches storage. Every flush path persists parent-pending spans;
   they carry a trace id, and the tree renders them as awaiting rows.
 
+**Addendum (2026-07-12):** the same doctrine gained a second kind of
+evidence. An open conversation turn, a `tool_use` still awaiting its
+`tool_result`, vouches for its trace across the gap BETWEEN round
+trips, when the client is running its tools and nothing is on the
+wire: a 20-minute real session fragmented on exactly this shape,
+because a build can take minutes with no request in flight. The
+exemption is bounded by conversation recency (five minutes without
+any request), so a client that died mid-turn still flushes. Liveness
+evidence now comes in two kinds: bytes flowing, and open protocol
+state with recent contact.
+
 ## Consequences
 
 **What gets easier:**
