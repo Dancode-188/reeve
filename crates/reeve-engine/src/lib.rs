@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod evaluation;
 pub mod outcome;
 pub mod policy;
@@ -13,9 +14,11 @@ use outcome::OutcomeTracker;
 use policy::dsl::PolicyContext;
 use policy::{PolicyEngine, alert_fields};
 use reeve_model::entity::evaluation::{EvaluationResult, EvaluatorType, TargetType};
-use reeve_model::entity::intervention::{AppliedCommand, InterventionCommand};
+use reeve_model::entity::intervention::{
+    AppliedCommand, CommandStatus, CommandType, InterventionCommand,
+};
 use reeve_model::entity::span::InternalSpan;
-use reeve_model::ids::{AgentId, EvalId, RuleId, TraceId};
+use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, TraceId};
 use reeve_model::signal::{EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::WarmStore;
 use std::collections::{HashMap, VecDeque};
@@ -72,6 +75,12 @@ pub async fn run(
     let mut trace_agents: HashMap<TraceId, AgentId> = HashMap::new();
     let mut policy_engine = PolicyEngine::with_defaults();
     let mut outcome_tracker = OutcomeTracker::default();
+    // Daily budgets: read once at startup like the rest of the config.
+    let budgets = policy::config::load_budgets(&config_path);
+    let mut budget_tracker = budget::BudgetTracker::default();
+    // Where each agent last sat against its cap, so only a crossing warns
+    // or kills rather than every tick.
+    let mut budget_states: HashMap<AgentId, budget::BudgetState> = HashMap::new();
 
     {
         let db_rules = warm.load_policy_rules().await.unwrap_or_else(|e| {
@@ -291,6 +300,26 @@ pub async fn run(
                     }
                 }
 
+                // Settle this trace's real cost against the agent's daily
+                // budget. The completion path folds in no prediction: the
+                // number is now known, so the check is exact.
+                if budgets.cap_for(agent_id.as_str()).is_some() {
+                    budget_tracker.add_spend(&agent_id, cost);
+                    enforce_budget(
+                        &budgets,
+                        &budget_tracker,
+                        &mut budget_states,
+                        &engine_tx,
+                        &dispatch_tx,
+                        &warm,
+                        &agent_id,
+                        &trace_id,
+                        0.0,
+                        current_ms(),
+                    )
+                    .await;
+                }
+
                 fingerprints.entry(agent_id.clone()).or_default().update(
                     span_count,
                     cost,
@@ -468,6 +497,26 @@ pub async fn run(
                     )
                     .await;
                 }
+
+                // Fold the predicted final cost of this in-flight trace into
+                // the budget check so a run that will blow the cap is stopped
+                // before it finishes spending. Settled spend does not yet
+                // include this trace, so `predicted` is the whole extra.
+                if budgets.cap_for(agent_id.as_str()).is_some() {
+                    enforce_budget(
+                        &budgets,
+                        &budget_tracker,
+                        &mut budget_states,
+                        &engine_tx,
+                        &dispatch_tx,
+                        &warm,
+                        &agent_id,
+                        &trace_id,
+                        predicted,
+                        now_ms,
+                    )
+                    .await;
+                }
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -519,6 +568,100 @@ async fn persist_cooldown(
         .await
     {
         tracing::warn!(rule_id = %rule_id, error = %e, "failed to persist cooldown");
+    }
+}
+
+/// Checks an agent's spend against its cap and acts on it: always emits a
+/// `BudgetUpdated` so the cockpit's bar tracks the ceiling, warns ALERTS once
+/// on entry into the warn band, and fires a kill the moment settled or
+/// predicted spend crosses the cap. `extra` folds a mid-trace prediction into
+/// the check so the stop lands before the money is gone; it is zero at
+/// completion, when spend is already settled. `last_states` remembers where
+/// each agent sat so only a transition speaks: a fresh alert every tick, or a
+/// re-fired kill against an already-engaged breaker, would be noise.
+#[allow(clippy::too_many_arguments)]
+async fn enforce_budget(
+    budgets: &policy::config::Budgets,
+    tracker: &budget::BudgetTracker,
+    last_states: &mut HashMap<AgentId, budget::BudgetState>,
+    engine_tx: &broadcast::Sender<EngineEvent>,
+    dispatch_tx: &Option<DispatchSender>,
+    warm: &WarmStore,
+    agent_id: &AgentId,
+    trace_id: &TraceId,
+    extra: f64,
+    now_ms: i64,
+) {
+    let Some(cap) = budgets.cap_for(agent_id.as_str()) else {
+        return;
+    };
+    let view = tracker.view(agent_id, cap, extra);
+    let over = view.state == budget::BudgetState::Over;
+    let _ = engine_tx.send(EngineEvent::BudgetUpdated {
+        agent_id: agent_id.clone(),
+        spent_today: view.spent_today,
+        cap: view.cap,
+        over,
+    });
+
+    let prev = last_states.insert(agent_id.clone(), view.state);
+    let projected = view.spent_today + extra.max(0.0);
+    let pct = (projected / cap * 100.0).round() as i64;
+
+    if view.state == budget::BudgetState::Warn
+        && !matches!(
+            prev,
+            Some(budget::BudgetState::Warn | budget::BudgetState::Over)
+        )
+    {
+        let _ = engine_tx.send(EngineEvent::PolicyAlert {
+            rule_id: "builtin_budget_warn".to_string(),
+            description: format!("budget: {agent_id} nearing its ${cap:.2} daily cap ({pct}%)"),
+            command_type: "warning".to_string(),
+            requires_confirmation: false,
+            auto_confirm_after_secs: None,
+            effectiveness: None,
+        });
+    }
+
+    if over && prev != Some(budget::BudgetState::Over) {
+        let _ = engine_tx.send(EngineEvent::PolicyAlert {
+            rule_id: "builtin_budget_kill".to_string(),
+            description: format!("budget: stopped {agent_id} at its ${cap:.2} daily cap"),
+            command_type: "kill".to_string(),
+            requires_confirmation: false,
+            auto_confirm_after_secs: None,
+            effectiveness: None,
+        });
+        let command = budget_kill_command(agent_id, trace_id, now_ms);
+        dispatch_or_save(
+            dispatch_tx,
+            warm,
+            agent_id,
+            command,
+            false,
+            "builtin_budget",
+        )
+        .await;
+    }
+}
+
+/// Builds the unconfirmed Kill a crossed budget dispatches through the same
+/// policy-to-dispatcher path a rule uses. Issued by "budget", not a policy id,
+/// so the audit trail names why it fired.
+fn budget_kill_command(agent_id: &AgentId, trace_id: &TraceId, now_ms: i64) -> InterventionCommand {
+    InterventionCommand {
+        id: CommandId::from(format!("budget:{agent_id}:{trace_id}").as_str()),
+        trace_id: trace_id.clone(),
+        span_id: None,
+        policy_id: None,
+        command_type: CommandType::Kill,
+        status: CommandStatus::Pending,
+        requires_confirmation: false,
+        issued_at: now_ms,
+        acknowledged_at: None,
+        issued_by: "budget".to_string(),
+        valid_until_ms: now_ms + 60_000,
     }
 }
 
@@ -691,6 +834,20 @@ mod tests {
 
     fn history(scores: &[f64]) -> VecDeque<f64> {
         scores.iter().copied().collect()
+    }
+
+    #[test]
+    fn budget_kill_is_an_unconfirmed_kill_attributed_to_the_budget() {
+        let cmd = budget_kill_command(&"claude-cli:proxy".into(), &"trace-1".into(), 1_000);
+        assert_eq!(cmd.command_type, CommandType::Kill);
+        // Unconfirmed so it dispatches straight through the breaker path, the
+        // way a policy kill with requires_confirmation false does.
+        assert!(!cmd.requires_confirmation);
+        assert_eq!(cmd.status, CommandStatus::Pending);
+        // No policy id: the audit trail names the budget, not a rule.
+        assert_eq!(cmd.policy_id, None);
+        assert_eq!(cmd.issued_by, "budget");
+        assert_eq!(cmd.valid_until_ms, 61_000);
     }
 
     #[test]

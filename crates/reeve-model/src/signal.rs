@@ -141,4 +141,14 @@ pub enum EngineEvent {
     AgentControlDisconnected {
         agent_id: AgentId,
     },
+    /// An agent's daily spend against its configured cap changed. The
+    /// renderer draws the COST budget bar from this; emitted only for
+    /// agents that have a cap. `over` means the budget stopped the agent
+    /// (or requested it, on the SDK path).
+    BudgetUpdated {
+        agent_id: AgentId,
+        spent_today: f64,
+        cap: f64,
+        over: bool,
+    },
 }
