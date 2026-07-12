@@ -46,6 +46,39 @@ struct ProxyState {
     /// the assembler so a trace mid-generation is never called idle. The
     /// count handles concurrent requests on one turn.
     active_streams: Option<crate::assemble::ActiveStreams>,
+    /// Traces whose turn is still open, with the conversation's last
+    /// request time: the between-round-trips exemption from the idle
+    /// timeout, held while the client runs its tools (#200).
+    open_turns: Option<crate::assemble::OpenTurns>,
+}
+
+fn trace_key(trace_id: &[u8]) -> reeve_model::ids::TraceId {
+    trace_id
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>()
+        .into()
+}
+
+/// Records that this trace's turn is open and its conversation just sent
+/// a request; every request refreshes the recency the assembler checks.
+fn mark_turn_open(state: &ProxyState, trace_id: &[u8]) {
+    if let Some(ref turns) = state.open_turns {
+        turns
+            .lock()
+            .expect("open turns mutex poisoned")
+            .insert(trace_key(trace_id), std::time::Instant::now());
+    }
+}
+
+/// The turn closed: its exemption ends with it.
+fn mark_turn_closed(state: &ProxyState, trace_id: &[u8]) {
+    if let Some(ref turns) = state.open_turns {
+        turns
+            .lock()
+            .expect("open turns mutex poisoned")
+            .remove(&trace_key(trace_id));
+    }
 }
 
 /// Marks a trace's round trip in flight for the assembler's idle check.
@@ -55,11 +88,7 @@ fn mark_stream(state: &ProxyState, trace_id: &[u8], delta: i64) {
     let Some(ref streams) = state.active_streams else {
         return;
     };
-    let key: reeve_model::ids::TraceId = trace_id
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>()
-        .into();
+    let key = trace_key(trace_id);
     let mut map = streams.lock().expect("active streams mutex poisoned");
     let count = map.entry(key.clone()).or_insert(0);
     if delta > 0 {
@@ -78,6 +107,7 @@ pub async fn run(
     signal_tx: broadcast::Sender<IngestionEvent>,
     interventions: ProxyInterventions,
     active_streams: crate::assemble::ActiveStreams,
+    open_turns: crate::assemble::OpenTurns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let upstream =
         std::env::var("REEVE_PROXY_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
@@ -90,6 +120,7 @@ pub async fn run(
         signal_tx,
         Some(interventions),
         Some(active_streams),
+        Some(open_turns),
     )
     .await
 }
@@ -104,6 +135,7 @@ pub async fn run_with(
     signal_tx: broadcast::Sender<IngestionEvent>,
     interventions: Option<ProxyInterventions>,
     active_streams: Option<crate::assemble::ActiveStreams>,
+    open_turns: Option<crate::assemble::OpenTurns>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = Arc::new(ProxyState {
         client: reqwest::Client::new(),
@@ -115,6 +147,7 @@ pub async fn run_with(
         tracker: std::sync::Mutex::new(ConversationTracker::default()),
         interventions,
         active_streams,
+        open_turns,
     });
 
     let app = axum::Router::new()
@@ -194,6 +227,9 @@ async fn forward(
         None
     };
     if let Some(ref placement) = placement {
+        // The turn is open and its conversation just spoke: hold the
+        // idle timeout across the client-side tool gap that follows.
+        mark_turn_open(&state, &placement.trace_id);
         for tool in &placement.tools {
             emit_tool_span(&state, &agent_name, placement, tool).await;
         }
@@ -721,6 +757,9 @@ async fn emit_tool_span(
 /// assembler the trace is complete, emitted only when the turn ends,
 /// exactly as SDK agents emit their task root last.
 async fn emit_turn_root(state: &ProxyState, agent_name: &str, root: TurnRoot) {
+    // The root only exists because the turn closed: the between-round-
+    // trips exemption ends here, on both proxy paths.
+    mark_turn_closed(state, &root.trace_id);
     let span = OtlpSpan {
         trace_id: root.trace_id,
         span_id: root.span_id,
@@ -1017,6 +1056,7 @@ mod tests {
             signal_tx,
             Some(interventions.clone()),
             None,
+            None,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         (format!("http://{}", proxy_addr), rx, interventions)
@@ -1125,6 +1165,7 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             signal_tx,
             None,
             None,
+            None,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         (format!("http://{}", proxy_addr), rx, signal_rx)
@@ -1230,6 +1271,7 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             signal_tx,
             None,
             None,
+            None,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -1248,6 +1290,96 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             Some(any_value::Value::StringValue(m)) => assert_eq!(m, "claude-opus-4-8"),
             other => panic!("a readable response must price the span: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn placement_opens_the_turn_and_the_root_closes_it() {
+        // The #200 wiring: every placed request marks its turn open in
+        // the shared map (holding the idle timeout across client-side
+        // tool gaps), and the turn root retires the mark.
+        const TOOL_USE_BODY: &str = r#"{
+            "id": "msg_t", "model": "claude-opus-4-8",
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "t1", "name": "bash",
+                         "input": {}}],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#;
+        let upstream_app = axum::Router::new().route(
+            "/v1/messages",
+            post(move |body: axum::body::Bytes| async move {
+                let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let n = req["messages"].as_array().unwrap().len();
+                let payload = if n == 1 { TOOL_USE_BODY } else { OK_BODY };
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .unwrap()
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let (signal_tx, _) = broadcast::channel(64);
+        let open_turns: crate::assemble::OpenTurns =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+        tokio::spawn(run_with(
+            proxy_addr,
+            format!("http://{}", upstream_addr),
+            None,
+            std::time::Duration::from_millis(500),
+            tx,
+            signal_tx,
+            None,
+            None,
+            Some(open_turns.clone()),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"go"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        let _first_chat = rx.recv().await.expect("first chat span");
+        assert_eq!(
+            open_turns.lock().unwrap().len(),
+            1,
+            "a tool_use response leaves the turn open and marked"
+        );
+
+        client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(
+                r#"{"model":"claude-opus-4-8","messages":[
+                    {"role":"user","content":"go"},
+                    {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"bash","input":{}}]},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}
+                ]}"#,
+            )
+            .send()
+            .await
+            .unwrap();
+        // tool span, second chat, then the turn root.
+        let _tool = rx.recv().await.expect("tool span");
+        let _chat = rx.recv().await.expect("second chat");
+        let root = rx.recv().await.expect("turn root");
+        assert!(root.span.name.starts_with("agent.turn"));
+        assert!(
+            open_turns.lock().unwrap().is_empty(),
+            "the root retires the open-turn mark"
+        );
     }
 
     #[tokio::test]

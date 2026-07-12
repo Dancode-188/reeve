@@ -28,6 +28,20 @@ pub type DisconnectedAgents = Arc<Mutex<std::collections::HashMap<AgentId, Insta
 /// takes. Same shared-map pattern as the paused set.
 pub type ActiveStreams = Arc<Mutex<std::collections::HashMap<TraceId, usize>>>;
 
+/// Traces whose conversation turn is still open (a tool_use awaits its
+/// tool_result), with the moment the conversation last sent a request.
+/// The gap BETWEEN round trips is when the client runs its tools; a
+/// build can take minutes with no request in flight, and that silence
+/// is expected continuation, not death. Written by the proxy, read by
+/// the assembler's tick.
+pub type OpenTurns = Arc<Mutex<std::collections::HashMap<TraceId, Instant>>>;
+
+/// How long an open turn holds the idle timeout after its conversation
+/// last sent a request. A client that died mid-turn stops sending, so
+/// its trace flushes one idle window after this bound instead of
+/// lingering forever.
+const OPEN_TURN_RECENCY: Duration = Duration::from_secs(5 * 60);
+
 /// How long a disconnected agent's traces survive before flushing as
 /// Interrupted and resumable. Generous relative to the idle timeout
 /// because a dropped connection is diagnosable, unlike plain silence.
@@ -202,6 +216,7 @@ pub struct Assembler {
     paused: PausedAgents,
     disconnected: DisconnectedAgents,
     active_streams: ActiveStreams,
+    open_turns: OpenTurns,
     ceiling_bytes: usize,
 }
 
@@ -210,12 +225,14 @@ impl Assembler {
         paused: PausedAgents,
         disconnected: DisconnectedAgents,
         active_streams: ActiveStreams,
+        open_turns: OpenTurns,
     ) -> Self {
         Self {
             traces: HashMap::new(),
             paused,
             disconnected,
             active_streams,
+            open_turns,
             ceiling_bytes: IN_FLIGHT_CEILING_BYTES,
         }
     }
@@ -310,6 +327,26 @@ impl Assembler {
             }
         }
 
+        // An open turn between round trips is the client running its
+        // tools: a build can take minutes with no request in flight, and
+        // that silence is expected continuation. Hold the idle timeout
+        // while the turn is open and the conversation was seen recently;
+        // a client that died mid-turn stops sending, its recency lapses,
+        // and the plain timeout resumes (#200).
+        {
+            let open = self.open_turns.lock().unwrap();
+            if !open.is_empty() {
+                for trace in self.traces.values_mut() {
+                    if open
+                        .get(&trace.trace_id)
+                        .is_some_and(|seen| seen.elapsed() < OPEN_TURN_RECENCY)
+                    {
+                        trace.last_updated = Instant::now();
+                    }
+                }
+            }
+        }
+
         // A dropped connection is not silence: while the grace period
         // runs, the idle timeout is held off (same mechanism as pause);
         // when it expires, the flush below picks the trace up as
@@ -369,6 +406,7 @@ impl Default for Assembler {
             Arc::new(Mutex::new(HashSet::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         )
     }
 }
@@ -380,8 +418,9 @@ pub async fn run(
     paused: PausedAgents,
     disconnected: DisconnectedAgents,
     active_streams: ActiveStreams,
+    open_turns: OpenTurns,
 ) {
-    let mut assembler = Assembler::new(paused, disconnected, active_streams);
+    let mut assembler = Assembler::new(paused, disconnected, active_streams, open_turns);
     let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
 
     loop {
@@ -617,6 +656,47 @@ mod tests {
     }
 
     #[test]
+    fn an_open_turn_survives_the_idle_timeout_until_recency_lapses() {
+        // The #200 shape: a build runs client-side for minutes, so no
+        // request is in flight and no span arrives, but the turn is
+        // open (a tool_use awaits its result). Recently-seen open turns
+        // hold the timeout; a conversation that stops sending entirely
+        // (client died mid-turn) lapses and flushes.
+        let open: OpenTurns = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        open.lock()
+            .unwrap()
+            .insert("trace-1".into(), Instant::now());
+
+        let mut assembler = Assembler::new(
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+            open.clone(),
+        );
+        assembler.receive(
+            make_span("chat-1", "trace-1", Some("unarrived-root")),
+            vec![],
+            make_agent(),
+        );
+        make_idle(&mut assembler, "trace-1");
+        assert!(
+            assembler.tick().is_empty(),
+            "an open turn with a recent request is alive, however long the tool runs"
+        );
+
+        // The client died mid-turn: no request ever comes again, so the
+        // recency bound lapses and the plain timeout resumes.
+        open.lock().unwrap().insert(
+            "trace-1".into(),
+            Instant::now() - OPEN_TURN_RECENCY - Duration::from_secs(1),
+        );
+        make_idle(&mut assembler, "trace-1");
+        let finalized = assembler.tick();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].1, CompletionState::Interrupted);
+    }
+
+    #[test]
     fn actively_streaming_trace_survives_idle_timeout() {
         // A model can stream a single response for minutes while the
         // trace's spans only arrive at stream end: the proxy marks the
@@ -629,6 +709,7 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             active.clone(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
         assembler.receive(
             make_span("chat-1", "trace-1", Some("unarrived-root")),
@@ -659,6 +740,7 @@ mod tests {
             paused,
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
         assembler.receive(
             make_span("child-1", "trace-1", Some("never-arrives")),
@@ -680,6 +762,7 @@ mod tests {
 
         let mut assembler = Assembler::new(
             paused.clone(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
@@ -717,6 +800,7 @@ mod tests {
             paused,
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
         assembler.receive(make_span("root-1", "trace-1", None), vec![], make_agent());
 
@@ -740,6 +824,7 @@ mod tests {
         let mut assembler = Assembler::new(
             Arc::new(Mutex::new(HashSet::new())),
             disconnected.clone(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
         assembler.receive(
@@ -771,6 +856,7 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             disconnected.clone(),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
         assembler.receive(
             make_span("child", "t1", Some("missing")),
@@ -798,6 +884,7 @@ mod tests {
         let mut assembler = Assembler::new(
             Arc::new(Mutex::new(HashSet::new())),
             disconnected.clone(),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
         assembler.receive(
@@ -829,6 +916,7 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             disconnected.clone(),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
         // Root arrived: the straggler window governs, not the grace.
         assembler.receive(make_span("root", "t1", None), vec![], make_agent());
@@ -852,6 +940,7 @@ mod tests {
     fn ceiling_evicts_the_stalest_trace_first() {
         let mut assembler = Assembler::new(
             Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
@@ -881,6 +970,7 @@ mod tests {
     fn a_single_oversized_trace_is_never_self_evicted() {
         let mut assembler = Assembler::new(
             Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashMap::new())),
         );
