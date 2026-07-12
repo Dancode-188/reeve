@@ -152,7 +152,7 @@ fn render_agents(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                     .filter(|_| is_selected)
                     .map(|s| format!("{}", s.round() as u32))
                     .unwrap_or_else(|| "--".to_string());
-                let cost_str = format!("${:.3}", agent_state.total_cost);
+                let cost_str = format!("${:.3}", agent_state.display_cost());
                 let health_color = state
                     .health_score
                     .filter(|_| is_selected)
@@ -190,7 +190,7 @@ fn render_agents(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             AgentStatus::Idle => Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
-                    format!("idle \u{00B7} ${:.3}", agent_state.total_cost),
+                    format!("idle \u{00B7} ${:.3}", agent_state.display_cost()),
                     Style::default()
                         .fg(theme.subtext())
                         .add_modifier(Modifier::DIM),
@@ -355,7 +355,7 @@ fn render_cost(
         .and_then(|i| state.agents.get_index(i))
         .map(|(_, s)| s);
 
-    let total_cost = selected_agent.map(|s| s.total_cost).unwrap_or(0.0);
+    let total_cost = selected_agent.map(|s| s.display_cost()).unwrap_or(0.0);
     let cost_trend = selected_agent.and_then(|s| s.cost_trend);
 
     // Layout: label(1) + total(1) + sparkline(1) + divider(1) = 4 rows minimum

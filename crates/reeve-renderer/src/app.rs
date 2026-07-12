@@ -61,6 +61,14 @@ pub struct AgentState {
 }
 
 impl AgentState {
+    /// The one number every cost display shows: settled cost plus the
+    /// live in-flight estimate. Two renderings of the same agent's cost
+    /// disagreeing mid-generation reads as a bug, whatever the
+    /// internals say, so nothing renders `total_cost` directly.
+    pub fn display_cost(&self) -> f64 {
+        self.total_cost + self.live_cost
+    }
+
     fn new(agent: Agent) -> Self {
         Self {
             agent,
