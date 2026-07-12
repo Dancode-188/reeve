@@ -45,6 +45,11 @@ pub struct ToolCall {
     pub is_error: bool,
     /// Parent chat span: the one whose response requested the tool.
     pub parent_span_id: Vec<u8>,
+    /// Hash of the tool's input from the replayed `tool_use` block,
+    /// computed in memory so the input itself is never stored. Loop
+    /// detection uses it to tell "same tool, different work" from
+    /// "same call repeated". None when the block was not found.
+    pub input_hash: Option<String>,
 }
 
 /// What the tracker decided about an incoming request.
@@ -286,10 +291,38 @@ fn close_tools(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
                 parent_span_id: turn.last_chat_span.clone(),
+                input_hash: tool_input_hash(messages, id),
             });
         }
     }
     tools
+}
+
+/// Finds the `tool_use` block matching this id in the replayed history
+/// and hashes its `input` value. The hash never leaves memory as
+/// anything but a fingerprint, so tier 1 privacy holds: two spans with
+/// equal hashes did the same thing, and nothing says what that was.
+/// serde_json's Display is deterministic for a given value (map order
+/// preserved from the wire), and the comparison is within one turn's
+/// replayed history, where the client resends the block verbatim.
+fn tool_input_hash(messages: &[serde_json::Value], tool_use_id: &str) -> Option<String> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    for msg in messages {
+        let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                && block.get("id").and_then(|v| v.as_str()) == Some(tool_use_id)
+            {
+                let input = block.get("input")?;
+                let mut hasher = DefaultHasher::new();
+                input.to_string().hash(&mut hasher);
+                return Some(format!("{:016x}", hasher.finish()));
+            }
+        }
+    }
+    None
 }
 
 /// Per-message fingerprint. DefaultHasher is deterministic within a
@@ -391,6 +424,52 @@ mod tests {
         let root = root.expect("end_turn closes the turn");
         assert_eq!(root.trace_id, p1.trace_id);
         assert_eq!(root.name, "agent.turn.1");
+    }
+
+    #[test]
+    fn closed_tools_carry_the_input_fingerprint() {
+        let mut t = ConversationTracker::default();
+        let now = SystemTime::now();
+        let p1 = t.place_request("cli", &[msg("user", "read both files")], now, ids);
+        t.record_response(
+            "cli",
+            &p1.trace_id,
+            ResponseInfo {
+                chat_span_id: vec![1; 8],
+                tool_uses: vec![
+                    ("toolu_1".into(), "Read".into()),
+                    ("toolu_2".into(), "Read".into()),
+                ],
+                stop_reason: Some("tool_use".into()),
+                ended_at: now,
+            },
+        );
+        // The replayed history carries the tool_use blocks verbatim,
+        // inputs included; the results close both calls.
+        let m2 = vec![
+            msg("user", "read both files"),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Read",
+                 "input": {"path": "a.rs"}},
+                {"type": "tool_use", "id": "toolu_2", "name": "Read",
+                 "input": {"path": "b.rs"}},
+            ]}),
+            tool_result("toolu_1", false),
+            tool_result("toolu_2", false),
+        ];
+        let p2 = t.place_request("cli", &m2, now, ids);
+        assert_eq!(p2.tools.len(), 2);
+        let h1 = p2.tools[0].input_hash.as_ref().expect("hash present");
+        let h2 = p2.tools[1].input_hash.as_ref().expect("hash present");
+        assert_ne!(h1, h2, "different inputs, different fingerprints");
+
+        // The same input hashes the same: what a genuine loop looks like.
+        assert_eq!(
+            tool_input_hash(&m2, "toolu_1"),
+            tool_input_hash(&m2, "toolu_1")
+        );
+        // A block that never appears yields no hash, not a fake one.
+        assert_eq!(tool_input_hash(&m2, "toolu_missing"), None);
     }
 
     #[test]

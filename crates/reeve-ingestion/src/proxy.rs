@@ -737,6 +737,18 @@ async fn emit_tool_span(
     placement: &TurnPlacement,
     tool: &ToolCall,
 ) {
+    let mut attributes = vec![
+        kv_str("gen_ai.system", "anthropic"),
+        kv_str("gen_ai.operation.name", "execute_tool"),
+        // The clean tool name, so the judge scores [bash, read]
+        // rather than raw operation names.
+        kv_str("gen_ai.tool.name", &tool.name),
+    ];
+    // The input's fingerprint, never the input: loop detection compares
+    // hashes to tell repeated work from repeated calls.
+    if let Some(ref hash) = tool.input_hash {
+        attributes.push(kv_str("reeve.tool.input_hash", hash));
+    }
     let span = OtlpSpan {
         trace_id: placement.trace_id.clone(),
         span_id: random_bytes(8),
@@ -744,13 +756,7 @@ async fn emit_tool_span(
         name: format!("gen_ai.tool:{}", tool.name),
         start_time_unix_nano: to_nanos(tool.started_at),
         end_time_unix_nano: to_nanos(tool.ended_at),
-        attributes: vec![
-            kv_str("gen_ai.system", "anthropic"),
-            kv_str("gen_ai.operation.name", "execute_tool"),
-            // The clean tool name, so the judge scores [bash, read]
-            // rather than raw operation names.
-            kv_str("gen_ai.tool.name", &tool.name),
-        ],
+        attributes,
         status: Some(OtlpStatus {
             code: if tool.is_error { 2 } else { 1 },
             message: String::new(),

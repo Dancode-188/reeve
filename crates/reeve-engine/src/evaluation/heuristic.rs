@@ -30,15 +30,27 @@ impl Evaluator for LoopDetector {
     /// among the remaining actions, the threshold is the minimum
     /// evidence before dominance is judged, and the score falls as one
     /// action's share climbs past half of everything the agent did.
+    ///
+    /// An action is the operation PLUS its input fingerprint when the
+    /// span carries one: eight reads of eight files are eight different
+    /// actions (exploration), eight reads of one file are one action
+    /// repeated (a loop). A real session scored 17 on legitimate
+    /// exploration before inputs were counted. Spans without a hash
+    /// fall back to the bare operation, which keeps the old (stricter)
+    /// behavior for SDK spans rather than exempting them.
     fn evaluate(&self, ctx: &TraceContext<'_>) -> Option<f64> {
-        let mut counts: HashMap<&str, usize> = HashMap::new();
+        let mut counts: HashMap<(&str, Option<&str>), usize> = HashMap::new();
         let mut total = 0usize;
         for span in ctx.spans {
             let op = span.operation.as_str();
             if op == "gen_ai.chat" || op.starts_with("agent.turn") {
                 continue;
             }
-            *counts.entry(op).or_insert(0) += 1;
+            let input_hash = span
+                .raw_attributes
+                .get("reeve.tool.input_hash")
+                .and_then(|v| v.as_str());
+            *counts.entry((op, input_hash)).or_insert(0) += 1;
             total += 1;
         }
         let max = counts.values().copied().max().unwrap_or(0);
@@ -247,6 +259,45 @@ mod tests {
             .evaluate(&ctx(&spans, 0.5, None))
             .unwrap();
         assert!(score < 0.2, "one tool at 95% share is a loop: {score}");
+    }
+
+    fn make_tool_span(op: &str, input_hash: &str, start: i64) -> InternalSpan {
+        let mut span = make_span(op, start, start + 1);
+        span.raw_attributes.insert(
+            "reeve.tool.input_hash".to_string(),
+            serde_json::json!(input_hash),
+        );
+        span
+    }
+
+    #[test]
+    fn loop_detector_diverse_inputs_are_exploration_not_a_loop() {
+        // The health-17 false positive: one tool repeated, every input
+        // different. Eight reads of eight files is work.
+        let mut spans: Vec<InternalSpan> = Vec::new();
+        for i in 0..8 {
+            spans.push(make_tool_span("gen_ai.tool:Read", &format!("hash{i}"), i));
+        }
+        spans.push(make_span("gen_ai.chat", 100, 101));
+        let score = LoopDetector::new(3)
+            .evaluate(&ctx(&spans, 0.1, None))
+            .unwrap();
+        assert_eq!(score, 1.0, "diverse inputs are exploration: {score}");
+    }
+
+    #[test]
+    fn loop_detector_same_input_repeated_is_still_a_loop() {
+        // The same call verbatim, over and over: the hash agrees on
+        // every span, so dominance judges it exactly as before.
+        let mut spans: Vec<InternalSpan> = Vec::new();
+        for i in 0..8 {
+            spans.push(make_tool_span("gen_ai.tool:Read", "samehash", i));
+        }
+        spans.push(make_span("gen_ai.chat", 100, 101));
+        let score = LoopDetector::new(3)
+            .evaluate(&ctx(&spans, 0.1, None))
+            .unwrap();
+        assert!(score < 0.2, "one call repeated verbatim is a loop: {score}");
     }
 
     #[test]
