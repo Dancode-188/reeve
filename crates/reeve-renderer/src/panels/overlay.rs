@@ -154,25 +154,37 @@ fn render_text_input(
     buffer: &str,
     theme: &Theme,
 ) {
-    let popup = centered(54, 10, area);
-
     let label = match command {
         OverlayCommand::Redirect => "Redirect instruction:",
         OverlayCommand::InjectContext => "Context to inject:",
         _ => "Input:",
     };
 
+    // The buffer wraps to the popup width and the popup grows with it:
+    // the operator must see everything they are about to send. Inner
+    // width is 54 minus borders and the two-space indent.
     let prompt = format!("> {buffer}_");
+    let inner = 54usize - 2 - 2;
+    let prompt_rows: Vec<String> = {
+        let chars: Vec<char> = prompt.chars().collect();
+        chars.chunks(inner).map(|c| c.iter().collect()).collect()
+    };
+    let popup = centered(54, 10 + prompt_rows.len().saturating_sub(1) as u16, area);
+
     let hint = Style::default().fg(theme.subtext());
     let text_style = Style::default().fg(theme.text());
 
-    let lines = vec![
+    let mut lines = vec![
         Line::raw(""),
         Line::from(vec![Span::raw("  "), Span::styled(label, text_style)]),
-        Line::from(vec![
+    ];
+    for row in &prompt_rows {
+        lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(&prompt, Style::default().fg(theme.highlight())),
-        ]),
+            Span::styled(row.clone(), Style::default().fg(theme.highlight())),
+        ]));
+    }
+    let mut rest = vec![
         Line::raw(""),
         Line::from(vec![
             Span::raw("  "),
@@ -184,6 +196,7 @@ fn render_text_input(
         ]),
         Line::raw(""),
     ];
+    lines.append(&mut rest);
 
     let title = format!(" INTERVENE: {} ", ov.agent_id);
     let block = Block::default()

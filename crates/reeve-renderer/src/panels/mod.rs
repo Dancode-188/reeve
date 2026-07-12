@@ -111,3 +111,29 @@ pub fn render_confirmation_modal(frame: &mut Frame, area: Rect, state: &AppState
         confirm::render(frame, area, pc, theme);
     }
 }
+
+/// Shows the tail of a one-line input buffer when it outgrows its bar:
+/// the cursor and the newest characters stay visible, with a leading
+/// ellipsis marking the cut, like any terminal input.
+pub fn tail_view(buffer: &str, max: usize) -> String {
+    let len = buffer.chars().count();
+    if len <= max {
+        return buffer.to_string();
+    }
+    let tail: String = buffer.chars().skip(len - max.saturating_sub(1)).collect();
+    format!("\u{2026}{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail_view;
+
+    #[test]
+    fn tail_view_keeps_short_buffers_and_tails_long_ones() {
+        assert_eq!(tail_view("short", 10), "short");
+        let long = "abcdefghijklmnop";
+        let shown = tail_view(long, 8);
+        assert_eq!(shown, "\u{2026}jklmnop", "ellipsis plus the newest seven");
+        assert_eq!(shown.chars().count(), 8);
+    }
+}

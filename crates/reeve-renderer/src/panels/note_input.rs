@@ -21,7 +21,12 @@ pub fn render(frame: &mut Frame, area: Rect, buffer: &str, theme: &Theme) {
                 .fg(theme.get("blue"))
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(buffer.to_string(), Style::default().fg(theme.text())),
+        Span::styled(
+            // Reserve room for the label, cursor, and hint so the tail
+            // of a long note stays visible.
+            super::tail_view(buffer, (area.width as usize).saturating_sub(38)),
+            Style::default().fg(theme.text()),
+        ),
         Span::styled("\u{258C}", Style::default().fg(theme.text())),
         Span::styled(
             "  [Enter] save  [Esc] cancel",
