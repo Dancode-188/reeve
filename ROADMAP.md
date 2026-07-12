@@ -76,6 +76,33 @@ write a single line of integration code.
 
 ---
 
+## v0.6.0: Guarded
+
+The proxy stops being just a window. Reeve sits in the one place that
+sees every token an agent sends and every dollar it spends, so it can
+guard as well as watch.
+
+Outbound secret scanning catches an agent about to send an API key or a
+`.env` file to the model, warning first and blocking by policy when told
+to. Per-agent budgets wire the cost predictor to the circuit breaker: an
+agent that would blow through its cap gets stopped at the line, with no
+instrumentation and nothing to install. Killed agents become visible and
+revivable in the cockpit instead of silently idle, because a guard you
+cannot see or undo is not a guard.
+
+The signals get more honest too: thinking-token spend surfaces (adaptive
+thinking made it everyone's invisible tax), context compaction shows up
+as an event instead of a mysterious fresh trace, and loop detection
+learns the difference between reading eight files and reading one file
+eight times. Under it all, a regression corpus of recorded real traffic,
+because every bug this project has ever shipped was caught by reality
+and none by a polite mock.
+
+**What this proves:** the cheapest seat in the room, a local proxy, is
+enough to protect an agent fleet, not just observe it.
+
+---
+
 ## v1.0.0: Production
 
 All adapters. Full docs. Stable APIs. `cargo install reeve` actually works.
