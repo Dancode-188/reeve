@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-12
+
+### Added
+
+- HTTP proxy input path on port 4318: point `ANTHROPIC_BASE_URL` at Reeve
+  and an uninstrumented tool appears in the cockpit. Requests forward to
+  the real API (`REEVE_PROXY_UPSTREAM` to override); spans are synthesized
+  from the traffic with token counts, model, and estimated cost. Agent
+  identity derives from the User-Agent product token, `REEVE_PROXY_AGENT_NAME`
+  to override (ADR-0036). API keys pass through in memory only, never
+  logged or persisted, pinned by a test.
+- SSE streaming through the proxy: each chunk forwards to the client before
+  it is parsed, so the proxy adds no observable latency. Three stream
+  failure modes (client disconnect, upstream error, chunk timeout) all
+  finalize the span honestly, with time-to-first-token and measured proxy
+  overhead recorded as span attributes. The streaming box now renders live
+  generations token by token.
+- Trace trees reconstructed from traffic alone (ADR-0037): agentic clients
+  resend the conversation each call, so consecutive requests thread into
+  turns, one turn per trace, and `tool_use`/`tool_result` pairs across the
+  request-response seam become child tool spans with real durations.
+  Claude Code's task structure, server-side web searches included, renders
+  with zero instrumentation.
+- Interventions on the proxy path: redirect and inject context apply by
+  modifying the agent's next request (ADR-0038), audited as queued and
+  applied through the same ack handling as SDK commands. Kill is a circuit
+  breaker: the proxy refuses to forward a killed agent's Messages requests,
+  making kill stronger on this path than the SDK's cooperative version
+  (ADR-0039). Proxy agents show `[proxy]` in the fleet with their honest
+  capability set; pause is deliberately absent.
+- Connection lifecycle: a dropped SDK control stream starts a 60-second
+  grace period, expiry flushes the trace as interrupted and resumable, and
+  a restart reloads resumable traces from the last five minutes so a
+  returning agent continues where it left off. Offline agents show
+  `[offline]` in the fleet.
+- Live trace view: the panel renders an open turn as it grows, chats and
+  tool spans appearing the moment they enter the pipeline, with selection,
+  span detail, and a `TRACE · live` title, then hands off to the scored
+  tree when the turn completes.
+- Cache-efficiency gauge in the Cost view: prompt-cache hit rate and net
+  dollars saved, computed from cache read and write tokens per span. The
+  header cost ticks during generation from a running estimate that the
+  final span cost corrects.
+- In-flight memory ceiling (50 MB) with staleness-based eviction, and an
+  ALERTS warning when an agent's exporter batches spans seconds behind
+  reality.
+
+### Changed
+
+- Loop detection judges dominance, not volume (ADR-0040): carrier spans
+  are excluded and the score falls as one action's share of the trace
+  climbs, so a long healthy turn scores healthy and a hammered single tool
+  still scores critical.
+- Trace liveness means no evidence of life, not no spans (ADR-0041): an
+  actively streaming response and an open conversation turn both hold the
+  idle timeout, bounded by conversation recency, so a 20-minute turn full
+  of long builds survives as one trace.
+- Policy suggestions check the target agent's capabilities before offering
+  confirmation; a suggestion the agent cannot apply offers the intervention
+  overlay instead of dispatching a dead letter.
+- History `Enter` loads the selected trace's detail into the right panel,
+  as the footer always promised.
+
+### Fixed
+
+- The proxy strips `accept-encoding` so the upstream answers in plain text
+  the span parser can read; compressed responses previously produced spans
+  with no model, tokens, or cost.
+- Conversation threading survives prompt-cache markers moving between
+  requests, and responses are attributed to the exact turn that requested
+  them, so concurrent side calls cannot cross-wire or close each other's
+  turns.
+- Spans pending their parent are persisted on every flush path; an
+  interrupted turn keeps all of its spans and its real start time.
+- Agent-level displays survive concurrent conversations: side-call stubs
+  no longer steal the trace panel or flap the agent status, every cost
+  display shows the same number, and the streaming box belongs to the
+  oldest active stream instead of the last writer.
+- The streaming box wraps long generations; the in-flight span note and
+  all text inputs wrap or keep their tails visible instead of clipping.
+
+
 ## [0.4.0] - 2026-07-08
 
 ### Added
@@ -262,6 +344,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI: fmt check, clippy with `-D warnings`, tests, release build.
 - Issue templates, PR template, CONTRIBUTING.md, ROADMAP.md.
 
+[0.5.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.2.0

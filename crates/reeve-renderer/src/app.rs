@@ -112,7 +112,7 @@ pub struct TraceView {
 /// tree. It may replace another stub, and anything loads into an empty
 /// panel.
 pub fn completed_trace_takes_panel(completed_spans: usize, loaded_spans: Option<usize>) -> bool {
-    completed_spans > 2 || loaded_spans.map_or(true, |n| n <= 2)
+    completed_spans > 2 || loaded_spans.is_none_or(|n| n <= 2)
 }
 
 /// One open turn's live view and its display ordering.

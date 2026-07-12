@@ -65,9 +65,11 @@ No SDK, no instrumentation, no code changes.
 The HTTP proxy intercepts request/response pairs and synthesizes spans from
 them, streaming SSE included, with zero added latency to the tool being
 proxied. Redirect and inject-context work cleanly through the proxy by
-modifying the buffered request before forwarding. Pause and kill are fragile
-without an SDK, so proxy-connected agents carry a `[proxy]` indicator and
-their reduced capabilities are stated plainly rather than papered over.
+modifying the buffered request before forwarding. Kill turned out stronger
+here than on the SDK path: the proxy refuses to forward a killed agent's
+requests, a circuit breaker instead of a cooperative shutdown. Pause is the
+honest exception, so proxy-connected agents carry a `[proxy]` indicator and
+the one missing capability is stated plainly rather than papered over.
 
 **What this proves:** Reeve is useful with tools you already run, before you
 write a single line of integration code.
