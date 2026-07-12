@@ -177,6 +177,7 @@ async fn run_inner(
                     app.state.streaming.cursor_tick.wrapping_add(1);
                 app.state.advance_flash();
                 app.sync_pause_status();
+                app.sync_killed_status();
                 app.check_auto_confirm().await;
                 // 66ms of wall time per tick, matching the render interval.
                 app.advance_replay(66.0);
