@@ -35,7 +35,7 @@ Reeve is for that moment.
 ---
 
 ```
-┌─ REEVE v0.4.0 ──────────────────────── ● research-bot  ◆72 CAUTION  $0.047 ──┐
+┌─ REEVE v0.5.0 ──────────────────────── ● research-bot  ◆72 CAUTION  $0.047 ──┐
 │ AGENTS          │ TRACE ── task-0047 ── 12.4s                   │ SPAN DETAIL│
 │                 │                                               │            │
 │ ● research-bot  │ ▾ agent.execute  ◷ 12.4s  ●                   │ gen_ai.chat│
@@ -159,12 +159,31 @@ Any OTel-instrumented agent can point directly at Reeve:
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 python your_agent.py
 ```
 
-### HTTP proxy (no SDK required, planned)
+### HTTP proxy (no SDK required)
 
-The proxy path is v0.5.0 on the [roadmap](ROADMAP.md): point
-`ANTHROPIC_BASE_URL` at Reeve and watch Claude Code appear in the cockpit with
-zero integration work. Redirect and inject context will work cleanly through
-the proxy; pause and kill are fragile without an SDK and will say so honestly.
+Point `ANTHROPIC_BASE_URL` at Reeve and any tool that speaks the Anthropic
+API appears in the cockpit with zero integration work:
+
+```bash
+ANTHROPIC_BASE_URL=http://localhost:4318 claude
+```
+
+The trace tree is reconstructed from the traffic itself: agentic clients
+resend the conversation on every call, so consecutive requests thread into
+turns, and a `tool_use` in one response plus its `tool_result` in the next
+request becomes a tool span with a real duration. Claude Code's task
+structure renders live without a single line of instrumentation, web
+searches included.
+
+Interventions work through the proxy too. Redirect and inject context apply
+by modifying the agent's next request. Kill is a circuit breaker: the proxy
+refuses to forward the agent's Messages requests, which means kill on the
+proxy path is stronger than the SDK's cooperative version, not weaker. Pause
+is the honest exception; holding a request reads as an outage to the client,
+so proxy agents show reduced capabilities rather than a pause that lies.
+
+Your API key passes through in memory only. It is never logged, never
+persisted, and never attached to any span; a test pins this.
 
 ---
 
@@ -204,7 +223,7 @@ something is going wrong right now.
 | Rust agents | SDK | Full | Yes | Yes |
 | OpenAI Agents SDK | SDK | Planned (v1.0.0) | — | — |
 | Claude Agent SDK | SDK | Planned (v1.0.0) | — | — |
-| Claude Code | Proxy | Planned (v0.5.0) | — | — |
+| Claude Code | Proxy | Full | No (by design) | Yes |
 | Any OTel agent | OTel | Full | No | No |
 
 ---
