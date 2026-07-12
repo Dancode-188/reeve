@@ -49,12 +49,16 @@ pub async fn serve(
     // assembler treats them as alive however long the model streams.
     let active_streams: assemble::ActiveStreams =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
+    // Open turns hold the idle timeout across the client-side tool gaps
+    // between round trips; the proxy writes, the assembler reads.
+    let open_turns: assemble::OpenTurns = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     // The HTTP proxy is a second producer into the same pipeline: spans it
     // synthesizes are normalized, assembled, and routed like SDK spans.
     let proxy_pipeline_tx = pipeline_tx.clone();
     let proxy_signal_tx = signal_tx.clone();
     let proxy_active_streams = active_streams.clone();
+    let proxy_open_turns = open_turns.clone();
     tokio::spawn(async move {
         if let Err(e) = proxy::run(
             proxy_addr,
@@ -62,6 +66,7 @@ pub async fn serve(
             proxy_signal_tx,
             proxy_interventions,
             proxy_active_streams,
+            proxy_open_turns,
         )
         .await
         {
@@ -106,6 +111,7 @@ pub async fn serve(
         paused,
         disconnected,
         active_streams,
+        open_turns,
     ));
     tokio::spawn(route::run(route_rx, hot, warm, signal_tx));
 
