@@ -98,6 +98,15 @@ pub struct TraceView {
     pub notes: HashMap<SpanId, String>,
 }
 
+/// Whether a trace that just completed should replace what the panel
+/// is showing. A single-round-trip stub (one chat plus its root) is the
+/// side-call shape: it never steals the panel from a larger loaded
+/// tree. It may replace another stub, and anything loads into an empty
+/// panel.
+pub fn completed_trace_takes_panel(completed_spans: usize, loaded_spans: Option<usize>) -> bool {
+    completed_spans > 2 || loaded_spans.map_or(true, |n| n <= 2)
+}
+
 /// One open turn's live view and its display ordering.
 pub struct LiveTurn {
     pub agent_id: AgentId,
@@ -163,6 +172,14 @@ impl LiveTurns {
     /// The turn is over: its view retires.
     pub fn retire(&mut self, trace_id: &TraceId) {
         self.entries.retain(|t| &t.view.trace_id != trace_id);
+    }
+
+    /// How many turns this agent has open right now.
+    pub fn count_for(&self, agent_id: &AgentId) -> usize {
+        self.entries
+            .iter()
+            .filter(|t| &t.agent_id == agent_id)
+            .count()
     }
 
     pub fn oldest_for(&self, agent_id: &AgentId) -> Option<&TraceView> {
@@ -810,14 +827,30 @@ impl App {
                 }
             }
             IngestionEvent::AgentStatusChanged { agent_id, status } => {
-                if let Some(s) = self.state.agents.get_mut(&agent_id) {
-                    s.agent.status = status;
+                // Idle is per trace, but an agent runs concurrent
+                // conversations: a side call completing must not flap a
+                // still-working agent to idle. Idle applies only when no
+                // other work is open; the TraceCompleted handler settles
+                // it after the completing turn retires. Error and the
+                // rest apply unconditionally.
+                let still_working = status == reeve_model::entity::AgentStatus::Idle
+                    && (self.state.live_turns.count_for(&agent_id) > 1
+                        || self
+                            .state
+                            .streaming
+                            .active
+                            .iter()
+                            .any(|st| st.agent_id == agent_id));
+                if !still_working {
+                    if let Some(s) = self.state.agents.get_mut(&agent_id) {
+                        s.agent.status = status;
+                    }
                 }
             }
             IngestionEvent::TraceCompleted {
                 trace_id,
                 agent_id,
-                span_count: _,
+                span_count,
                 cost,
             } => {
                 if let Some(s) = self.state.agents.get_mut(&agent_id) {
@@ -835,13 +868,34 @@ impl App {
                 // The turn is over: the live view retires and the loaded
                 // completed trace takes the panel back.
                 self.state.live_turns.retire(&trace_id);
+                // The completing turn was this agent's last open work:
+                // NOW idle is true (its own status event was suppressed
+                // while the retiring turn still counted as open).
+                if self.state.live_turns.count_for(&agent_id) == 0
+                    && !self
+                        .state
+                        .streaming
+                        .active
+                        .iter()
+                        .any(|st| st.agent_id == agent_id)
+                {
+                    if let Some(s) = self.state.agents.get_mut(&agent_id) {
+                        if s.agent.status == reeve_model::entity::AgentStatus::Running {
+                            s.agent.status = reeve_model::entity::AgentStatus::Idle;
+                        }
+                    }
+                }
                 let is_selected = self
                     .state
                     .selected_agent
                     .and_then(|i| self.state.agents.get_index(i))
                     .map(|(id, _)| id == &agent_id)
                     .unwrap_or(false);
-                if is_selected {
+                let takes_panel = completed_trace_takes_panel(
+                    span_count,
+                    self.state.trace.as_ref().map(|tv| tv.spans.len()),
+                );
+                if is_selected && takes_panel {
                     self.state.active_suggestion = None;
                     self.state.metric_scores.clear();
                     self.state.health_tier2_pending = false;
@@ -3062,6 +3116,23 @@ mod tests {
         assert!(
             !suggestion_supported(&[], "redirect"),
             "no capabilities, no dispatchable suggestions"
+        );
+    }
+
+    #[test]
+    fn side_call_stubs_never_steal_the_panel() {
+        // The #201 shape: a 100-span build turn loads, then a trailing
+        // 2-span title-generation stub completes and used to mask it.
+        assert!(!completed_trace_takes_panel(2, Some(100)));
+        assert!(completed_trace_takes_panel(100, Some(2)), "big beats stub");
+        assert!(
+            completed_trace_takes_panel(2, Some(2)),
+            "stub replaces stub"
+        );
+        assert!(completed_trace_takes_panel(2, None), "anything fills empty");
+        assert!(
+            completed_trace_takes_panel(100, Some(50)),
+            "big replaces big"
         );
     }
 
