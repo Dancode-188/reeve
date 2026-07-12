@@ -1,4 +1,4 @@
-use crate::app::{AppState, FlashTarget};
+use crate::app::{AgentBudget, AppState, FlashTarget};
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -29,7 +29,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .map(|(_, s)| s.cost_history.as_slice())
         .unwrap_or(&[]);
     let has_predicted = false; // populated when issue #55 ships
-    let cost_height = 1 + 1 + 1 + u16::from(has_predicted) + 1; // label+total+sparkline+predicted+divider
+    let has_budget = selected_agent
+        .map(|(_, s)| s.budget.is_some())
+        .unwrap_or(false);
+    // label+total+budget+sparkline+predicted+divider
+    let cost_height = 1 + 1 + u16::from(has_budget) + 1 + u16::from(has_predicted) + 1;
 
     let has_alerts = !state.policy_alerts.is_empty();
     let alert_height = if has_alerts {
@@ -348,6 +352,43 @@ fn render_health(
     );
 }
 
+/// The daily-budget bar for the COST section: a filled gauge against the
+/// cap with the ceiling labelled, coloured teal under the warn threshold,
+/// amber past it, and red once the budget has stopped the agent. Mirrors
+/// the HEALTH gauge so the two read as one family.
+fn budget_bar(b: AgentBudget, width: usize, theme: &Theme) -> Line<'static> {
+    let fraction = if b.cap > 0.0 {
+        (b.spent_today / b.cap).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let color = if b.over {
+        theme.health_crit()
+    } else if fraction >= 0.8 {
+        theme.health_warn()
+    } else {
+        theme.get("teal")
+    };
+    // A whole-dollar cap reads cleaner without cents; a fractional one keeps
+    // them so the ceiling shown is the ceiling set.
+    let cap_str = if b.cap.fract() == 0.0 {
+        format!(" /${:.0}", b.cap)
+    } else {
+        format!(" /${:.2}", b.cap)
+    };
+    let gauge_w = width.saturating_sub(cap_str.len());
+    let filled = (fraction * gauge_w as f64).round() as usize;
+    let empty = gauge_w.saturating_sub(filled);
+    Line::from(vec![
+        Span::styled("\u{2588}".repeat(filled), Style::default().fg(color)),
+        Span::styled(
+            "\u{2591}".repeat(empty),
+            Style::default().fg(theme.get("muted")),
+        ),
+        Span::styled(cap_str, Style::default().fg(theme.subtext())),
+    ])
+}
+
 fn render_cost(
     frame: &mut Frame,
     area: Rect,
@@ -366,10 +407,13 @@ fn render_cost(
 
     let total_cost = selected_agent.map(|s| s.display_cost()).unwrap_or(0.0);
     let cost_trend = selected_agent.and_then(|s| s.cost_trend);
+    let budget = selected_agent.and_then(|s| s.budget);
 
-    // Layout: label(1) + total(1) + sparkline(1) + divider(1) = 4 rows minimum
+    // Layout: label(1) + total(1) + [budget(1)] + sparkline(1) + divider(1)
     let n_rows = area.height;
-    let sparkline_row = 2u16; // 0-indexed within area
+    // The budget bar, when present, sits between the total and the
+    // sparkline, pushing the sparkline down a row.
+    let sparkline_row = 2u16 + u16::from(budget.is_some());
 
     // Label + total lines
     let label_line = section_label("COST", theme);
@@ -385,14 +429,20 @@ fn render_cost(
         Span::styled(" today", Style::default().fg(theme.subtext())),
     ]);
 
-    // Render label and total as a paragraph over the first 2 rows
+    let mut top_lines = vec![label_line, total_line];
+    if let Some(b) = budget {
+        top_lines.push(budget_bar(b, area.width as usize, theme));
+    }
+    let top_height = top_lines.len() as u16;
+
+    // Render label, total, and the budget bar as one paragraph.
     let top_area = Rect {
         x: area.x,
         y: area.y,
         width: area.width,
-        height: 2,
+        height: top_height,
     };
-    frame.render_widget(Paragraph::new(vec![label_line, total_line]), top_area);
+    frame.render_widget(Paragraph::new(top_lines), top_area);
 
     // Sparkline row
     let spark_area = Rect {

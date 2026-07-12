@@ -10,6 +10,59 @@ struct ConfigFile {
     rules: Vec<RuleEntry>,
     privacy_tier: Option<u8>,
     notifications: Option<NotificationsSection>,
+    budgets: Option<BudgetsSection>,
+}
+
+#[derive(Deserialize)]
+struct BudgetsSection {
+    /// Applies to every agent without its own entry.
+    default_daily: Option<f64>,
+    /// Per-agent daily caps, keyed by agent id (e.g. "claude-cli:proxy").
+    #[serde(default)]
+    per_agent: std::collections::HashMap<String, f64>,
+}
+
+/// Resolved daily spend caps. An agent's cap is its per-agent entry, or
+/// the default, or none (unbudgeted). Read once at startup like the rest
+/// of the config.
+#[derive(Debug, Clone, Default)]
+pub struct Budgets {
+    pub default_daily: Option<f64>,
+    pub per_agent: std::collections::HashMap<String, f64>,
+}
+
+impl Budgets {
+    /// The daily cap for an agent, if any. A per-agent entry overrides
+    /// the default; a zero or negative cap is treated as unbudgeted so a
+    /// stray `0.0` never stops every request.
+    pub fn cap_for(&self, agent_id: &str) -> Option<f64> {
+        self.per_agent
+            .get(agent_id)
+            .copied()
+            .or(self.default_daily)
+            .filter(|c| *c > 0.0)
+    }
+}
+
+/// Loads daily budgets from the config, empty when the file or section
+/// is absent.
+pub fn load_budgets(path: &Path) -> Budgets {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Budgets::default();
+    };
+    match toml::from_str::<ConfigFile>(&text) {
+        Ok(c) => match c.budgets {
+            Some(b) => Budgets {
+                default_daily: b.default_daily,
+                per_agent: b.per_agent,
+            },
+            None => Budgets::default(),
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse budgets from config");
+            Budgets::default()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -265,5 +318,37 @@ scope = "agent:my-agent-id"
         let rules = load(f.path());
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].scope, RuleScope::Agent("my-agent-id".to_string()));
+    }
+
+    #[test]
+    fn budgets_resolve_per_agent_over_default() {
+        let f = write_temp(
+            r#"
+[budgets]
+default_daily = 5.0
+
+[budgets.per_agent]
+"claude-cli:proxy" = 20.0
+"#,
+        );
+        let b = load_budgets(f.path());
+        assert_eq!(b.cap_for("claude-cli:proxy"), Some(20.0), "per-agent wins");
+        assert_eq!(b.cap_for("other:proxy"), Some(5.0), "falls back to default");
+    }
+
+    #[test]
+    fn a_zero_cap_is_unbudgeted_not_a_wall() {
+        let f = write_temp("[budgets]\ndefault_daily = 0.0\n");
+        assert_eq!(
+            load_budgets(f.path()).cap_for("any"),
+            None,
+            "a stray zero must not stop every request"
+        );
+        assert!(
+            load_budgets(Path::new("/nonexistent"))
+                .cap_for("any")
+                .is_none(),
+            "no config, no budget"
+        );
     }
 }

@@ -58,6 +58,20 @@ pub struct AgentState {
     pub live_cost: f64,
     pub cost_history: Vec<f64>,
     pub cost_trend: Option<CostTrend>,
+    /// The agent's daily budget picture, when it has a cap. Drives the COST
+    /// section's budget bar; `None` for an unbudgeted agent, which shows no
+    /// bar at all rather than an empty one.
+    pub budget: Option<AgentBudget>,
+}
+
+/// A budgeted agent's spend against its daily cap, from `BudgetUpdated`.
+#[derive(Clone, Copy)]
+pub struct AgentBudget {
+    pub spent_today: f64,
+    pub cap: f64,
+    /// The budget stopped the agent (hard on the proxy path, requested on
+    /// the SDK path). Colours the bar and marks it as the ceiling hit.
+    pub over: bool,
 }
 
 impl AgentState {
@@ -78,6 +92,7 @@ impl AgentState {
             live_cost: 0.0,
             cost_history: Vec::new(),
             cost_trend: None,
+            budget: None,
         }
     }
 }
@@ -1176,6 +1191,20 @@ impl App {
                     if ov.agent_id == agent_id {
                         self.state.overlay = None;
                     }
+                }
+            }
+            EngineEvent::BudgetUpdated {
+                agent_id,
+                spent_today,
+                cap,
+                over,
+            } => {
+                if let Some(s) = self.state.agents.get_mut(&agent_id) {
+                    s.budget = Some(AgentBudget {
+                        spent_today,
+                        cap,
+                        over,
+                    });
                 }
             }
         }
