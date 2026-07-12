@@ -130,6 +130,19 @@ fn render_note(frame: &mut Frame, area: Rect, content: &str, theme: &Theme) {
 }
 
 fn span_detail_height(state: &AppState) -> u16 {
+    // Mirrors the live-mode branch in render_span_detail: the section
+    // shows the live name plus a note that wraps to two rows, and the
+    // height must come from what is actually rendered, not from the
+    // hidden loaded trace's selection.
+    if state.view_mode == crate::app::ViewMode::Fleet {
+        if let Some(lv) = state.live_view_for_selected() {
+            return if lv.selected.is_some() {
+                2 + 2 + 1 // label + name + wrapped note + divider
+            } else {
+                3
+            };
+        }
+    }
     let selected_span = state
         .trace
         .as_ref()
@@ -406,7 +419,12 @@ fn render_span_detail(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     )));
                 }
             }
-            frame.render_widget(Paragraph::new(lines), area);
+            // The note is longer than the panel is wide: wrap it
+            // instead of clipping mid-word at the border.
+            frame.render_widget(
+                Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+                area,
+            );
             return;
         }
     }
