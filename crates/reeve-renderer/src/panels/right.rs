@@ -509,6 +509,26 @@ fn render_span_detail(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     theme.subtext(),
                     theme,
                 ));
+
+                // Reasoning tokens hiding inside the output count, with
+                // their share so a mostly-thinking response is obvious.
+                if let Some(thinking) = span
+                    .attributes
+                    .get("gen_ai.usage.thinking_tokens")
+                    .and_then(|v| v.as_u64())
+                    .filter(|t| *t > 0)
+                {
+                    let share = if tok_out > 0 {
+                        format!(
+                            "{} ({}%)",
+                            format_tokens(thinking),
+                            (thinking as f64 / tok_out as f64 * 100.0).round() as u64
+                        )
+                    } else {
+                        format_tokens(thinking)
+                    };
+                    lines.push(field_line("thinking", &share, theme.subtext(), theme));
+                }
             }
 
             // cost

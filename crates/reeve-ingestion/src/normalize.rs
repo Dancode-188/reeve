@@ -92,6 +92,7 @@ impl AttributeTranslator for V1AttributeTranslator {
             "gen_ai.operation.name",
             "gen_ai.usage.input_tokens",
             "gen_ai.usage.output_tokens",
+            "gen_ai.usage.thinking_tokens",
             "gen_ai.usage.total_tokens",
             "gen_ai.usage.cache_read_tokens",
             "gen_ai.usage.cache_creation_tokens",
@@ -315,6 +316,7 @@ mod tests {
             attributes: vec![
                 string_kv("gen_ai.request.model", "claude-3-5-sonnet"),
                 int_kv("gen_ai.usage.input_tokens", 512),
+                int_kv("gen_ai.usage.thinking_tokens", 47),
                 int_kv("gen_ai.usage.cache_read_tokens", 2048),
                 string_kv("gen_ai.tool.name", "search"),
                 string_kv("custom.my_app.version", "1.0"),
@@ -336,6 +338,12 @@ mod tests {
         assert_eq!(
             internal.attributes["gen_ai.usage.cache_read_tokens"],
             serde_json::json!(2048i64)
+        );
+        // Thinking tokens feed the same SQL aggregation; the same gap
+        // would silently zero the thinking share for SDK-path spans.
+        assert_eq!(
+            internal.attributes["gen_ai.usage.thinking_tokens"],
+            serde_json::json!(47i64)
         );
         // The judge's extract_tool_calls reads this from queryable
         // attributes; dropping it here silently degrades tool-selection

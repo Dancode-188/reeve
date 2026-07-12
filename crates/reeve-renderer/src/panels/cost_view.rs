@@ -21,7 +21,7 @@ pub fn render(frame: &mut Frame, area: Rect, summary: &CostSummary, theme: &Them
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Percentage(50),
             Constraint::Fill(1),
         ])
@@ -58,6 +58,32 @@ pub fn render(frame: &mut Frame, area: Rect, summary: &CostSummary, theme: &Them
         ])
     };
 
+    // The thinking line answers "how much of my output spend is invisible
+    // reasoning": adaptive thinking is on by default for newer models, so
+    // the share can be large without a single visible character changing.
+    let thinking_line = if summary.thinking_tokens == 0 || summary.output_tokens == 0 {
+        Line::from(vec![
+            Span::styled("THINKING", Style::default().fg(theme.get("blue"))),
+            Span::styled(
+                "  no thinking tokens seen",
+                Style::default().fg(theme.subtext()),
+            ),
+        ])
+    } else {
+        let share = 100.0 * summary.thinking_tokens as f64 / summary.output_tokens as f64;
+        Line::from(vec![
+            Span::styled("THINKING", Style::default().fg(theme.get("blue"))),
+            Span::styled(
+                format!("  {share:.0}% of output"),
+                Style::default().fg(theme.text()),
+            ),
+            Span::styled(
+                format!("  \u{00B7}  {} tokens", summary.thinking_tokens),
+                Style::default().fg(theme.subtext()),
+            ),
+        ])
+    };
+
     let headline = vec![
         Line::from(vec![
             Span::styled("COST", Style::default().fg(theme.get("blue"))),
@@ -71,6 +97,7 @@ pub fn render(frame: &mut Frame, area: Rect, summary: &CostSummary, theme: &Them
             ),
         ]),
         cache_line,
+        thinking_line,
         Line::raw(""),
     ];
     frame.render_widget(Paragraph::new(headline), sections[0]);

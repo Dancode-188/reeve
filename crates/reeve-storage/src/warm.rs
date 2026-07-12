@@ -29,6 +29,10 @@ pub struct CostSummary {
     pub prompt_tokens: u64,
     /// Net dollars the prompt cache saved, summed from span attributes.
     pub cache_saved: f64,
+    /// Reasoning tokens across all spans, a subset of `output_tokens`.
+    pub thinking_tokens: u64,
+    /// Output tokens across all spans; the thinking share is over this.
+    pub output_tokens: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -752,7 +756,13 @@ impl WarmStore {
                 )?
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
-            let (cache_read_tokens, prompt_tokens, cache_saved): (i64, i64, f64) = conn.query_row(
+            let (cache_read_tokens, prompt_tokens, cache_saved, thinking_tokens, output_tokens): (
+                i64,
+                i64,
+                f64,
+                i64,
+                i64,
+            ) = conn.query_row(
                 "SELECT
                          COALESCE(SUM(json_extract(attributes,
                              '$.\"gen_ai.usage.cache_read_tokens\"')), 0),
@@ -764,10 +774,22 @@ impl WarmStore {
                              + COALESCE(json_extract(attributes,
                                  '$.\"gen_ai.usage.cache_creation_tokens\"'), 0)), 0),
                          COALESCE(SUM(json_extract(attributes,
-                             '$.\"gen_ai.usage.cache_saved\"')), 0.0)
+                             '$.\"gen_ai.usage.cache_saved\"')), 0.0),
+                         COALESCE(SUM(json_extract(attributes,
+                             '$.\"gen_ai.usage.thinking_tokens\"')), 0),
+                         COALESCE(SUM(json_extract(attributes,
+                             '$.\"gen_ai.usage.output_tokens\"')), 0)
                      FROM spans",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )?;
             Ok(CostSummary {
                 total,
@@ -777,6 +799,8 @@ impl WarmStore {
                 cache_read_tokens: cache_read_tokens.max(0) as u64,
                 prompt_tokens: prompt_tokens.max(0) as u64,
                 cache_saved,
+                thinking_tokens: thinking_tokens.max(0) as u64,
+                output_tokens: output_tokens.max(0) as u64,
             })
         })
         .await
@@ -1397,6 +1421,28 @@ mod tests {
         assert_eq!(summary.cache_read_tokens, 3000);
         assert_eq!(summary.prompt_tokens, 10_000);
         assert!((summary.cache_saved - 0.012).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn cost_summary_sums_thinking_share() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t1")).await.unwrap();
+        let mut s1 = span("s1", "t1");
+        s1.attributes = serde_json::json!({
+            "gen_ai.usage.output_tokens": 131,
+            "gen_ai.usage.thinking_tokens": 47
+        });
+        store.save_span(s1).await.unwrap();
+        // A span without thinking still counts its output toward the
+        // denominator, diluting the share honestly.
+        let mut s2 = span("s2", "t1");
+        s2.attributes = serde_json::json!({"gen_ai.usage.output_tokens": 69});
+        store.save_span(s2).await.unwrap();
+
+        let summary = store.cost_summary().await.unwrap();
+        assert_eq!(summary.thinking_tokens, 47);
+        assert_eq!(summary.output_tokens, 200);
     }
 
     #[tokio::test]
