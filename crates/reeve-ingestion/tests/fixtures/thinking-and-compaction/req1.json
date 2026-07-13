@@ -1,0 +1,1 @@
+{"model":"claude-opus-4-8","max_tokens":1024,"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]},"messages":[{"role":"user","content":"continue the analysis"}]}

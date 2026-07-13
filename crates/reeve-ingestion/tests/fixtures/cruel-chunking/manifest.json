@@ -1,0 +1,6 @@
+{
+  "description": "A streamed response delivered one byte per chunk: events split at every possible boundary. The accumulator must reassemble the model, usage, and text.",
+  "steps": [
+    {"request": "req1.json", "response": {"kind": "sse", "file": "resp1.sse", "chunking": "bytes"}}
+  ]
+}

@@ -1,0 +1,1 @@
+{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"summarize the build failures"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_10","name":"read_logs","input":{"path":"build.log"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_10","content":"two failures, both linker"}]}]}

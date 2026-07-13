@@ -1,0 +1,1 @@
+{"id":"msg_02","type":"message","model":"claude-opus-4-8","stop_reason":"end_turn","content":[{"type":"text","text":"three entries at the top level"}],"usage":{"input_tokens":950,"output_tokens":25,"cache_read_input_tokens":800,"cache_creation_input_tokens":0}}

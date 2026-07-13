@@ -1656,6 +1656,7 @@ dependencies = [
  "reeve-storage",
  "regex",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-stream",

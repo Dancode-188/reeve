@@ -1,0 +1,1 @@
+{"id":"msg_30","type":"message","model":"claude-opus-4-8","stop_reason":"end_turn","content":[{"type":"text","text":"analysis continued"}],"usage":{"input_tokens":9000,"output_tokens":131,"output_tokens_details":{"thinking_tokens":47},"cache_read_input_tokens":31715,"cache_creation_input_tokens":0},"context_management":{"applied_edits":[{"type":"clear_thinking_20251015"}]}}

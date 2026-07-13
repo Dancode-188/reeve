@@ -1,0 +1,7 @@
+{
+  "description": "The tool_result closing a call carries is_error true. The synthesized tool span must carry failed status, not completed.",
+  "steps": [
+    {"request": "req1.json", "response": {"kind": "json", "file": "resp1.json"}},
+    {"request": "req2.json", "response": {"kind": "json", "file": "resp2.json"}}
+  ]
+}
