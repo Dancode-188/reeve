@@ -680,14 +680,7 @@ fn apply_interventions(
             tracing::info!(command_id = %cmd.id, "queued proxy command expired before application");
             continue;
         }
-        let text = match &cmd.payload {
-            ProxyPayload::Redirect { instruction } => format!(
-                "[Operator redirect via Reeve] Disregard the current approach and instead: {instruction}"
-            ),
-            ProxyPayload::InjectContext { context } => {
-                format!("[Operator context via Reeve] {context}")
-            }
-        };
+        let text = intervention_message(&cmd.payload);
         messages.push(serde_json::json!({"role": "user", "content": text}));
         applied_any = true;
         interventions
@@ -703,6 +696,26 @@ fn apply_interventions(
     match serde_json::to_vec(&parsed) {
         Ok(modified) => axum::body::Bytes::from(modified),
         Err(_) => body,
+    }
+}
+
+/// The user-role message an intervention injects. Steering, not
+/// correction: the earlier "disregard the current approach" wording read
+/// as "you made a mistake", and a live agent answered a redirect with
+/// "I did this in error" and started treating good work as wrong. The
+/// message must carry that priorities changed and no fault exists, or
+/// the model invents one and self-attributes it.
+fn intervention_message(payload: &ProxyPayload) -> String {
+    match payload {
+        ProxyPayload::Redirect { instruction } => format!(
+            "[Operator redirect via Reeve] A human operator watching this session \
+             has changed the priorities. Your work so far is not in question. \
+             From this point, do the following instead: {instruction}"
+        ),
+        ProxyPayload::InjectContext { context } => format!(
+            "[Operator context via Reeve] A human operator watching this session \
+             shares the following context: {context}"
+        ),
     }
 }
 
@@ -1760,6 +1773,27 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             Some(1),
             "closing a tool is behavior, not breakage"
         );
+    }
+
+    #[test]
+    fn intervention_messages_steer_without_fault_framing() {
+        let redirect = intervention_message(&ProxyPayload::Redirect {
+            instruction: "focus on the tests".to_string(),
+        });
+        // The live failure mode: fault-framing words make the model
+        // apologize for the operator's decision and undo good work.
+        for banned in ["Disregard", "disregard", "wrong", "mistake", "error"] {
+            assert!(!redirect.contains(banned), "fault framing: {banned}");
+        }
+        assert!(redirect.contains("not in question"));
+        assert!(redirect.contains("focus on the tests"));
+        assert!(redirect.starts_with("[Operator redirect via Reeve]"));
+
+        let inject = intervention_message(&ProxyPayload::InjectContext {
+            context: "the deploy window closes at 5".to_string(),
+        });
+        assert!(inject.contains("the deploy window closes at 5"));
+        assert!(inject.starts_with("[Operator context via Reeve]"));
     }
 
     #[tokio::test]
