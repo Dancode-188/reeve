@@ -19,6 +19,7 @@ use opentelemetry_proto::tonic::trace::v1::Span as OtlpSpan;
 use opentelemetry_proto::tonic::trace::v1::Status as OtlpStatus;
 use reeve_model::entity::{IntegrationPath, ProxyInterventions, ProxyPayload};
 use reeve_model::signal::IngestionEvent;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -50,6 +51,14 @@ struct ProxyState {
     /// request time: the between-round-trips exemption from the idle
     /// timeout, held while the client runs its tools (#200).
     open_turns: Option<crate::assemble::OpenTurns>,
+    /// Refuse requests carrying a detected secret instead of forwarding
+    /// them. Off by default: warn-first, because a false positive that
+    /// blocks legitimate traffic destroys trust in the whole feature.
+    secrets_block: bool,
+    /// Fingerprints of secrets already alerted, per agent. The replayed
+    /// history re-sends every secret on every round trip; each one
+    /// speaks in ALERTS once.
+    seen_secrets: std::sync::Mutex<HashMap<reeve_model::ids::AgentId, HashSet<u64>>>,
 }
 
 fn trace_key(trace_id: &[u8]) -> reeve_model::ids::TraceId {
@@ -108,6 +117,7 @@ pub async fn run(
     interventions: ProxyInterventions,
     active_streams: crate::assemble::ActiveStreams,
     open_turns: crate::assemble::OpenTurns,
+    secrets_block: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let upstream =
         std::env::var("REEVE_PROXY_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
@@ -121,6 +131,7 @@ pub async fn run(
         Some(interventions),
         Some(active_streams),
         Some(open_turns),
+        secrets_block,
     )
     .await
 }
@@ -136,6 +147,7 @@ pub async fn run_with(
     interventions: Option<ProxyInterventions>,
     active_streams: Option<crate::assemble::ActiveStreams>,
     open_turns: Option<crate::assemble::OpenTurns>,
+    secrets_block: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = Arc::new(ProxyState {
         client: reqwest::Client::new(),
@@ -148,7 +160,13 @@ pub async fn run_with(
         interventions,
         active_streams,
         open_turns,
+        secrets_block,
+        seen_secrets: std::sync::Mutex::new(HashMap::new()),
     });
+
+    // The secret patterns compile here, not inside the first request's
+    // measured overhead.
+    crate::secrets::warm();
 
     let app = axum::Router::new()
         .fallback(forward)
@@ -208,6 +226,51 @@ async fn forward(
                     "{\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"an operator killed this agent via Reeve; API access is stopped until Reeve restarts\"}}",
                 ))
                 .expect("static response construction cannot fail");
+        }
+    }
+    // Outbound secret scan, before the bytes leave the machine. The
+    // scan is in memory on text already passing through; only the kind,
+    // a redacted hint, and a fingerprint survive. New findings alert
+    // once per agent; in block mode ANY finding refuses the request,
+    // because the replayed history re-leaks a seen secret on every
+    // round trip, not just the first.
+    let mut secret_kinds: Vec<&'static str> = Vec::new();
+    if method == Method::POST && uri.path().ends_with("/v1/messages") {
+        if let Ok(text) = std::str::from_utf8(&body) {
+            let findings = crate::secrets::scan(text);
+            if !findings.is_empty() {
+                let agent_id = reeve_model::ids::agent_id_from_service(&agent_name, "proxy");
+                let new: Vec<_> = {
+                    let mut seen = state.seen_secrets.lock().expect("secrets mutex poisoned");
+                    let agent_seen = seen.entry(agent_id).or_default();
+                    findings
+                        .iter()
+                        .filter(|f| agent_seen.insert(f.fingerprint))
+                        .collect()
+                };
+                if !new.is_empty() {
+                    let listed = new
+                        .iter()
+                        .map(|f| format!("{} {}", f.kind, f.hint))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    tracing::warn!(agent = %agent_name, findings = %listed, "outbound secret detected");
+                    let _ = state.signal_tx.send(IngestionEvent::PipelineWarning {
+                        message: format!("{agent_name}: outbound secret detected ({listed})"),
+                    });
+                }
+                secret_kinds = new.iter().map(|f| f.kind).collect();
+                if state.secrets_block {
+                    tracing::warn!(agent = %agent_name, "request refused: outbound secret (block mode)");
+                    return Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            "{\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Reeve refused this request: the body contains what looks like a secret, and secret blocking is enabled\"}}",
+                        ))
+                        .expect("static response construction cannot fail");
+                }
+            }
         }
     }
     let placement = if method == Method::POST && uri.path().ends_with("/v1/messages") {
@@ -305,6 +368,7 @@ async fn forward(
             placement,
             arrived,
             overhead_ms,
+            secret_kinds,
         );
         return build_response(status, &resp_headers, body);
     }
@@ -335,6 +399,7 @@ async fn forward(
             status.as_u16(),
             arrived,
             overhead_ms,
+            &secret_kinds,
         )
         .await;
     }
@@ -396,6 +461,7 @@ impl StreamOutcome {
 /// client can observe. Emits StreamingUpdate per text delta so the
 /// cockpit's streaming box renders the generation live, and finalizes a
 /// span through every exit path.
+#[allow(clippy::too_many_arguments)]
 fn stream_and_accumulate(
     state: Arc<ProxyState>,
     upstream_resp: reqwest::Response,
@@ -403,6 +469,7 @@ fn stream_and_accumulate(
     placement: Option<TurnPlacement>,
     arrived: SystemTime,
     overhead_ms: f64,
+    secret_kinds: Vec<&'static str>,
 ) -> Body {
     let (body_tx, body_rx) = mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
 
@@ -498,6 +565,7 @@ fn stream_and_accumulate(
             arrived,
             ttft_ms,
             overhead_ms,
+            &secret_kinds,
         )
         .await;
         if let Some(tid) = placement_trace_id {
@@ -523,6 +591,7 @@ async fn finalize_stream_span(
     arrived: SystemTime,
     ttft_ms: Option<f64>,
     overhead_ms: f64,
+    secret_kinds: &[&'static str],
 ) {
     let model = acc.model.unwrap_or_else(|| "unknown".to_string());
     let mut attributes = vec![
@@ -554,6 +623,7 @@ async fn finalize_stream_span(
         ));
     }
     surface_compaction(state, agent_name, &acc.applied_edits, &mut attributes);
+    stamp_secret_findings(secret_kinds, &mut attributes);
     if acc.cache_read_tokens > 0 {
         attributes.push(kv_int(
             "gen_ai.usage.cache_read_tokens",
@@ -806,6 +876,7 @@ async fn emit_turn_root(state: &ProxyState, agent_name: &str, root: TurnRoot) {
 /// model, token usage, and estimated cost, threaded into its turn's trace
 /// as a child of the turn root. Upstream failures (429s, 5xx) synthesize
 /// failed spans so retry storms render visibly.
+#[allow(clippy::too_many_arguments)]
 async fn synthesize_span(
     state: &ProxyState,
     agent_name: &str,
@@ -814,6 +885,7 @@ async fn synthesize_span(
     http_status: u16,
     arrived: SystemTime,
     overhead_ms: f64,
+    secret_kinds: &[&'static str],
 ) {
     let ended = SystemTime::now();
 
@@ -898,6 +970,7 @@ async fn synthesize_span(
         })
         .unwrap_or_default();
     surface_compaction(state, agent_name, &applied_edits, &mut attributes);
+    stamp_secret_findings(secret_kinds, &mut attributes);
     if cache_read > 0 {
         attributes.push(kv_int("gen_ai.usage.cache_read_tokens", cache_read as i64));
     }
@@ -980,6 +1053,18 @@ fn derive_agent_name(headers: &HeaderMap) -> String {
         .map(|token| token.split('/').next().unwrap_or(token).to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "proxy-agent".to_string())
+}
+
+/// Stamps newly detected secret kinds on the span whose request first
+/// carried them: count and kinds only, never the secrets. The ALERTS
+/// notice already fired in the request path; this is the durable mark
+/// that makes the moment findable in the trace afterward.
+fn stamp_secret_findings(kinds: &[&'static str], attributes: &mut Vec<KeyValue>) {
+    if kinds.is_empty() {
+        return;
+    }
+    attributes.push(kv_int("reeve.secret.findings", kinds.len() as i64));
+    attributes.push(kv_str("reeve.secret.kinds", &kinds.join(", ")));
 }
 
 /// Stamps applied context edits on the span and tells ALERTS. Compaction
@@ -1141,6 +1226,7 @@ mod tests {
             Some(interventions.clone()),
             None,
             None,
+            false,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         (format!("http://{}", proxy_addr), rx, interventions)
@@ -1250,6 +1336,7 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             None,
             None,
             None,
+            false,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         (format!("http://{}", proxy_addr), rx, signal_rx)
@@ -1277,6 +1364,153 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
         "usage": {"input_tokens": 1000, "output_tokens": 500,
                   "cache_read_input_tokens": 2000, "cache_creation_input_tokens": 0}
     }"#;
+
+    /// The proxy with secret handling under test: returns the base URL,
+    /// the pipeline receiver, and a signal subscription.
+    async fn spawn_proxy_for_secrets(
+        block: bool,
+    ) -> (
+        String,
+        mpsc::Receiver<PipelineSpan>,
+        broadcast::Receiver<IngestionEvent>,
+    ) {
+        let upstream_app = axum::Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(Body::from(OK_BODY))
+                    .unwrap()
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let (tx, rx) = mpsc::channel(8);
+        let (signal_tx, signal_rx) = broadcast::channel(64);
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        drop(proxy_listener);
+        tokio::spawn(run_with(
+            proxy_addr,
+            format!("http://{}", upstream_addr),
+            None,
+            std::time::Duration::from_millis(500),
+            tx,
+            signal_tx,
+            None,
+            None,
+            None,
+            block,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        (format!("http://{}", proxy_addr), rx, signal_rx)
+    }
+
+    /// Assembled at runtime so no token-shaped literal sits in source,
+    /// where it trips secret scanners; see the secrets module tests.
+    fn leaky_body() -> String {
+        format!(
+            r#"{{"model":"claude-opus-4-8","messages":[{{"role":"user","content":"my .env says ANTHROPIC_KEY=sk-ant-{}-{}"}}]}}"#,
+            "api03", "abcdefghijklmnopqrstuvwx"
+        )
+    }
+
+    #[tokio::test]
+    async fn a_leaked_secret_warns_once_and_stamps_the_span() {
+        let (base, mut rx, mut signal_rx) = spawn_proxy_for_secrets(false).await;
+        let client = reqwest::Client::new();
+        let send = || {
+            client
+                .post(format!("{base}/v1/messages"))
+                .header("user-agent", "claude-cli/2.0.0")
+                .body(leaky_body())
+                .send()
+        };
+
+        let resp = send().await.unwrap();
+        assert_eq!(resp.status(), 200, "warn mode forwards the request");
+
+        // The alert names the kind, redacted, and never the secret.
+        let warning = loop {
+            match signal_rx.recv().await.unwrap() {
+                IngestionEvent::PipelineWarning { message } => break message,
+                _ => continue,
+            }
+        };
+        assert!(warning.contains("outbound secret"), "{warning}");
+        assert!(warning.contains("anthropic api key"), "{warning}");
+        assert!(
+            !warning.contains("abcdefghijklmnopqrstuvwx"),
+            "the alert must never carry the secret: {warning}"
+        );
+
+        // The chat span carries the durable mark.
+        let span = rx.recv().await.expect("chat span synthesized");
+        match attr(&span.span, "reeve.secret.kinds") {
+            Some(any_value::Value::StringValue(kinds)) => {
+                assert!(kinds.contains("anthropic api key"), "{kinds}")
+            }
+            other => panic!("secret kinds missing on span: {other:?}"),
+        }
+
+        // The replayed history re-sends the secret; it speaks once.
+        let resp = send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let span2 = rx.recv().await.expect("second chat span");
+        assert!(
+            attr(&span2.span, "reeve.secret.kinds").is_none(),
+            "a seen secret does not re-stamp"
+        );
+        assert!(
+            matches!(
+                signal_rx.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "a seen secret does not re-alert"
+        );
+    }
+
+    #[tokio::test]
+    async fn block_mode_refuses_a_request_carrying_a_secret() {
+        let (base, _rx, _signal_rx) = spawn_proxy_for_secrets(true).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(leaky_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("Reeve"), "the refusal names itself: {body}");
+
+        // A retry replays the same secret: still refused. The history
+        // re-leaks on every request, so the wall holds.
+        let retry = client
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(leaky_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), 403, "a seen secret still blocks");
+
+        // Clean traffic flows: the block is per request, not per agent.
+        let clean = client
+            .post(format!("{base}/v1/messages"))
+            .header("user-agent", "claude-cli/2.0.0")
+            .body(r#"{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(clean.status(), 200, "clean requests are not punished");
+    }
 
     #[tokio::test]
     async fn round_trip_synthesizes_a_priced_span() {
@@ -1356,6 +1590,7 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             None,
             None,
             None,
+            false,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -1424,6 +1659,7 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             None,
             None,
             Some(open_turns.clone()),
+            false,
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 

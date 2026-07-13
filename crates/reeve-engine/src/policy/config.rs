@@ -11,6 +11,12 @@ struct ConfigFile {
     privacy_tier: Option<u8>,
     notifications: Option<NotificationsSection>,
     budgets: Option<BudgetsSection>,
+    secrets: Option<SecretsSection>,
+}
+
+#[derive(Deserialize)]
+struct SecretsSection {
+    block: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -63,6 +69,20 @@ pub fn load_budgets(path: &Path) -> Budgets {
             Budgets::default()
         }
     }
+}
+
+/// Whether detected outbound secrets should block the request instead of
+/// only warning. Default off: warn-first, because a false positive that
+/// blocks legitimate traffic destroys trust in the whole feature. A
+/// missing or unparseable file means warn-only, never surprise blocking.
+pub fn load_secrets_block(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    toml::from_str::<ConfigFile>(&text)
+        .ok()
+        .and_then(|c| c.secrets.and_then(|s| s.block))
+        .unwrap_or(false)
 }
 
 #[derive(Deserialize)]
@@ -318,6 +338,20 @@ scope = "agent:my-agent-id"
         let rules = load(f.path());
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].scope, RuleScope::Agent("my-agent-id".to_string()));
+    }
+
+    #[test]
+    fn secrets_block_defaults_off_and_fails_to_warn_only() {
+        assert!(!load_secrets_block(Path::new("/nonexistent")));
+        let f = write_temp("privacy_tier = 1");
+        assert!(!load_secrets_block(f.path()), "absent section warns only");
+        let f = write_temp("[secrets]\nblock = true");
+        assert!(load_secrets_block(f.path()));
+        let f = write_temp("not [ valid toml");
+        assert!(
+            !load_secrets_block(f.path()),
+            "unparseable config must never surprise-block"
+        );
     }
 
     #[test]
