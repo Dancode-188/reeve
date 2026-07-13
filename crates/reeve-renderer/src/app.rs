@@ -126,6 +126,19 @@ pub struct TraceView {
 /// side-call shape: it never steals the panel from a larger loaded
 /// tree. It may replace another stub, and anything loads into an empty
 /// panel.
+/// Drops toasts and flash highlights whose deadline has passed. Expiry
+/// is a wall-clock deadline, never a tick countdown: the render cadence
+/// is variable, and a tick-counted TTL would stretch a three-second
+/// toast to nearly a minute at the unfocused rate.
+pub fn prune_expired(
+    toasts: &mut VecDeque<(String, std::time::Instant)>,
+    flashes: &mut HashMap<FlashTarget, (FlashDirection, std::time::Instant)>,
+    now: std::time::Instant,
+) {
+    toasts.retain(|(_, deadline)| *deadline > now);
+    flashes.retain(|_, (_, deadline)| *deadline > now);
+}
+
 pub fn completed_trace_takes_panel(completed_spans: usize, loaded_spans: Option<usize>) -> bool {
     completed_spans > 2 || loaded_spans.is_none_or(|n| n <= 2)
 }
@@ -487,7 +500,8 @@ pub struct AppState {
     /// Active privacy tier from engine startup event. 1 = default (no content
     /// capture); 2+ = content capture enabled. Controls mini-metric row states.
     pub privacy_tier: u8,
-    pub flash_targets: HashMap<FlashTarget, (FlashDirection, u8)>,
+    /// Flash highlights keyed by target, each with its wall-clock expiry.
+    pub flash_targets: HashMap<FlashTarget, (FlashDirection, std::time::Instant)>,
     pub panel_focus: PanelFocus,
     pub view_mode: ViewMode,
     /// The selected agent's recent traces, newest first, loaded from the
@@ -542,9 +556,11 @@ pub struct AppState {
     /// developer selects them or the score recovers. Peripheral vision for
     /// fleets; distinct from the one-tick flash on the selected agent.
     pub sustained_alerts: HashMap<AgentId, f64>,
-    /// Transient notices: text plus remaining render ticks. Drawn bottom
-    /// right, newest last, dropped as the TTL runs out.
-    pub toasts: VecDeque<(String, u16)>,
+    /// Transient notices: text plus wall-clock expiry. Drawn bottom
+    /// right, newest last, dropped as the deadline passes. Wall-clock
+    /// rather than tick-counted so the render cadence can change
+    /// without stretching or shrinking every notice.
+    pub toasts: VecDeque<(String, std::time::Instant)>,
     /// Zoomed panel: the focused panel takes the full body width until z
     /// is pressed again or Backspace steps out.
     pub zoomed: bool,
@@ -552,6 +568,10 @@ pub struct AppState {
     /// actual capture state with this; m toggles it, and the header shows
     /// a dim indicator while off so text selection visibly works again.
     pub mouse_enabled: bool,
+    /// Whether the terminal reports itself focused. Drives the render
+    /// cadence down while nobody is looking; defaults to true because a
+    /// terminal that never sends focus events must render normally.
+    pub focused: bool,
     pub show_help: bool,
     pub errors: Vec<String>,
     /// Unrecoverable startup error. When set, the normal cockpit is replaced
@@ -590,24 +610,30 @@ impl AppState {
         });
     }
 
-    /// Queue a transient notice. Three seconds at the 15fps tick rate.
+    /// Queue a transient notice, visible for three seconds of wall time.
     pub fn toast(&mut self, text: impl Into<String>) {
-        self.toasts.push_back((text.into(), 45));
+        self.toasts.push_back((
+            text.into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+        ));
         if self.toasts.len() > 3 {
             self.toasts.pop_front();
         }
     }
 
-    /// Decrement all flash TTLs by one tick and remove expired entries.
+    /// The expiry a fresh flash highlight gets: two frames at the full
+    /// rate, long enough to register, short enough to read as a flash.
+    pub fn flash_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_millis(150)
+    }
+
+    /// Drop flashes and toasts whose wall-clock deadline has passed.
     pub fn advance_flash(&mut self) {
-        for (_, ttl) in self.toasts.iter_mut() {
-            *ttl = ttl.saturating_sub(1);
-        }
-        self.toasts.retain(|(_, ttl)| *ttl > 0);
-        self.flash_targets.retain(|_, (_, ttl)| {
-            *ttl = ttl.saturating_sub(1);
-            *ttl > 0
-        });
+        prune_expired(
+            &mut self.toasts,
+            &mut self.flash_targets,
+            std::time::Instant::now(),
+        );
     }
 
     pub fn flash_color(
@@ -829,6 +855,7 @@ impl App {
                 toasts: VecDeque::new(),
                 zoomed: false,
                 mouse_enabled: true,
+                focused: true,
                 show_help: false,
                 errors: Vec::new(),
                 fatal_error: None,
@@ -940,9 +967,10 @@ impl App {
                     command_type: "warning".to_string(),
                     effectiveness: None,
                 });
-                self.state
-                    .flash_targets
-                    .insert(FlashTarget::AlertSection, (FlashDirection::Alert, 2));
+                self.state.flash_targets.insert(
+                    FlashTarget::AlertSection,
+                    (FlashDirection::Alert, AppState::flash_deadline()),
+                );
             }
             IngestionEvent::StreamingUpdate {
                 content,
@@ -1024,10 +1052,11 @@ impl App {
                     };
                     self.state
                         .flash_targets
-                        .insert(FlashTarget::HealthGauge, (dir, 2));
-                    self.state
-                        .flash_targets
-                        .insert(FlashTarget::AgentRow(agent_id.clone()), (dir, 2));
+                        .insert(FlashTarget::HealthGauge, (dir, AppState::flash_deadline()));
+                    self.state.flash_targets.insert(
+                        FlashTarget::AgentRow(agent_id.clone()),
+                        (dir, AppState::flash_deadline()),
+                    );
 
                     // Band crossings on unselected agents start a sustained
                     // pulse; recovery or selection clears it.
@@ -1147,9 +1176,10 @@ impl App {
                 entries.sort_by_key(|e| alert_severity_rank(&e.command_type));
                 entries.reverse();
                 self.state.policy_alerts = entries.into();
-                self.state
-                    .flash_targets
-                    .insert(FlashTarget::AlertSection, (FlashDirection::Alert, 2));
+                self.state.flash_targets.insert(
+                    FlashTarget::AlertSection,
+                    (FlashDirection::Alert, AppState::flash_deadline()),
+                );
                 if let Some(s) = suggestion_for_rule(&rule_id) {
                     self.state.active_suggestion = Some(s);
                 }
@@ -3096,6 +3126,51 @@ fn confirmation_command_type(command_type: &str, description: &str) -> Option<Co
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Toasts and flashes expire on wall-clock deadlines, not tick
+    /// counts: the render cadence is variable, and a tick-counted TTL
+    /// would stretch a three-second toast to nearly a minute at the
+    /// unfocused rate.
+    #[test]
+    fn toast_and_flash_ttls_are_wall_clock() {
+        let start = std::time::Instant::now();
+        let mut toasts: VecDeque<(String, std::time::Instant)> = VecDeque::new();
+        toasts.push_back(("hello".into(), start + std::time::Duration::from_secs(3)));
+        let mut flashes: HashMap<FlashTarget, (FlashDirection, std::time::Instant)> =
+            HashMap::new();
+        flashes.insert(
+            FlashTarget::AlertSection,
+            (
+                FlashDirection::Alert,
+                start + std::time::Duration::from_millis(150),
+            ),
+        );
+
+        // Any number of prunes before the deadline leaves entries alone:
+        // expiry is a point in time, not a countdown of calls.
+        for _ in 0..100 {
+            prune_expired(&mut toasts, &mut flashes, start);
+        }
+        assert_eq!(toasts.len(), 1, "a fresh toast survives any tick rate");
+        assert_eq!(flashes.len(), 1);
+
+        // One second in: the flash is gone, the toast holds.
+        prune_expired(
+            &mut toasts,
+            &mut flashes,
+            start + std::time::Duration::from_secs(1),
+        );
+        assert!(flashes.is_empty(), "a flash lasts a moment, not a second");
+        assert_eq!(toasts.len(), 1);
+
+        // Past three seconds: the toast expires too.
+        prune_expired(
+            &mut toasts,
+            &mut flashes,
+            start + std::time::Duration::from_secs(4),
+        );
+        assert!(toasts.is_empty(), "a toast is three seconds of wall time");
+    }
 
     /// Pins this matcher to the exact strings `command_type_str` in
     /// reeve-engine emits. If a variant is added or renamed there, this
