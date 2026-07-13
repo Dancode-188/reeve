@@ -1,0 +1,6 @@
+{
+  "description": "A conversation whose history carries a leaked API key. The scanner must stamp the span; the key is a placeholder substituted at load time so nothing credential-shaped sits in the repo.",
+  "steps": [
+    {"request": "req1.json", "response": {"kind": "json", "file": "resp1.json"}}
+  ]
+}

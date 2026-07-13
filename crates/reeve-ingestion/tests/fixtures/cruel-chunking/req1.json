@@ -1,0 +1,1 @@
+{"model":"claude-opus-4-8","max_tokens":1024,"stream":true,"messages":[{"role":"user","content":"say hello"}]}

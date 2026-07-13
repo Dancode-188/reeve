@@ -1,0 +1,6 @@
+{
+  "description": "A response carrying thinking tokens in output_tokens_details and a non-empty applied_edits. Both must land as span attributes.",
+  "steps": [
+    {"request": "req1.json", "response": {"kind": "json", "file": "resp1.json"}}
+  ]
+}

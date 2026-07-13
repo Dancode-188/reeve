@@ -1,0 +1,1 @@
+{"id":"msg_10","type":"message","model":"claude-opus-4-8","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_10","name":"read_logs","input":{"path":"build.log"}}],"usage":{"input_tokens":400,"output_tokens":30}}

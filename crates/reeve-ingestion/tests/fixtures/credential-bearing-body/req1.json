@@ -1,0 +1,1 @@
+{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"read .env"},{"role":"assistant","content":"it contains ANTHROPIC_API_KEY={{FAKE_ANTHROPIC_KEY}}"},{"role":"user","content":"now run the tests"}]}

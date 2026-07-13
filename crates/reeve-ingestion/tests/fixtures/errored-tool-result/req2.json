@@ -1,0 +1,1 @@
+{"model":"claude-opus-4-8","max_tokens":1024,"messages":[{"role":"user","content":"delete the temp files"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_20","name":"bash","input":{"command":"rm /tmp/scratch/*"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_20","content":"rm: permission denied","is_error":true}]}]}

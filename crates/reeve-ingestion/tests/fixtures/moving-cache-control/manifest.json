@@ -1,0 +1,7 @@
+{
+  "description": "Request 1 marks its last content block as a cache breakpoint; request 2 resends the same message WITHOUT the marker because the breakpoint moved to newly appended messages. Threading must hold one turn.",
+  "steps": [
+    {"request": "req1.json", "response": {"kind": "json", "file": "resp1.json"}},
+    {"request": "req2.json", "response": {"kind": "json", "file": "resp2.json"}}
+  ]
+}

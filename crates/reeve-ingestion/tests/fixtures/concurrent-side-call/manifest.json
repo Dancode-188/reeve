@@ -1,0 +1,8 @@
+{
+  "description": "A one-shot side call (fresh single-message conversation) lands while the main turn is open. It must get its own trace instead of stomping the main turn.",
+  "steps": [
+    {"request": "req1.json", "response": {"kind": "json", "file": "resp1.json"}},
+    {"request": "side.json", "response": {"kind": "json", "file": "side-resp.json"}},
+    {"request": "req2.json", "response": {"kind": "json", "file": "resp2.json"}}
+  ]
+}

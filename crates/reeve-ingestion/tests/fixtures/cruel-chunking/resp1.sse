@@ -1,0 +1,15 @@
+event: message_start
+data: {"type":"message_start","message":{"model":"claude-opus-4-8","usage":{"input_tokens":900,"cache_read_input_tokens":100,"cache_creation_input_tokens":0}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hel"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"lo"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
