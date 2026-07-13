@@ -185,6 +185,10 @@ so proxy agents show reduced capabilities rather than a pause that lies.
 Your API key passes through in memory only. It is never logged, never
 persisted, and never attached to any span; a test pins this.
 
+The full story, including budgets, secret scanning, and exactly which
+guarantee each intervention carries on this path, is in the
+[proxy path guide](docs/guides/proxy-path.md).
+
 ---
 
 ## A few things worth saying upfront
@@ -221,8 +225,8 @@ something is going wrong right now.
 | LangChain | SDK | Full | Yes | Yes |
 | Custom Python | SDK | Full | Yes | Yes |
 | Rust agents | SDK | Full | Yes | Yes |
-| OpenAI Agents SDK | SDK | Planned (v1.0.0) | — | — |
-| Claude Agent SDK | SDK | Planned (v1.0.0) | — | — |
+| OpenAI Agents SDK | SDK | Planned (v1.0.0) | n/a | n/a |
+| Claude Agent SDK | SDK | Planned (v1.0.0) | n/a | n/a |
 | Claude Code | Proxy | Full | No (by design) | Yes |
 | Any OTel agent | OTel | Full | No | No |
 
