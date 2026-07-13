@@ -47,6 +47,7 @@ record here: what was decided, why, and what alternatives were considered and re
 | [0040](./0040-loop-detection-by-dominance.md) | Loop Detection Judges Dominance, Not Volume | Accepted | 2026-07-11 |
 | [0041](./0041-a-streaming-trace-is-not-idle.md) | A Streaming Trace Is Not Idle | Accepted | 2026-07-11 |
 | [0042](./0042-per-agent-daily-budgets.md) | Per-Agent Daily Budgets Wire Cost to the Breaker | Accepted | 2026-07-12 |
+| [0043](./0043-outbound-secret-scanning.md) | Outbound Secret Scanning Warns First, Blocks by Consent | Accepted | 2026-07-13 |
 
 ## Format
 

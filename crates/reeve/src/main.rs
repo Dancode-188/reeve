@@ -138,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         disconnected_agents.clone(),
         proxy_interventions.clone(),
         privacy_tier >= 2,
+        reeve_engine::policy::config::load_secrets_block(&config_path),
     ));
     let reprobe_requested: reeve_engine::ReprobeRequested =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

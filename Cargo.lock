@@ -1654,6 +1654,7 @@ dependencies = [
  "opentelemetry-proto 0.32.0",
  "reeve-model",
  "reeve-storage",
+ "regex",
  "reqwest",
  "serde_json",
  "tokio",

@@ -187,6 +187,9 @@ fn span_detail_height(state: &AppState) -> u16 {
             if span.raw_attributes.contains_key("reeve.context.edit_types") {
                 h += 1; // compacted
             }
+            if span.raw_attributes.contains_key("reeve.secret.kinds") {
+                h += 1; // secret!
+            }
             h + 1 // divider
         }
     }
@@ -585,6 +588,17 @@ fn render_span_detail(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     theme.subtext(),
                     theme,
                 ));
+            }
+
+            // This request carried a newly detected outbound secret.
+            // Crit-colored: of everything the panel shows, this is the
+            // row that most needs to interrupt the operator.
+            if let Some(kinds) = span
+                .raw_attributes
+                .get("reeve.secret.kinds")
+                .and_then(|v| v.as_str())
+            {
+                lines.push(field_line("secret!", kinds, theme.health_crit(), theme));
             }
 
             // The API edited the conversation on this round trip: the

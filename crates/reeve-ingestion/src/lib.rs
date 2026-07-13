@@ -4,6 +4,7 @@ pub mod pricing;
 pub mod proxy;
 pub mod receive;
 pub mod route;
+pub mod secrets;
 pub mod sse;
 pub mod threading;
 
@@ -29,6 +30,7 @@ pub async fn serve(
     disconnected: assemble::DisconnectedAgents,
     proxy_interventions: reeve_model::entity::ProxyInterventions,
     capture_content: bool,
+    secrets_block: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let hot = Arc::new(Mutex::new(HotStore::new(10_000)));
 
@@ -67,6 +69,7 @@ pub async fn serve(
             proxy_interventions,
             proxy_active_streams,
             proxy_open_turns,
+            secrets_block,
         )
         .await
         {
