@@ -93,7 +93,12 @@ pub async fn run(
     reprobe_requested: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), RendererError> {
     enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        crossterm::event::EnableFocusChange
+    )?;
     // Save the terminal title (XTWINOPS 22) so exit can restore whatever
     // the shell had; SetTitle below overwrites it while Reeve runs.
     print!("\x1b[22;0t");
@@ -110,12 +115,36 @@ pub async fn run(
     .await;
 
     let _ = disable_raw_mode();
-    let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let _ = execute!(
+        std::io::stdout(),
+        crossterm::event::DisableFocusChange,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
     print!("\x1b[23;0t");
     use std::io::Write;
     let _ = std::io::stdout().flush();
 
     result
+}
+
+/// Whether anything on screen is worth full-rate rendering: an agent
+/// mid-work, a live stream, a playing replay, an animating overlay, or
+/// a toast or flash still fading. Everything here either moves on its
+/// own or counts down; a cockpit showing none of it can amble.
+fn ui_is_active(app: &app::App) -> bool {
+    let s = &app.state;
+    s.agents.is_empty() // the startup skeleton pulses
+        || s.agents.values().any(|a| {
+            matches!(a.agent.status, reeve_model::entity::AgentStatus::Running)
+        })
+        || !s.streaming.active.is_empty()
+        || s.replay.as_ref().is_some_and(|r| r.playing)
+        || s.overlay.is_some()
+        || s.pending_confirmation.is_some()
+        || s.note_input.is_some()
+        || !s.toasts.is_empty()
+        || !s.flash_targets.is_empty()
 }
 
 async fn run_inner(
@@ -142,8 +171,19 @@ async fn run_inner(
         input::run(event_tx).await;
     });
 
-    // 15fps: live enough to feel responsive, low enough to not burn CPU on a monitoring tool.
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(66));
+    // The render cadence adapts to what is worth rendering: the full
+    // 15fps while something moves, a 5fps amble when every agent is
+    // idle, and 1fps while the terminal is unfocused. A monitoring tool
+    // nobody is looking at should cost approximately nothing. Timers
+    // (toasts, flashes, replay, blink) are all wall-clock, so changing
+    // cadence changes smoothness and never timing.
+    const ACTIVE_TICK: std::time::Duration = std::time::Duration::from_millis(66);
+    const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(200);
+    const UNFOCUSED_TICK: std::time::Duration = std::time::Duration::from_millis(1000);
+    let mut tick_period = ACTIVE_TICK;
+    let mut interval = tokio::time::interval(tick_period);
+    let ui_started = std::time::Instant::now();
+    let mut last_tick = std::time::Instant::now();
     let mut mouse_captured = true;
     let mut last_title = String::new();
 
@@ -173,14 +213,36 @@ async fn run_inner(
                     }
                 }
 
+                // Blink phase derives from wall time, not a counter, so
+                // the blink period stays constant at any frame rate.
                 app.state.streaming.cursor_tick =
-                    app.state.streaming.cursor_tick.wrapping_add(1);
+                    ((ui_started.elapsed().as_millis() / 66) % 256) as u8;
                 app.state.advance_flash();
                 app.sync_pause_status();
                 app.sync_killed_status();
                 app.check_auto_confirm().await;
-                // 66ms of wall time per tick, matching the render interval.
-                app.advance_replay(66.0);
+                // The replay clock advances by measured wall time; at a
+                // slower cadence it advances further per tick, keeping
+                // playback speed honest.
+                let elapsed_ms = last_tick.elapsed().as_secs_f64() * 1e3;
+                last_tick = std::time::Instant::now();
+                app.advance_replay(elapsed_ms);
+
+                // Re-aim the cadence when the situation changed.
+                let target = if !app.state.focused {
+                    UNFOCUSED_TICK
+                } else if ui_is_active(&app) {
+                    ACTIVE_TICK
+                } else {
+                    IDLE_TICK
+                };
+                if target != tick_period {
+                    tick_period = target;
+                    interval = tokio::time::interval_at(
+                        tokio::time::Instant::now() + target,
+                        target,
+                    );
+                }
 
                 // Apply a theme chosen via the palette or T. pending_theme
                 // stays set so T keeps cycling from the current position.
@@ -332,6 +394,15 @@ async fn run_inner(
             }
             event = event_rx.recv() => {
                 match event {
+                    Some(crossterm::event::Event::FocusGained) => {
+                        app.state.focused = true;
+                        // Wake the render loop now: the first frame after
+                        // refocusing must not wait out an unfocused tick.
+                        interval.reset_immediately();
+                    }
+                    Some(crossterm::event::Event::FocusLost) => {
+                        app.state.focused = false;
+                    }
                     Some(crossterm::event::Event::Mouse(mouse)) => {
                         // Hit-testing needs the same layout the draw used;
                         // recompute it from the terminal size, which is
@@ -377,6 +448,8 @@ async fn run_inner(
                                 _ => mouse::MouseTarget::None,
                             };
                             app.apply_mouse_target(target).await;
+                            // Draw the consequence now, not a slow tick later.
+                            interval.reset_immediately();
                         }
                     }
                     Some(event) => {
@@ -384,6 +457,8 @@ async fn run_inner(
                         // depends on whether a text input is active right now.
                         if let Some(action) = input::map_event(event, app.text_input_active()) {
                             app.handle_action(action).await;
+                            // Draw the consequence now, not a slow tick later.
+                            interval.reset_immediately();
                         }
                         if app.should_quit {
                             break;
