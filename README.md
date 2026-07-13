@@ -4,10 +4,9 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange.svg)](https://www.rust-lang.org)
 
-<!-- Demo GIF goes here before v1.0.0 ships.
-     Record: agent connects, trace tree grows in real time, streaming
-     cursor appears, health score drops, policy fires, redirect sent,
-     quality recovers. Eight seconds. That clip is the whole pitch.    -->
+![Reeve catching a research agent that gets stuck in a loop, live through the proxy](docs/assets/demo.gif)
+
+<!-- Rough cut; a polished recording replaces it before v1.0.0. -->
 
 ---
 
@@ -34,32 +33,10 @@ Reeve is for that moment.
 
 ---
 
-```
-┌─ REEVE v0.5.0 ──────────────────────── ● research-bot  ◆72 CAUTION  $0.047 ──┐
-│ AGENTS          │ TRACE ── task-0047 ── 12.4s                   │ SPAN DETAIL│
-│                 │                                               │            │
-│ ● research-bot  │ ▾ agent.execute  ◷ 12.4s  ●                   │ gen_ai.chat│
-│   ◆72  $0.047   │ │                                             │ ✓ completed│
-│                 │ ├─▾ gen_ai.chat  ◷ 2.1s  ✓  [★0.89]  ♦        │            │
-│ ○ code-reviewer │ │   └─ gen_ai.tool:web_search  ◷ 0.8s  ✓      │dur  2,104ms│
-│   idle          │ │      ↳ redirect +0.58 quality · 4 spans     │ cost $0.003│
-│                 │ └─▾ gen_ai.chat  ●  [STREAMING]               │ ctx  ████ ⚠│
-│ HEALTH          │     sonnet-4 · 1,089↑  ctx 78% ⚠              │78% of limit│
-│ ███████░░  72   │     ┌─────────────────────────────────┐       │            │
-│ CAUTION         │     │ The renewable energy sector has │       │ QUALITY    │
-│ ⋯ hallu scoring │     │ seen remarkable growth. Solar   │       │ faith ██.89│
-│                 │     │ and wind capacity expanding▌    │       │ tools ██.94│
-│ COST            │     └─────────────────────────────────┘       │ hallu ⋯ ...│
-│ $0.047 today    │                                               │            │
-│ ▁▂▃▄▅▆▇  ↑      │                                               │SCORE   ██72│
-│ predicted $0.11 │                                               │ 2/3 metrics│
-└─────────────────┴───────────────────────────────────────────────┴────────────┘
- [j/k] nav  [i] intervene  [p] pause/resume  [?] help  [q] quit
-```
-
 The trace tree grows as spans arrive. The LLM response appears token by token with
-a blinking cursor. The health score tells you whether the agent is doing well. Press
-`i` to intervene.
+a blinking cursor. The health score tells you whether the agent is doing well: in the
+clip above it holds green through a real research turn, then craters when the agent
+gets stuck repeating one search and the loop rule fires. Press `i` to intervene.
 
 ---
 
