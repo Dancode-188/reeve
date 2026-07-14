@@ -16,6 +16,9 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from .proto import reeve_pb2, reeve_pb2_grpc
 
 
+from . import __version__  # noqa: E402  (single version source)
+
+
 class AgentKilled(Exception):
     """Raised by checkpoint() when Reeve sends a Kill command."""
 
@@ -92,7 +95,7 @@ class ReeveSdk:
                 handshake=reeve_pb2.AgentHandshake(
                     agent_id=f"{agent_name}:{instance_id}",
                     framework=framework,
-                    sdk_version="0.1.0",
+                    sdk_version=__version__,
                     capabilities=capabilities
                     or ["pause", "redirect", "inject_context", "kill"],
                     t1_ms=t1_ms,

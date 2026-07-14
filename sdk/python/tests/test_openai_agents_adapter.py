@@ -11,7 +11,7 @@ pytest.importorskip("agents")
 from opentelemetry import trace as otel_trace
 
 from agents.run_context import RunContextWrapper
-from reeve.adapters.openai_agents import ReeveHooks
+from reeve_sdk.adapters.openai_agents import ReeveHooks
 
 from tests._otel import EXPORTER as _EXPORTER
 

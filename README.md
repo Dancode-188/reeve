@@ -43,7 +43,7 @@ gets stuck repeating one search and the loop rule fires. Press `i` to intervene.
 ## Quick start
 
 ```bash
-cargo install --git https://github.com/Dancode-188/reeve reeve
+cargo install --git https://github.com/Dancode-188/reeve reeve-cockpit
 reeve
 ```
 
@@ -94,8 +94,8 @@ changed against where the trend was heading.
 
 **LangChain**
 ```python
-from reeve import ReeveSdk
-from reeve.adapters.langchain import ReeveCallbacks
+from reeve_sdk import ReeveSdk
+from reeve_sdk.adapters.langchain import ReeveCallbacks
 
 sdk = await ReeveSdk.connect("research-bot")
 agent = create_agent(llm=llm, tools=tools, callbacks=[ReeveCallbacks(sdk)])
@@ -103,7 +103,7 @@ agent = create_agent(llm=llm, tools=tools, callbacks=[ReeveCallbacks(sdk)])
 
 **Custom Python**
 ```python
-from reeve import CheckpointResult, ReeveSdk
+from reeve_sdk import CheckpointResult, ReeveSdk
 
 sdk = await ReeveSdk.connect("my-agent")
 
@@ -221,7 +221,7 @@ cargo build --release
 
 Or straight from the repository:
 ```bash
-cargo install --git https://github.com/Dancode-188/reeve reeve
+cargo install --git https://github.com/Dancode-188/reeve reeve-cockpit
 ```
 
 Requires Rust 1.78+. Linux and macOS. On Windows, Windows Terminal works fine. Use
