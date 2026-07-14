@@ -10,6 +10,14 @@ use tokio::sync::broadcast;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `reeve env` prints connection exports and exits: the second
+    // terminal becomes `eval "$(reeve env)"`. Stdout carries only the
+    // export lines, because the output exists to be executed.
+    if std::env::args().nth(1).as_deref() == Some("env") {
+        print!("{}", env_exports());
+        return Ok(());
+    }
+
     let ascii_mode = std::env::args().any(|a| a == "--ascii");
 
     let db_path = std::env::var("REEVE_DB")
@@ -275,4 +283,31 @@ fn check_ports_available(ports: &[(u16, &str)]) -> Result<(), reeve_renderer::ap
         }
     }
     Ok(())
+}
+
+/// The exports `reeve env` prints: proxy for tools that speak the
+/// Anthropic API, OTel endpoint for SDK agents. Both paths in one
+/// eval, since the caller's integration is not ours to guess.
+fn env_exports() -> String {
+    "export ANTHROPIC_BASE_URL=http://localhost:4318\n\
+     export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317\n"
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_output_is_pure_eval_food() {
+        let out = env_exports();
+        // Every line is an export and nothing else: the output gets
+        // executed by eval, so a banner here would run as a command.
+        assert!(out.lines().count() >= 2);
+        for line in out.lines() {
+            assert!(line.starts_with("export "), "not an export: {line}");
+        }
+        assert!(out.contains("ANTHROPIC_BASE_URL=http://localhost:4318"));
+        assert!(out.contains("OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317"));
+    }
 }
