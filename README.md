@@ -48,9 +48,10 @@ reeve
 ```
 
 Reeve listens on `:4317` for OTel spans and `:4316` for the control channel.
-Connect your agent and it shows up. If Ollama is running with phi4-mini
-available, quality scoring starts immediately at zero cost. No account, no API
-key, no setup wizard.
+In a second terminal, `eval "$(reeve env)"` sets the exports your agent needs,
+then launch it and it shows up. If Ollama is running with phi4-mini available,
+quality scoring starts immediately at zero cost. No account, no API key, no
+setup wizard.
 
 ---
 
