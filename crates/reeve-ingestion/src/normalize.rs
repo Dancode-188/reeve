@@ -114,6 +114,34 @@ impl AttributeTranslator for V1AttributeTranslator {
             }
         }
 
+        // SDK spans arrive with model and token counts but no cost:
+        // unlike the proxy, adapters do not carry a price table, and
+        // they should not, or every adapter drifts separately. Price
+        // here so the assembler's cost accumulator sees SDK and proxy
+        // spans alike; a span that already priced itself is left alone.
+        if !known.contains_key("gen_ai.usage.cost") {
+            let tok = |k: &str| known.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            let input = tok("gen_ai.usage.input_tokens");
+            let output = tok("gen_ai.usage.output_tokens");
+            if input > 0 || output > 0 {
+                if let Some(cost) = known
+                    .get("gen_ai.request.model")
+                    .and_then(|v| v.as_str())
+                    .and_then(|model| {
+                        crate::pricing::estimate(
+                            model,
+                            input,
+                            output,
+                            tok("gen_ai.usage.cache_read_tokens"),
+                            tok("gen_ai.usage.cache_creation_tokens"),
+                        )
+                    })
+                {
+                    known.insert("gen_ai.usage.cost".to_string(), cost.into());
+                }
+            }
+        }
+
         let internal_span = InternalSpan {
             id: span_id.clone().into(),
             trace_id: trace_id.clone().into(),
@@ -303,6 +331,60 @@ mod tests {
             }),
             key_strindex: 0,
         }
+    }
+
+    #[test]
+    fn sdk_spans_price_from_model_and_tokens() {
+        let translator = V1AttributeTranslator::new(false);
+        let span = OtlpSpan {
+            span_id: vec![1u8; 8],
+            trace_id: vec![2u8; 16],
+            end_time_unix_nano: 2_000_000_000,
+            start_time_unix_nano: 1_000_000_000,
+            attributes: vec![
+                string_kv("gen_ai.request.model", "gpt-5.4-mini"),
+                int_kv("gen_ai.usage.input_tokens", 1_000_000),
+                int_kv("gen_ai.usage.output_tokens", 1_000_000),
+            ],
+            ..Default::default()
+        };
+        let (internal, _, _) = translator.translate(make_pipeline_span(span));
+        // 0.75 + 4.50 per MTok: normalize stamped the cost the adapter
+        // could not, so the assembler's accumulator sees it.
+        assert_eq!(
+            internal.attributes["gen_ai.usage.cost"],
+            serde_json::json!(5.25)
+        );
+    }
+
+    #[test]
+    fn a_span_that_priced_itself_is_left_alone() {
+        let translator = V1AttributeTranslator::new(false);
+        let mut attributes = vec![
+            string_kv("gen_ai.request.model", "gpt-5.4-mini"),
+            int_kv("gen_ai.usage.input_tokens", 1_000_000),
+        ];
+        attributes.push(KeyValue {
+            key: "gen_ai.usage.cost".to_string(),
+            value: Some(AnyValue {
+                value: Some(OtlpValue::DoubleValue(0.123)),
+            }),
+            key_strindex: 0,
+        });
+        let span = OtlpSpan {
+            span_id: vec![1u8; 8],
+            trace_id: vec![2u8; 16],
+            end_time_unix_nano: 2_000_000_000,
+            start_time_unix_nano: 1_000_000_000,
+            attributes,
+            ..Default::default()
+        };
+        let (internal, _, _) = translator.translate(make_pipeline_span(span));
+        assert_eq!(
+            internal.attributes["gen_ai.usage.cost"],
+            serde_json::json!(0.123),
+            "an agent's own cost figure wins over the estimate"
+        );
     }
 
     #[test]
