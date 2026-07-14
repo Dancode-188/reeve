@@ -5,8 +5,8 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from reeve.sdk import AgentKilled, CheckpointResult, ReeveSdk
-from reeve.proto import reeve_pb2
+from reeve_sdk.sdk import AgentKilled, CheckpointResult, ReeveSdk
+from reeve_sdk.proto import reeve_pb2
 
 
 def _sdk_with_pending(cmd_type: int, payload: str = "") -> ReeveSdk:

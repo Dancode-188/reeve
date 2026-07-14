@@ -1,7 +1,13 @@
 [package]
-name = "reeve"
+# The crates.io name; `reeve` there is an unrelated earlier project.
+# The installed binary keeps the real name via [[bin]] below.
+name = "reeve-cockpit"
 version = "0.6.0"
 edition = "2024"
+
+[[bin]]
+name = "reeve"
+path = "src/main.rs"
 
 [dependencies]
 reeve-ingestion = { path = "../reeve-ingestion" }

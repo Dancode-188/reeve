@@ -19,8 +19,8 @@ from claude_agent_sdk import (
 )
 from opentelemetry import trace as otel_trace
 
-from reeve.adapters.claude_agent import ReeveClaudeClient
-from reeve.sdk import AgentKilled, CheckpointResult
+from reeve_sdk.adapters.claude_agent import ReeveClaudeClient
+from reeve_sdk.sdk import AgentKilled, CheckpointResult
 
 from tests._otel import EXPORTER as _EXPORTER
 

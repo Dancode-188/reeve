@@ -1613,7 +1613,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "reeve"
+name = "reeve-cockpit"
 version = "0.6.0"
 dependencies = [
  "reeve-engine",
