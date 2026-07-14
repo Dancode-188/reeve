@@ -9,19 +9,11 @@ import pytest
 pytest.importorskip("agents")
 
 from opentelemetry import trace as otel_trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-    InMemorySpanExporter,
-)
 
 from agents.run_context import RunContextWrapper
 from reeve.adapters.openai_agents import ReeveHooks
 
-_EXPORTER = InMemorySpanExporter()
-_PROVIDER = TracerProvider()
-_PROVIDER.add_span_processor(SimpleSpanProcessor(_EXPORTER))
-otel_trace.set_tracer_provider(_PROVIDER)
+from tests._otel import EXPORTER as _EXPORTER
 
 
 class RecordingSdk:
@@ -36,12 +28,6 @@ class RecordingSdk:
 
 def make_run():
     return RunContextWrapper(context=None)
-
-
-@pytest.fixture(autouse=True)
-def clear_spans():
-    _EXPORTER.clear()
-    yield
 
 
 @pytest.mark.asyncio

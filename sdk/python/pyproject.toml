@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 langchain = ["langchain-core>=0.1"]
 openai-agents = ["openai-agents>=0.1"]
+claude-agent = ["claude-agent-sdk>=0.2"]
 
 [project.urls]
 Homepage = "https://github.com/Dancode-188/reeve"
