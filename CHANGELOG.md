@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-14
+
+Reeve stops being only a window on the proxy path and becomes a guard.
+The proxy already sees every token an agent sends and every dollar it
+spends; this release acts on that.
+
+### Added
+
+- Per-agent daily spend budgets in `config.toml`: a `default_daily` cap
+  and `per_agent` overrides, tracked against the local calendar day. At
+  80 percent of the cap the cockpit warns; at the cap, on settled or
+  predicted spend, the budget fires a kill through the existing
+  policy-to-dispatcher path. On the proxy path that engages the circuit
+  breaker, so the cap is a hard ceiling; a zero cap reads as unbudgeted.
+  The COST section grows a budget bar. Predicted spend triggers the stop
+  so it lands before the money is gone (ADR-0042).
+- Outbound secret scanning at the proxy: request bodies are scanned in
+  memory for provider key prefixes, private key headers, JWTs, and
+  credential-named high-entropy assignments before they leave the
+  machine. Findings warn through ALERTS with a redacted hint, stamp the
+  span, and speak once per secret rather than once per replayed request.
+  Blocking is opt-in via `[secrets] block = true` and refuses any request
+  carrying a finding. Warn-first is the default; the config fails closed
+  to warn-only. Only the kind, a redacted hint, and a hash survive a
+  finding (ADR-0043).
+- Killed agents are visible and revivable: a killed proxy agent shows
+  `killed` in the fleet with its last cost instead of reading idle, and a
+  Resume against it clears the breaker, the one recovery short of
+  restarting Reeve. The intervention overlay offers Revive where Kill
+  stood (ADR-0039 addendum).
+- Thinking-token visibility: the reasoning tokens the API reports inside
+  `output_tokens` now surface as a `thinking` row in SPAN DETAIL with
+  their share of the output, and as a session-wide THINKING line in the
+  cost view. No pricing change; thinking tokens were always billed as
+  output.
+- Context compaction is surfaced: when the API applies a context edit,
+  the span that carried it is marked `compacted` in SPAN DETAIL and an
+  ALERTS notice names what was cleared, so the new trace that follows
+  reads as a deliberate compaction rather than a mystery.
+- A fixture corpus of recorded wire shapes replayed through the real
+  proxy in CI: the moving `cache_control` marker, a concurrent side
+  call, one-byte SSE chunking, an errored tool result, thinking and
+  compaction fields, and a credential-bearing body. Each reproduces a
+  shape that broke something once.
+- Demo GIF at the top of the README, replacing the ASCII mockup.
+- A proxy-path guide at `docs/guides/proxy-path.md`.
+
+### Changed
+
+- Loop detection counts tool inputs, not just tool names: dominance is
+  now judged over `(operation, input fingerprint)` pairs, so eight reads
+  of eight different files score as exploration while eight reads of one
+  file score as a loop. The input is hashed in memory and only the
+  fingerprint is stored (ADR-0040 addendum).
+- The render cadence adapts to activity: 15fps while something moves,
+  5fps when every agent is idle, 1fps while the terminal is unfocused.
+  Toast, flash, blink, and replay timing moved to wall-clock deadlines
+  so the cadence can change without stretching any of them (#152).
+
+### Fixed
+
+- Redirect and inject-context messages are reworded to steer rather than
+  correct: an agent answered an earlier redirect with "I did this in
+  error" and treated good work as wrong, because "disregard the current
+  approach" reads as a correction. The message now states that a human
+  operator changed the priorities and prior work is not in question.
+
 ## [0.5.0] - 2026-07-12
 
 ### Added
@@ -344,6 +411,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI: fmt check, clippy with `-D warnings`, tests, release build.
 - Issue templates, PR template, CONTRIBUTING.md, ROADMAP.md.
 
+[0.6.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.6.0
 [0.5.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.3.0
