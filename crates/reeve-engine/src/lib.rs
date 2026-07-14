@@ -392,24 +392,20 @@ pub async fn run(
                     _ => continue,
                 };
 
-                let input_tokens = span
+                // The pipeline already priced every priceable span (the
+                // proxy for its own traffic, normalize for SDK spans), so
+                // prediction accumulates the stamped cost instead of
+                // re-deriving it from tokens. The engine keeping its own
+                // price table meant two tables for one quantity, and the
+                // engine's had drifted: predictive stops silently never
+                // fired for model families only the pipeline knew.
+                let span_cost = span
                     .attributes
-                    .get("gen_ai.usage.input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let output_tokens = span
-                    .attributes
-                    .get("gen_ai.usage.output_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let model = span
-                    .attributes
-                    .get("gen_ai.request.model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let span_cost = span_cost_usd(input_tokens, output_tokens, model);
+                    .get("gen_ai.usage.cost")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
 
-                if span_cost == 0.0 {
+                if span_cost <= 0.0 {
                     continue;
                 }
 
@@ -703,36 +699,6 @@ struct CostAccumulator {
     samples: VecDeque<(f64, i64)>,
 }
 
-/// Approximate cost in USD for a single LLM span. Returns 0.0 for local or
-/// unrecognised models. Used for prediction only, not billing.
-///
-/// USD per 1M tokens. Check more specific prefixes before broader ones.
-fn span_cost_usd(input_tokens: u64, output_tokens: u64, model: &str) -> f64 {
-    let (input_rate, output_rate): (f64, f64) = if model.starts_with("claude-opus") {
-        (15.0, 75.0)
-    } else if model.starts_with("claude-sonnet") || model.starts_with("claude-fable") {
-        (3.0, 15.0)
-    } else if model.starts_with("claude-haiku") {
-        (0.8, 4.0)
-    } else if model.starts_with("gpt-4.1") {
-        (2.0, 8.0)
-    } else if model.starts_with("gpt-4o-mini") {
-        (0.15, 0.60)
-    } else if model.starts_with("gpt-4o") {
-        (2.5, 10.0)
-    } else if model.contains("flash") {
-        (0.075, 0.30)
-    } else if model.starts_with("gemini-2.5")
-        || model.starts_with("gemini-2.0")
-        || model.starts_with("gemini-1.5")
-    {
-        (1.0, 4.0)
-    } else {
-        return 0.0;
-    };
-    (input_tokens as f64 * input_rate + output_tokens as f64 * output_rate) / 1_000_000.0
-}
-
 fn tier2_sample_rate(history: &VecDeque<f64>) -> f64 {
     let latest = match history.back() {
         Some(&s) => s,
@@ -898,38 +864,5 @@ mod tests {
     fn single_entry_history_is_stable() {
         let h = history(&[85.0]);
         assert!(is_score_stable(&h));
-    }
-
-    #[test]
-    fn claude_sonnet_costs_are_nonzero() {
-        let cost = span_cost_usd(1_000_000, 100_000, "claude-sonnet-4-6");
-        assert!(cost > 0.0);
-        assert!((cost - (3.0 + 15.0 * 0.1)).abs() < 0.001);
-    }
-
-    #[test]
-    fn gpt4o_mini_does_not_match_gpt4o_rate() {
-        let mini = span_cost_usd(1_000_000, 0, "gpt-4o-mini");
-        let full = span_cost_usd(1_000_000, 0, "gpt-4o");
-        assert!(mini < full);
-        assert!((mini - 0.15).abs() < 0.001);
-        assert!((full - 2.5).abs() < 0.001);
-    }
-
-    #[test]
-    fn gemini_flash_matches_flash_rate() {
-        let flash = span_cost_usd(1_000_000, 0, "gemini-2.0-flash");
-        assert!((flash - 0.075).abs() < 0.001);
-    }
-
-    #[test]
-    fn local_model_returns_zero() {
-        assert_eq!(span_cost_usd(100_000, 50_000, "phi4-mini"), 0.0);
-        assert_eq!(span_cost_usd(100_000, 50_000, "llama3.1"), 0.0);
-    }
-
-    #[test]
-    fn unknown_model_returns_zero() {
-        assert_eq!(span_cost_usd(100_000, 50_000, "my-custom-model"), 0.0);
     }
 }
