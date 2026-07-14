@@ -73,7 +73,13 @@ class ReeveSdk:
                 }
             )
         )
-        provider.add_span_processor(BatchSpanProcessor(exporter))
+        # A 1s flush instead of the OTel default 5s: an agent appears in
+        # the cockpit on its first exported span, and five invisible
+        # seconds is most of a short run, long enough that there is no
+        # agent to intervene on yet.
+        provider.add_span_processor(
+            BatchSpanProcessor(exporter, schedule_delay_millis=1000)
+        )
         otel_trace.set_tracer_provider(provider)
         sdk._tracer = otel_trace.get_tracer("reeve-sdk")
 

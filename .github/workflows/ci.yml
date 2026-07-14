@@ -28,5 +28,5 @@ jobs:
       - name: Python SDK tests
         working-directory: sdk/python
         run: |
-          pip install grpcio opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc protobuf pytest pytest-asyncio
+          pip install grpcio opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc protobuf pytest pytest-asyncio openai-agents
           pytest
