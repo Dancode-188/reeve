@@ -33,6 +33,10 @@ const PRICES: &[(&str, f64, f64)] = &[
     ("gpt-4.1", 2.0, 8.0),
     ("gpt-4o-mini", 0.15, 0.60),
     ("gpt-4o", 2.5, 10.0),
+    // Gemini, carried over when the engine's second price table was
+    // deleted so prediction coverage did not shrink.
+    ("flash", 0.075, 0.30),
+    ("gemini", 1.0, 4.0),
 ];
 
 /// Cache reads bill at one tenth of the input rate.
@@ -105,6 +109,9 @@ mod tests {
         assert_eq!(estimate("gpt-5-nano", m, m, 0, 0), Some(0.45));
         assert_eq!(estimate("gpt-5-2025-08-07", m, m, 0, 0), Some(11.25));
         assert_eq!(estimate("gpt-4o-mini", m, m, 0, 0), Some(0.75));
+        // flash must outrank generic gemini.
+        assert_eq!(estimate("gemini-2.0-flash", m, m, 0, 0), Some(0.375));
+        assert_eq!(estimate("gemini-2.5-pro", m, m, 0, 0), Some(5.0));
     }
 
     #[test]
