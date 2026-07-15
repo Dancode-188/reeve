@@ -148,6 +148,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         privacy_tier >= 2,
         reeve_engine::policy::config::load_secrets_block(&config_path),
     ));
+    // Retention: completed traces older than the configured age are
+    // pruned on startup and then hourly, through the same atomic delete
+    // path the History view uses. Zero days disables pruning entirely.
+    let retention_days = reeve_engine::policy::config::load_retention_days(&config_path);
+    if retention_days > 0 {
+        let warm_for_retention = warm.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                let cutoff_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64
+                    - i64::from(retention_days) * 86_400_000;
+                match warm_for_retention.prune_completed_before(cutoff_ms).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(pruned = n, retention_days, "retention pruned traces"),
+                    Err(e) => tracing::warn!(error = %e, "retention prune failed"),
+                }
+            }
+        });
+    }
+
     let reprobe_requested: reeve_engine::ReprobeRequested =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     tokio::spawn(reeve_engine::run(

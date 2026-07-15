@@ -12,11 +12,17 @@ struct ConfigFile {
     notifications: Option<NotificationsSection>,
     budgets: Option<BudgetsSection>,
     secrets: Option<SecretsSection>,
+    retention: Option<RetentionSection>,
 }
 
 #[derive(Deserialize)]
 struct SecretsSection {
     block: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct RetentionSection {
+    max_trace_age_days: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +89,22 @@ pub fn load_secrets_block(path: &Path) -> bool {
         .ok()
         .and_then(|c| c.secrets.and_then(|s| s.block))
         .unwrap_or(false)
+}
+
+/// How many days of completed traces the warm store keeps. Default 30:
+/// a stranger who never reads the config should not discover an
+/// unbounded database months in. Zero means keep forever, and a
+/// missing or unparseable file gets the default rather than surprise
+/// deletion of nothing or everything.
+pub fn load_retention_days(path: &Path) -> u32 {
+    const DEFAULT_DAYS: u32 = 30;
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return DEFAULT_DAYS;
+    };
+    toml::from_str::<ConfigFile>(&text)
+        .ok()
+        .and_then(|c| c.retention.and_then(|r| r.max_trace_age_days))
+        .unwrap_or(DEFAULT_DAYS)
 }
 
 #[derive(Deserialize)]
@@ -352,6 +374,19 @@ scope = "agent:my-agent-id"
             !load_secrets_block(f.path()),
             "unparseable config must never surprise-block"
         );
+    }
+
+    #[test]
+    fn retention_defaults_to_thirty_and_zero_disables() {
+        assert_eq!(load_retention_days(Path::new("/nonexistent")), 30);
+        let f = write_temp("privacy_tier = 1");
+        assert_eq!(load_retention_days(f.path()), 30, "absent section defaults");
+        let f = write_temp("[retention]\nmax_trace_age_days = 7");
+        assert_eq!(load_retention_days(f.path()), 7);
+        let f = write_temp("[retention]\nmax_trace_age_days = 0");
+        assert_eq!(load_retention_days(f.path()), 0, "zero is keep-forever");
+        let f = write_temp("not [ valid");
+        assert_eq!(load_retention_days(f.path()), 30, "unparseable defaults");
     }
 
     #[test]

@@ -587,6 +587,44 @@ impl WarmStore {
         .await
     }
 
+    /// Deletes traces whose completion is older than the cutoff, spans,
+    /// events, and notes included, in one transaction. Retention only:
+    /// running traces (completed_at NULL) and everything the audit
+    /// trail records (interventions, outcomes) are untouched, because
+    /// the record of what the operator and the policies did is
+    /// permanent while the telemetry it acted on is not. Returns how
+    /// many traces went.
+    pub async fn prune_completed_before(&self, cutoff_ms: i64) -> Result<usize, StorageError> {
+        // Traces that were intervened on are exempt: the permanent
+        // record (commands, outcomes) keeps its anchor, and the bundled
+        // SQLite enforces the foreign keys that would otherwise refuse
+        // the delete. The soaked database taught this, not the unit
+        // test: real data had commands where test data had none.
+        const PRUNABLE: &str = "SELECT id FROM traces
+             WHERE completed_at IS NOT NULL AND completed_at < ?1
+               AND id NOT IN (SELECT trace_id FROM intervention_commands)";
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            for sql in [
+                "DELETE FROM span_events WHERE span_id IN
+                     (SELECT id FROM spans WHERE trace_id IN ({P}))",
+                "DELETE FROM span_notes WHERE span_id IN
+                     (SELECT id FROM spans WHERE trace_id IN ({P}))",
+                "DELETE FROM replay_records WHERE trace_id IN ({P})",
+                "DELETE FROM spans WHERE trace_id IN ({P})",
+            ] {
+                tx.execute(&sql.replace("{P}", PRUNABLE), params![cutoff_ms])?;
+            }
+            let pruned = tx.execute(
+                &format!("DELETE FROM traces WHERE id IN ({PRUNABLE})"),
+                params![cutoff_ms],
+            )?;
+            tx.commit()?;
+            Ok(pruned)
+        })
+        .await
+    }
+
     /// Saves one finalized trace, its spans, and its span events in a
     /// single transaction. Route saved each piece as its own implicit
     /// transaction, which meant one fsync per statement and a write
@@ -1632,6 +1670,85 @@ mod tests {
         // belongs to the NEXT window, so tiles cannot double-count.
         let none = store.agent_spend_between(5_000, 10_000).await.unwrap();
         assert!(none.is_empty(), "upper bound is exclusive");
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_recent_running_and_the_permanent_record() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        // Old completed: goes. Recent completed: stays. Running
+        // (completed_at NULL): stays no matter how old its start is.
+        let mut old = trace("t-old");
+        old.end_time = Some(1_000);
+        store.save_trace(old).await.unwrap();
+        store.save_span(span("s-old", "t-old")).await.unwrap();
+        store
+            .save_span_events(vec![SpanEvent {
+                id: "e-old".into(),
+                span_id: "s-old".into(),
+                event_type: EventType::AssistantMessage,
+                occurred_at: 900,
+                content: None,
+            }])
+            .await
+            .unwrap();
+        let mut recent = trace("t-recent");
+        recent.end_time = Some(9_000);
+        store.save_trace(recent).await.unwrap();
+        store.save_span(span("s-recent", "t-recent")).await.unwrap();
+        store.save_trace(trace("t-running")).await.unwrap();
+
+        // An old completed trace that was intervened on: exempt, the
+        // permanent record keeps its anchor.
+        let mut touched = trace("t-touched");
+        touched.end_time = Some(1_000);
+        store.save_trace(touched).await.unwrap();
+        store
+            .save_intervention_command(InterventionCommand {
+                id: "cmd-1".into(),
+                trace_id: "t-touched".into(),
+                span_id: None,
+                policy_id: None,
+                command_type: CommandType::Kill,
+                status: CommandStatus::Applied,
+                requires_confirmation: false,
+                issued_at: 900,
+                acknowledged_at: Some(950),
+                issued_by: "human".to_string(),
+                valid_until_ms: 2_000,
+            })
+            .await
+            .unwrap();
+
+        let pruned = store.prune_completed_before(5_000).await.unwrap();
+        assert_eq!(pruned, 1, "only the old, untouched, completed trace goes");
+        assert!(
+            store
+                .get_trace(&"t-touched".into())
+                .await
+                .unwrap()
+                .is_some(),
+            "an intervened trace outlives retention"
+        );
+        assert!(store.get_trace(&"t-old".into()).await.unwrap().is_none());
+        assert!(store.get_span(&"s-old".into()).await.unwrap().is_none());
+        assert!(
+            store
+                .get_span_events_for_span(&"s-old".into())
+                .await
+                .unwrap()
+                .is_empty(),
+            "events go with their spans"
+        );
+        assert!(store.get_trace(&"t-recent".into()).await.unwrap().is_some());
+        assert!(
+            store
+                .get_trace(&"t-running".into())
+                .await
+                .unwrap()
+                .is_some(),
+            "a running trace is never retention's business"
+        );
     }
 
     #[tokio::test]
