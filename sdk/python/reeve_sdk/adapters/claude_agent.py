@@ -36,8 +36,8 @@ _HOOK_TIMEOUT_SECS = 6 * 3600
 _USAGE_KEYS = (
     ("input_tokens", "gen_ai.usage.input_tokens"),
     ("output_tokens", "gen_ai.usage.output_tokens"),
-    ("cache_read_input_tokens", "gen_ai.usage.cache_read_tokens"),
-    ("cache_creation_input_tokens", "gen_ai.usage.cache_creation_tokens"),
+    ("cache_read_input_tokens", "gen_ai.usage.cache_read.input_tokens"),
+    ("cache_creation_input_tokens", "gen_ai.usage.cache_creation.input_tokens"),
 )
 
 
@@ -182,7 +182,7 @@ class ReeveClaudeClient:
                     tool = self._tracer.start_span(
                         getattr(block, "name", "tool"), context=self._under(parent)
                     )
-                    tool.set_attribute("gen_ai.operation.name", "tool_call")
+                    tool.set_attribute("gen_ai.operation.name", "execute_tool")
                     tool.set_attribute("gen_ai.tool.name", getattr(block, "name", "tool"))
                     self._tool_spans[getattr(block, "id", "")] = tool
 

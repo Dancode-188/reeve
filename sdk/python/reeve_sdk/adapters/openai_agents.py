@@ -153,7 +153,7 @@ class ReeveHooks(RunHooks):
         span = self._tracer.start_span(
             name, context=self._child_context(self._current_agent.get(key))
         )
-        span.set_attribute("gen_ai.operation.name", "tool_call")
+        span.set_attribute("gen_ai.operation.name", "execute_tool")
         span.set_attribute("gen_ai.tool.name", name)
         self._tool_spans.setdefault((key, name), []).append(span)
         await self._sdk.checkpoint()

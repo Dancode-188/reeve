@@ -64,7 +64,7 @@ class ReeveCallbacks(AsyncCallbackHandler):
     ) -> None:
         name = serialized.get("name") or "tool"
         span = self._tracer.start_span(name)
-        span.set_attribute("gen_ai.operation.name", "tool_call")
+        span.set_attribute("gen_ai.operation.name", "execute_tool")
         self._tool_spans[str(run_id)] = span
         await self._sdk.checkpoint()
 

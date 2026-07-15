@@ -254,7 +254,10 @@ async fn byte_chunked_sse_reassembles_completely() {
     );
     assert_eq!(int_attr(chat, "gen_ai.usage.input_tokens"), Some(900));
     assert_eq!(int_attr(chat, "gen_ai.usage.output_tokens"), Some(42));
-    assert_eq!(int_attr(chat, "gen_ai.usage.cache_read_tokens"), Some(100));
+    assert_eq!(
+        int_attr(chat, "gen_ai.usage.cache_read.input_tokens"),
+        Some(100)
+    );
     assert_eq!(
         str_attr(chat, "reeve.proxy.stream_outcome"),
         Some("completed"),
@@ -286,7 +289,10 @@ async fn thinking_and_compaction_fields_land_as_attributes() {
     let chats = chats(&spans);
     assert_eq!(chats.len(), 1);
     let chat = chats[0];
-    assert_eq!(int_attr(chat, "gen_ai.usage.thinking_tokens"), Some(47));
+    assert_eq!(
+        int_attr(chat, "gen_ai.usage.reasoning.output_tokens"),
+        Some(47)
+    );
     assert_eq!(int_attr(chat, "reeve.context.applied_edits"), Some(1));
     assert!(
         str_attr(chat, "reeve.context.edit_types").is_some_and(|t| t.contains("clear_thinking")),

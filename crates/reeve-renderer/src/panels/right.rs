@@ -166,12 +166,7 @@ fn span_detail_height(state: &AppState) -> u16 {
                 // The thinking row renders only under an output row and
                 // only when the count is nonzero, so its height must
                 // follow the same gate or every other row shifts.
-                if span
-                    .attributes
-                    .get("gen_ai.usage.thinking_tokens")
-                    .and_then(|v| v.as_u64())
-                    .is_some_and(|t| t > 0)
-                {
+                if reasoning_tokens(span).is_some_and(|t| t > 0) {
                     h += 1;
                 }
             }
@@ -529,12 +524,7 @@ fn render_span_detail(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
 
                 // Reasoning tokens hiding inside the output count, with
                 // their share so a mostly-thinking response is obvious.
-                if let Some(thinking) = span
-                    .attributes
-                    .get("gen_ai.usage.thinking_tokens")
-                    .and_then(|v| v.as_u64())
-                    .filter(|t| *t > 0)
-                {
+                if let Some(thinking) = reasoning_tokens(span).filter(|t| *t > 0) {
                     let share = if tok_out > 0 {
                         format!(
                             "{} ({}%)",
@@ -639,6 +629,15 @@ fn render_span_detail(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/// Reasoning tokens under either spelling: the current semconv name on
+/// new spans, the pre-alignment name on everything already stored.
+fn reasoning_tokens(span: &reeve_model::entity::InternalSpan) -> Option<u64> {
+    span.attributes
+        .get("gen_ai.usage.reasoning.output_tokens")
+        .or_else(|| span.attributes.get("gen_ai.usage.thinking_tokens"))
+        .and_then(|v| v.as_u64())
+}
 
 fn section_label(title: &str, theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(
