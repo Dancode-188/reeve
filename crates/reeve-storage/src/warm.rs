@@ -806,6 +806,38 @@ impl WarmStore {
     }
 
     /// Spending totals for the Cost view: overall total with trace count,
+    /// Settled spend per agent for traces completed at or after the given
+    /// wall-clock ms, from stored span costs. The engine's budget
+    /// tracker resyncs from this on a cadence: its in-memory ledger is
+    /// fed by broadcast events, and a lagged receiver drops events, so
+    /// under load the ledger silently undercounts (#247). The store
+    /// heard every span the pipeline kept, making it the authority for
+    /// settled spend.
+    pub async fn agent_spend_since(
+        &self,
+        since_ms: i64,
+    ) -> Result<Vec<(AgentId, f64)>, StorageError> {
+        self.with_conn(move |conn| {
+            conn.prepare(
+                "SELECT t.agent_id,
+                        COALESCE(SUM(json_extract(s.attributes,
+                            '$.\"gen_ai.usage.cost\"')), 0.0) AS spend
+                 FROM traces t
+                 JOIN spans s ON s.trace_id = t.id
+                 WHERE t.completed_at >= ?1
+                 GROUP BY t.agent_id",
+            )?
+            .query_map(params![since_ms], |row| {
+                Ok((
+                    AgentId::from(row.get::<_, String>(0)?),
+                    row.get::<_, f64>(1)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()
+        })
+        .await
+    }
+
     /// cost grouped by agent, and cost grouped by model, in one pass over
     /// span attributes. Spans without a model attribute group under
     /// "other". Agents appear even at zero spend so the fleet is complete.
@@ -1561,6 +1593,33 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    #[tokio::test]
+    async fn agent_spend_since_windows_by_completion_time() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        // One trace completed inside the window, one before it.
+        let mut recent = trace("t-recent");
+        recent.end_time = Some(10_000);
+        store.save_trace(recent).await.unwrap();
+        let mut old = trace("t-old");
+        old.end_time = Some(4_000);
+        store.save_trace(old).await.unwrap();
+        let mut s1 = span("s1", "t-recent");
+        s1.attributes = serde_json::json!({"gen_ai.usage.cost": 0.30});
+        store.save_span(s1).await.unwrap();
+        let mut s2 = span("s2", "t-old");
+        s2.attributes = serde_json::json!({"gen_ai.usage.cost": 0.70});
+        store.save_span(s2).await.unwrap();
+
+        let spend = store.agent_spend_since(5_000).await.unwrap();
+        assert_eq!(spend.len(), 1);
+        assert_eq!(spend[0].0.as_str(), "agent-1");
+        assert!(
+            (spend[0].1 - 0.30).abs() < 1e-9,
+            "yesterday's spend stays out of today's window"
+        );
     }
 
     #[tokio::test]
