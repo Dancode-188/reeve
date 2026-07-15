@@ -282,6 +282,27 @@ fn rusqlite_serde_err(e: impl std::fmt::Display) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(e.to_string().into())
 }
 
+/// The one span upsert, shared by the single-span path and the
+/// per-trace bundle so the two cannot drift.
+const SPAN_UPSERT_SQL: &str = "INSERT INTO spans
+        (id, trace_id, parent_id, operation, status, start_time, end_time, arrived_at, attributes, raw_attributes)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+     ON CONFLICT(id) DO UPDATE SET
+        status = excluded.status,
+        end_time = excluded.end_time,
+        attributes = excluded.attributes,
+        raw_attributes = excluded.raw_attributes";
+
+/// The one trace upsert, shared the same way.
+const TRACE_UPSERT_SQL: &str = "INSERT INTO traces
+        (id, agent_id, status, started_at, completed_at, root_span_id, final_health_score)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+     ON CONFLICT(id) DO UPDATE SET
+        status = excluded.status,
+        completed_at = excluded.completed_at,
+        root_span_id = excluded.root_span_id,
+        final_health_score = excluded.final_health_score";
+
 pub struct WarmStore {
     conn: Arc<Mutex<Connection>>,
 }
@@ -289,6 +310,15 @@ pub struct WarmStore {
 impl WarmStore {
     pub fn open(path: &Path) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
+        // WAL with synchronous=NORMAL: the default rollback journal
+        // fsyncs every implicit transaction, which capped writes at a
+        // few hundred spans per second and let the soak's pipeline
+        // back up 85 minutes (#246); WAL measures ~70x faster on the
+        // same workload. NORMAL loses at most the final transactions
+        // on an OS crash, never consistency, which is the right trade
+        // for observability data.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         run_migrations(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -402,14 +432,7 @@ impl WarmStore {
         let status = enum_to_text(&trace.status)?;
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT INTO traces
-                    (id, agent_id, status, started_at, completed_at, root_span_id, final_health_score)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(id) DO UPDATE SET
-                    status = excluded.status,
-                    completed_at = excluded.completed_at,
-                    root_span_id = excluded.root_span_id,
-                    final_health_score = excluded.final_health_score",
+                TRACE_UPSERT_SQL,
                 params![
                     trace.id.as_str(),
                     trace.agent_id.as_str(),
@@ -559,20 +582,87 @@ impl WarmStore {
         .await
     }
 
+    /// Saves one finalized trace, its spans, and its span events in a
+    /// single transaction. Route saved each piece as its own implicit
+    /// transaction, which meant one fsync per statement and a write
+    /// ceiling the soak measured in the low hundreds of spans per
+    /// second (#246); a trace is the natural transaction boundary and
+    /// batching it is a further 2.5x on top of WAL.
+    pub async fn save_finalized_trace(
+        &self,
+        trace: Trace,
+        spans: Vec<InternalSpan>,
+        events: Vec<SpanEvent>,
+    ) -> Result<(), StorageError> {
+        let trace_status = enum_to_text(&trace.status)?;
+        let prepared: Vec<(String, String, String)> = spans
+            .iter()
+            .map(|s| {
+                Ok((
+                    enum_to_text(&s.status)?,
+                    serde_json::to_string(&s.attributes)?,
+                    serde_json::to_string(&s.raw_attributes)?,
+                ))
+            })
+            .collect::<Result<_, StorageError>>()?;
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                TRACE_UPSERT_SQL,
+                params![
+                    trace.id.as_str(),
+                    trace.agent_id.as_str(),
+                    trace_status,
+                    trace.start_time,
+                    trace.end_time,
+                    trace.root_span_id.as_deref(),
+                    trace.final_health_score,
+                ],
+            )?;
+            for (span, (status, attributes, raw_attributes)) in spans.iter().zip(&prepared) {
+                tx.execute(
+                    SPAN_UPSERT_SQL,
+                    params![
+                        span.id.as_str(),
+                        span.trace_id.as_str(),
+                        span.parent_id.as_deref(),
+                        span.operation,
+                        status,
+                        span.start_time,
+                        span.end_time,
+                        span.arrived_at,
+                        attributes,
+                        raw_attributes,
+                    ],
+                )?;
+            }
+            for event in &events {
+                let event_type = enum_to_text(&event.event_type).map_err(rusqlite_serde_err)?;
+                tx.execute(
+                    "INSERT INTO span_events (id, span_id, event_type, occurred_at, content)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        event.id.as_str(),
+                        event.span_id.as_str(),
+                        event_type,
+                        event.occurred_at,
+                        event.content
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn save_span(&self, span: InternalSpan) -> Result<(), StorageError> {
         let status = enum_to_text(&span.status)?;
         let attributes = serde_json::to_string(&span.attributes)?;
         let raw_attributes = serde_json::to_string(&span.raw_attributes)?;
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT INTO spans
-                    (id, trace_id, parent_id, operation, status, start_time, end_time, arrived_at, attributes, raw_attributes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 ON CONFLICT(id) DO UPDATE SET
-                    status = excluded.status,
-                    end_time = excluded.end_time,
-                    attributes = excluded.attributes,
-                    raw_attributes = excluded.raw_attributes",
+                SPAN_UPSERT_SQL,
                 params![
                     span.id.as_str(),
                     span.trace_id.as_str(),
@@ -1421,6 +1511,56 @@ mod tests {
         assert_eq!(summary.cache_read_tokens, 3000);
         assert_eq!(summary.prompt_tokens, 10_000);
         assert!((summary.cache_saved - 0.012).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn save_finalized_trace_bundles_everything_and_upserts() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        // A span saved earlier (mid-trace, via the single path) must be
+        // updated by the bundle, not duplicated: same upsert semantics.
+        // The trace row exists first, as it does in production, or the
+        // span's foreign key fails.
+        store.save_trace(trace("t1")).await.unwrap();
+        let mut early = span("s1", "t1");
+        early.status = SpanStatus::InFlight;
+        store.save_span(early).await.unwrap();
+
+        let mut s1 = span("s1", "t1");
+        s1.status = SpanStatus::Completed;
+        s1.attributes = serde_json::json!({"gen_ai.usage.cost": 0.5});
+        let s2 = span("s2", "t1");
+        let event = SpanEvent {
+            id: "e1".into(),
+            span_id: "s1".into(),
+            event_type: EventType::AssistantMessage,
+            occurred_at: 5,
+            content: Some("hello".to_string()),
+        };
+        store
+            .save_finalized_trace(trace("t1"), vec![s1, s2], vec![event])
+            .await
+            .unwrap();
+
+        assert!(store.get_trace(&"t1".into()).await.unwrap().is_some());
+        let spans = store.list_spans_for_trace(&"t1".into()).await.unwrap();
+        assert_eq!(spans.len(), 2, "upsert, not duplicate");
+        let s1_back = spans.iter().find(|s| s.id.as_str() == "s1").unwrap();
+        assert_eq!(s1_back.status, SpanStatus::Completed, "bundle updated it");
+        let events = store.get_span_events_for_span(&"s1".into()).await.unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn file_backed_store_runs_wal_with_normal_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.db");
+        let _store = WarmStore::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
     }
 
     #[tokio::test]

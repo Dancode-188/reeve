@@ -174,26 +174,26 @@ impl Router {
         }
 
         let resumable = state == CompletionState::InterruptedResumable;
-        if let Err(e) = self.warm.save_trace(trace_entity).await {
-            tracing::error!(trace_id = %trace_id, error = %e, "failed to save trace");
+        // One transaction per finalized trace instead of one per
+        // statement: the per-statement pattern paid an fsync each and
+        // capped write throughput low enough that the soak's pipeline
+        // backed up 85 minutes (#246).
+        let spans: Vec<_> = trace
+            .spans
+            .into_values()
+            .chain(trace.pending_attachment.into_values())
+            .collect();
+        let events: Vec<_> = trace.span_events.into_values().flatten().collect();
+        if let Err(e) = self
+            .warm
+            .save_finalized_trace(trace_entity, spans, events)
+            .await
+        {
+            tracing::error!(trace_id = %trace_id, error = %e, "failed to save finalized trace");
         }
         if resumable {
             if let Err(e) = self.warm.mark_resumable(&trace_id).await {
                 tracing::warn!(error = %e, trace_id = %trace_id, "failed to mark trace resumable");
-            }
-        }
-
-        for (_, span) in trace.spans.into_iter().chain(trace.pending_attachment) {
-            if let Err(e) = self.warm.save_span(span).await {
-                tracing::error!(trace_id = %trace_id, error = %e, "failed to save span");
-            }
-        }
-
-        for (_, events) in trace.span_events {
-            if !events.is_empty() {
-                if let Err(e) = self.warm.save_span_events(events).await {
-                    tracing::error!(trace_id = %trace_id, error = %e, "failed to save span events");
-                }
             }
         }
 
