@@ -62,6 +62,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         5,
         include_str!("../../../migrations/0005_resumable_traces.sql"),
     ),
+    (6, include_str!("../../../migrations/0006_indices.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -320,6 +321,10 @@ impl WarmStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         run_migrations(&conn)?;
+        // Refresh planner statistics as the data grows; without them
+        // the completed_at index misleads the planner outright
+        // (migration 0006 learned this by measurement).
+        conn.execute_batch("PRAGMA optimize;")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -805,17 +810,19 @@ impl WarmStore {
         .await
     }
 
-    /// Spending totals for the Cost view: overall total with trace count,
-    /// Settled spend per agent for traces completed at or after the given
-    /// wall-clock ms, from stored span costs. The engine's budget
-    /// tracker resyncs from this on a cadence: its in-memory ledger is
-    /// fed by broadcast events, and a lagged receiver drops events, so
-    /// under load the ledger silently undercounts (#247). The store
-    /// heard every span the pipeline kept, making it the authority for
-    /// settled spend.
-    pub async fn agent_spend_since(
+    /// Settled spend per agent for traces completed in the half-open
+    /// window `[since_ms, until_ms)`, from stored span costs. The
+    /// engine's budget tracker rebuilds from this because its ledger is
+    /// fed by broadcast events and a lagged receiver drops them (#247);
+    /// the store heard every span the pipeline kept. Half-open so
+    /// consecutive windows tile without double-counting a boundary
+    /// trace: the resync queries the full day once at startup, then one
+    /// small slice per tick, which the completed_at index serves in
+    /// under a millisecond.
+    pub async fn agent_spend_between(
         &self,
         since_ms: i64,
+        until_ms: i64,
     ) -> Result<Vec<(AgentId, f64)>, StorageError> {
         self.with_conn(move |conn| {
             conn.prepare(
@@ -824,10 +831,10 @@ impl WarmStore {
                             '$.\"gen_ai.usage.cost\"')), 0.0) AS spend
                  FROM traces t
                  JOIN spans s ON s.trace_id = t.id
-                 WHERE t.completed_at >= ?1
+                 WHERE t.completed_at >= ?1 AND t.completed_at < ?2
                  GROUP BY t.agent_id",
             )?
-            .query_map(params![since_ms], |row| {
+            .query_map(params![since_ms, until_ms], |row| {
                 Ok((
                     AgentId::from(row.get::<_, String>(0)?),
                     row.get::<_, f64>(1)?,
@@ -838,6 +845,7 @@ impl WarmStore {
         .await
     }
 
+    /// Spending totals for the Cost view: overall total with trace count,
     /// cost grouped by agent, and cost grouped by model, in one pass over
     /// span attributes. Spans without a model attribute group under
     /// "other". Agents appear even at zero spend so the fleet is complete.
@@ -1613,13 +1621,17 @@ mod tests {
         s2.attributes = serde_json::json!({"gen_ai.usage.cost": 0.70});
         store.save_span(s2).await.unwrap();
 
-        let spend = store.agent_spend_since(5_000).await.unwrap();
+        let spend = store.agent_spend_between(5_000, i64::MAX).await.unwrap();
         assert_eq!(spend.len(), 1);
         assert_eq!(spend[0].0.as_str(), "agent-1");
         assert!(
             (spend[0].1 - 0.30).abs() < 1e-9,
             "yesterday's spend stays out of today's window"
         );
+        // Half-open: a trace completing exactly at the upper bound
+        // belongs to the NEXT window, so tiles cannot double-count.
+        let none = store.agent_spend_between(5_000, 10_000).await.unwrap();
+        assert!(none.is_empty(), "upper bound is exclusive");
     }
 
     #[tokio::test]
