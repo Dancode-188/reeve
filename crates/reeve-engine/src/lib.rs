@@ -129,8 +129,48 @@ pub async fn run(
     // developer is most likely to be starting Ollama.
     let mut reprobe_tick = tokio::time::interval(std::time::Duration::from_secs(2));
 
+    // Budget resync: the tracker's ledger is fed by broadcast events,
+    // and a lagged receiver drops them, so under load it silently
+    // undercounts (#247). Every 30 seconds the settled figure is
+    // rebuilt from the warm store, which heard every span the pipeline
+    // kept. Skipped entirely when no budgets are configured.
+    let mut budget_resync_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    let budgets_configured = budgets.default_daily.is_some() || !budgets.per_agent.is_empty();
+
     loop {
         let event = tokio::select! {
+            _ = budget_resync_tick.tick(), if budgets_configured => {
+                match warm.agent_spend_since(budget::local_midnight_ms()).await {
+                    Ok(settled) => {
+                        for (agent_id, spend) in settled {
+                            if budgets.cap_for(agent_id.as_str()).is_none() {
+                                continue;
+                            }
+                            budget_tracker.resync(&agent_id, spend);
+                            // A crossing the dropped events hid fires here,
+                            // late but fired. Trace id is synthetic: the
+                            // kill is day-scoped, not trace-scoped.
+                            enforce_budget(
+                                &budgets,
+                                &budget_tracker,
+                                &mut budget_states,
+                                &engine_tx,
+                                &dispatch_tx,
+                                &warm,
+                                &agent_id,
+                                &TraceId::from(format!("budget-resync-{}", current_ms()).as_str()),
+                                0.0,
+                                current_ms(),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "budget resync query failed; ledger continues on events");
+                    }
+                }
+                continue;
+            }
             _ = reprobe_tick.tick() => {
                 let requested = reprobe_requested
                     .as_ref()

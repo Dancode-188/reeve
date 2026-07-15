@@ -41,6 +41,17 @@ fn today() -> i32 {
     now.year() * 366 + now.ordinal() as i32
 }
 
+/// Wall-clock ms of the most recent local midnight: the window the
+/// warm-store resync queries settled spend over.
+pub fn local_midnight_ms() -> i64 {
+    let now = Local::now();
+    now.date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|dt| dt.and_local_timezone(Local).single())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(0)
+}
+
 #[derive(Default)]
 pub struct BudgetTracker {
     /// Agent to (the day its spend belongs to, dollars spent that day).
@@ -58,6 +69,22 @@ impl BudgetTracker {
         }
         entry.1 += cost.max(0.0);
         entry.1
+    }
+
+    /// Reconciles an agent's day total against the warm store's settled
+    /// figure, taking whichever is higher. The in-memory ledger is fed
+    /// by broadcast events and a lagged receiver drops them, so it can
+    /// undercount (#247); the store can briefly trail the ledger while
+    /// a just-completed trace is still being written. Max of the two is
+    /// never below either honest source, which is the right bias for a
+    /// spend cap.
+    pub fn resync(&mut self, agent_id: &AgentId, settled_from_store: f64) {
+        let day = today();
+        let entry = self.spend.entry(agent_id.clone()).or_insert((day, 0.0));
+        if entry.0 != day {
+            *entry = (day, 0.0);
+        }
+        entry.1 = entry.1.max(settled_from_store);
     }
 
     /// An agent's spend so far today, zero if it has none or its record
@@ -114,6 +141,26 @@ mod tests {
         assert_eq!(t.spent_today(&agent()), 0.0, "yesterday does not count");
         // The next spend rolls the day over to a fresh total.
         assert_eq!(t.add_spend(&agent(), 1.0), 1.0);
+    }
+
+    #[test]
+    fn resync_lifts_an_undercounting_ledger_but_never_lowers_it() {
+        let mut t = BudgetTracker::default();
+        // The ledger heard $1 of events; the store settled $3 (the
+        // other $2 rode events a lagged receiver dropped).
+        t.add_spend(&agent(), 1.0);
+        t.resync(&agent(), 3.0);
+        assert_eq!(t.spent_today(&agent()), 3.0, "store truth wins upward");
+        // The store trails while a just-finished trace is mid-write:
+        // resync must not roll the ledger back.
+        t.add_spend(&agent(), 0.5);
+        t.resync(&agent(), 3.0);
+        assert_eq!(t.spent_today(&agent()), 3.5, "never lowered");
+        // An agent the ledger has never heard of (every event dropped)
+        // still gets its store figure.
+        let ghost: AgentId = "ghost:proxy".into();
+        t.resync(&ghost, 2.0);
+        assert_eq!(t.spent_today(&ghost), 2.0);
     }
 
     #[test]
