@@ -82,7 +82,7 @@ def test_a_response_cycle_becomes_one_parented_trace():
         assert spans[child].context.trace_id == root_ctx.trace_id, child
     llm = spans["llm.call"]
     assert llm.attributes["gen_ai.request.model"] == "claude-fable-5"
-    assert llm.attributes["gen_ai.usage.cache_read_tokens"] == 500
+    assert llm.attributes["gen_ai.usage.cache_read.input_tokens"] == 500
     # The exact figure rides its own attribute; gen_ai.usage.cost stays
     # absent so the pipeline's estimates are not double-counted.
     root = spans["claude.session"]

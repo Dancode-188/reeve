@@ -86,14 +86,22 @@ impl AttributeTranslator for V1AttributeTranslator {
             (true, _) => SpanStatus::Completed,
         };
 
+        // Both the current semconv spellings and the ones Reeve emitted
+        // before the alignment: an older SDK agent still sends the old
+        // names, and they should stay queryable rather than fall into
+        // raw_attributes.
         const KNOWN_KEYS: &[&str] = &[
+            "gen_ai.provider.name",
             "gen_ai.system",
             "gen_ai.request.model",
             "gen_ai.operation.name",
             "gen_ai.usage.input_tokens",
             "gen_ai.usage.output_tokens",
+            "gen_ai.usage.reasoning.output_tokens",
             "gen_ai.usage.thinking_tokens",
             "gen_ai.usage.total_tokens",
+            "gen_ai.usage.cache_read.input_tokens",
+            "gen_ai.usage.cache_creation.input_tokens",
             "gen_ai.usage.cache_read_tokens",
             "gen_ai.usage.cache_creation_tokens",
             "gen_ai.usage.cache_saved",
@@ -132,8 +140,10 @@ impl AttributeTranslator for V1AttributeTranslator {
                             model,
                             input,
                             output,
-                            tok("gen_ai.usage.cache_read_tokens"),
-                            tok("gen_ai.usage.cache_creation_tokens"),
+                            tok("gen_ai.usage.cache_read.input_tokens")
+                                + tok("gen_ai.usage.cache_read_tokens"),
+                            tok("gen_ai.usage.cache_creation.input_tokens")
+                                + tok("gen_ai.usage.cache_creation_tokens"),
                         )
                     })
                 {
@@ -398,8 +408,8 @@ mod tests {
             attributes: vec![
                 string_kv("gen_ai.request.model", "claude-3-5-sonnet"),
                 int_kv("gen_ai.usage.input_tokens", 512),
-                int_kv("gen_ai.usage.thinking_tokens", 47),
-                int_kv("gen_ai.usage.cache_read_tokens", 2048),
+                int_kv("gen_ai.usage.reasoning.output_tokens", 47),
+                int_kv("gen_ai.usage.cache_read.input_tokens", 2048),
                 string_kv("gen_ai.tool.name", "search"),
                 string_kv("custom.my_app.version", "1.0"),
             ],
@@ -418,13 +428,13 @@ mod tests {
         // by SQL over the attributes column. This gap shipped once (the
         // proxy recorded cache reads that never survived normalization).
         assert_eq!(
-            internal.attributes["gen_ai.usage.cache_read_tokens"],
+            internal.attributes["gen_ai.usage.cache_read.input_tokens"],
             serde_json::json!(2048i64)
         );
         // Thinking tokens feed the same SQL aggregation; the same gap
         // would silently zero the thinking share for SDK-path spans.
         assert_eq!(
-            internal.attributes["gen_ai.usage.thinking_tokens"],
+            internal.attributes["gen_ai.usage.reasoning.output_tokens"],
             serde_json::json!(47i64)
         );
         // The judge's extract_tool_calls reads this from queryable

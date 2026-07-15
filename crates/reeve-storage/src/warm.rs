@@ -931,20 +931,33 @@ impl WarmStore {
                 i64,
                 i64,
             ) = conn.query_row(
+                // Each usage figure sums the current semconv spelling
+                // and the pre-alignment one: stored history keeps the
+                // old names forever, new spans carry the new.
                 "SELECT
-                         COALESCE(SUM(json_extract(attributes,
-                             '$.\"gen_ai.usage.cache_read_tokens\"')), 0),
+                         COALESCE(SUM(
+                             COALESCE(json_extract(attributes,
+                                 '$.\"gen_ai.usage.cache_read_tokens\"'), 0)
+                             + COALESCE(json_extract(attributes,
+                                 '$.\"gen_ai.usage.cache_read.input_tokens\"'), 0)), 0),
                          COALESCE(SUM(
                              COALESCE(json_extract(attributes,
                                  '$.\"gen_ai.usage.input_tokens\"'), 0)
                              + COALESCE(json_extract(attributes,
                                  '$.\"gen_ai.usage.cache_read_tokens\"'), 0)
                              + COALESCE(json_extract(attributes,
-                                 '$.\"gen_ai.usage.cache_creation_tokens\"'), 0)), 0),
+                                 '$.\"gen_ai.usage.cache_read.input_tokens\"'), 0)
+                             + COALESCE(json_extract(attributes,
+                                 '$.\"gen_ai.usage.cache_creation_tokens\"'), 0)
+                             + COALESCE(json_extract(attributes,
+                                 '$.\"gen_ai.usage.cache_creation.input_tokens\"'), 0)), 0),
                          COALESCE(SUM(json_extract(attributes,
                              '$.\"gen_ai.usage.cache_saved\"')), 0.0),
-                         COALESCE(SUM(json_extract(attributes,
-                             '$.\"gen_ai.usage.thinking_tokens\"')), 0),
+                         COALESCE(SUM(
+                             COALESCE(json_extract(attributes,
+                                 '$.\"gen_ai.usage.thinking_tokens\"'), 0)
+                             + COALESCE(json_extract(attributes,
+                                 '$.\"gen_ai.usage.reasoning.output_tokens\"'), 0)), 0),
                          COALESCE(SUM(json_extract(attributes,
                              '$.\"gen_ai.usage.output_tokens\"')), 0)
                      FROM spans",

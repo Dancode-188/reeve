@@ -595,7 +595,7 @@ async fn finalize_stream_span(
 ) {
     let model = acc.model.unwrap_or_else(|| "unknown".to_string());
     let mut attributes = vec![
-        kv_str("gen_ai.system", "anthropic"),
+        kv_str("gen_ai.provider.name", "anthropic"),
         kv_str("gen_ai.operation.name", "chat"),
         kv_str("gen_ai.request.model", &model),
         kv_int("gen_ai.usage.input_tokens", acc.input_tokens as i64),
@@ -618,7 +618,7 @@ async fn finalize_stream_span(
     }
     if acc.thinking_tokens > 0 {
         attributes.push(kv_int(
-            "gen_ai.usage.thinking_tokens",
+            "gen_ai.usage.reasoning.output_tokens",
             acc.thinking_tokens as i64,
         ));
     }
@@ -626,13 +626,13 @@ async fn finalize_stream_span(
     stamp_secret_findings(secret_kinds, &mut attributes);
     if acc.cache_read_tokens > 0 {
         attributes.push(kv_int(
-            "gen_ai.usage.cache_read_tokens",
+            "gen_ai.usage.cache_read.input_tokens",
             acc.cache_read_tokens as i64,
         ));
     }
     if acc.cache_creation_tokens > 0 {
         attributes.push(kv_int(
-            "gen_ai.usage.cache_creation_tokens",
+            "gen_ai.usage.cache_creation.input_tokens",
             acc.cache_creation_tokens as i64,
         ));
     }
@@ -821,7 +821,7 @@ async fn emit_tool_span(
     tool: &ToolCall,
 ) {
     let mut attributes = vec![
-        kv_str("gen_ai.system", "anthropic"),
+        kv_str("gen_ai.provider.name", "anthropic"),
         kv_str("gen_ai.operation.name", "execute_tool"),
         // The clean tool name, so the judge scores [bash, read]
         // rather than raw operation names.
@@ -933,7 +933,7 @@ async fn synthesize_span(
         .unwrap_or_default();
 
     let mut attributes = vec![
-        kv_str("gen_ai.system", "anthropic"),
+        kv_str("gen_ai.provider.name", "anthropic"),
         kv_str("gen_ai.operation.name", "chat"),
         kv_str("gen_ai.request.model", &model),
         kv_int("gen_ai.usage.input_tokens", input_tokens as i64),
@@ -953,7 +953,7 @@ async fn synthesize_span(
     }
     if thinking_tokens > 0 {
         attributes.push(kv_int(
-            "gen_ai.usage.thinking_tokens",
+            "gen_ai.usage.reasoning.output_tokens",
             thinking_tokens as i64,
         ));
     }
@@ -972,11 +972,14 @@ async fn synthesize_span(
     surface_compaction(state, agent_name, &applied_edits, &mut attributes);
     stamp_secret_findings(secret_kinds, &mut attributes);
     if cache_read > 0 {
-        attributes.push(kv_int("gen_ai.usage.cache_read_tokens", cache_read as i64));
+        attributes.push(kv_int(
+            "gen_ai.usage.cache_read.input_tokens",
+            cache_read as i64,
+        ));
     }
     if cache_creation > 0 {
         attributes.push(kv_int(
-            "gen_ai.usage.cache_creation_tokens",
+            "gen_ai.usage.cache_creation.input_tokens",
             cache_creation as i64,
         ));
     }
@@ -1770,11 +1773,11 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
             .unwrap();
 
         let ps = rx.recv().await.expect("a span must be synthesized");
-        match attr(&ps.span, "gen_ai.usage.cache_read_tokens") {
+        match attr(&ps.span, "gen_ai.usage.cache_read.input_tokens") {
             Some(any_value::Value::IntValue(n)) => assert_eq!(*n, 2000),
             other => panic!("cache_read_tokens missing: {other:?}"),
         }
-        match attr(&ps.span, "gen_ai.usage.cache_creation_tokens") {
+        match attr(&ps.span, "gen_ai.usage.cache_creation.input_tokens") {
             Some(any_value::Value::IntValue(n)) => assert_eq!(*n, 1000),
             other => panic!("cache_creation_tokens missing: {other:?}"),
         }
