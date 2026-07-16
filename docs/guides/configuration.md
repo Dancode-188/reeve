@@ -34,9 +34,14 @@ auto_confirm_after_secs = 120       # optional countdown
 ```
 
 Conditions are plain comparisons over the trace the engine just
-scored: `health_score < 30`, `tool_name == "bash" AND content
-contains "rm -rf"`, `predicted_cost_usd > 10.0` for firing before a
-limit instead of after. `command_type` is `pause`, `resume`, or
+scored. The variables: `health_score`, `cost_usd`, `span_count`,
+`tier2_pending`, `weight_coverage`, `predicted_cost_at_completion`
+(fires before a limit instead of after), and every quality metric by
+name: `faithfulness`, `tool_selection`, `hallucination_detection`,
+`loop_detection`, `cost_efficiency`, `latency_normality`,
+`intent_action_divergence`, `fingerprint_deviation`. Combine with
+`&&` and `||` and the usual comparisons: `health_score < 30 &&
+cost_usd > 2.0`. `command_type` is `pause`, `resume`, or
 `kill`. `requires_confirmation` defaults to true because an automated
 kill should have a human in the loop until you decide otherwise;
 `auto_confirm_after_secs` puts a countdown on that prompt for rules

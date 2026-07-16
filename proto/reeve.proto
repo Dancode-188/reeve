@@ -2,7 +2,8 @@ syntax = "proto3";
 
 package reeve;
 
-// Reeve intervention channel — bidirectional streaming control protocol.
+// Reeve intervention channel: bidirectional streaming control protocol.
+// Field numbers are forever; changes to this file are additive only.
 // Agents connect here (port 4316) to receive commands and send acknowledgments.
 // Observation data goes through the OTel channel (ports 4317/4318), not here.
 

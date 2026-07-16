@@ -71,9 +71,10 @@ background via Ollama locally. It all feeds a single health score from 0 to 100 
 changes color as it drops. Green, amber, red. You know at a glance.
 
 **React.** Write policy rules in plain conditions: `health_score < 30`,
-`cost_usd > 5.0`, `tool_name == "bash" AND content contains "rm -rf"`. Rules fire
-automatically. You can write predicted thresholds that fire before a limit is hit,
-not after.
+`cost_usd > 5.0`, `predicted_cost_at_completion > 10.0` to fire before a limit
+is hit instead of after. Rules fire automatically, combine with `&&` and
+`||`, and any quality metric (`faithfulness`, `hallucination_detection`)
+works as a variable too.
 
 **Intervene.** Press `i`. Pause the agent, redirect it with a new instruction, inject
 context, or kill the trace. The agent applies the command at its next safe yield
