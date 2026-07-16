@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange.svg)](https://www.rust-lang.org)
 
-![Reeve catching a research agent that gets stuck in a loop, live through the proxy](docs/assets/demo.gif)
+![Reeve catching a looping research agent and redirecting it back to health, live through the proxy](docs/assets/demo.gif)
 
 <!-- Rough cut; a polished recording replaces it before v1.0.0. -->
 
