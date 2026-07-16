@@ -196,6 +196,20 @@ outbound secrets reports kind and fingerprint, never the secret.
 the audit log survive both retention and trace deletion. Telemetry is
 disposable; what the operator and the policies did is not.
 
+## What 1.0 promises, and what it does not
+
+Stable from 1.0: the Python SDK's documented exports and signatures,
+the Rust SDK's public API, the config.toml schema, the control-channel
+proto (additive changes only; field numbers are forever), the
+`gen_ai.*` and `reeve.*` span attributes as documented, and the three
+ports. Explicitly not promised: the internals of any crate (the
+workspace publishes together and the inter-crate APIs move freely),
+the warm store's SQLite schema (migrations own it; query it for
+curiosity, not for production), the log file format, and any attribute
+or config field that does not appear in the guides. Rule of thumb: if
+a guide documents it, it is a promise; if you found it by reading
+source, it is not.
+
 ## Source map
 
 | Crate | Owns |
