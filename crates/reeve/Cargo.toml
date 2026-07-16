@@ -2,8 +2,12 @@
 # The crates.io name; `reeve` there is an unrelated earlier project.
 # The installed binary keeps the real name via [[bin]] below.
 name = "reeve-cockpit"
-version = "0.6.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal cockpit for AI agents: watch, score, and intervene in real time"
+readme = "README.md"
 
 [[bin]]
 name = "reeve"

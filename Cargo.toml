@@ -11,6 +11,14 @@ members = [
 ]
 resolver = "2"
 
+# Shared publish metadata: crates.io needs license, repository, and a
+# description per crate; everything common inherits from here.
+[workspace.package]
+license = "Apache-2.0"
+repository = "https://github.com/Dancode-188/reeve"
+edition = "2024"
+version = "0.6.0"
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

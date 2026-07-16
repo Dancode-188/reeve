@@ -1,7 +1,11 @@
 [package]
 name = "reeve-sdk"
-version = "0.6.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust SDK for agents observed by the Reeve cockpit"
+readme = "README.md"
 
 [dependencies]
 tokio = { workspace = true }

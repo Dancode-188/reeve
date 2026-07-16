@@ -1,7 +1,11 @@
 [package]
 name = "reeve-model"
-version = "0.6.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared entities, IDs, and signal types for the Reeve cockpit"
+readme = "README.md"
 
 [dependencies]
 serde = { workspace = true }
