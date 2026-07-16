@@ -1,7 +1,11 @@
 [package]
 name = "reeve-engine"
-version = "0.6.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reeve's evaluation engine: heuristics, LLM judge, policy rules, and budgets"
+readme = "README.md"
 
 [dependencies]
 reeve-model = { path = "../reeve-model" }
