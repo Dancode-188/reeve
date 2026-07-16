@@ -262,8 +262,8 @@ use the same primitives as the built-in rules: `health_score`, `cost_usd`,
   control channel is separate from the OTel channel. Most projects lose this
   reasoning the moment a decision is made. It is all in here.
 - [Roadmap](ROADMAP.md)
-- [Architecture](docs/ARCHITECTURE.md) and getting-started guides land with
-  v1.0.0.
+- [Architecture](docs/ARCHITECTURE.md): the pipeline, the crates, and the
+  invariants they hold each other to.
 
 ---
 
