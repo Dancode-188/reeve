@@ -225,8 +225,9 @@ Or straight from the repository:
 cargo install --git https://github.com/Dancode-188/reeve reeve-cockpit
 ```
 
-Requires Rust 1.78+. Linux and macOS. On Windows, Windows Terminal works fine. Use
-`--ascii` if the Unicode characters do not render correctly.
+Requires Rust 1.78+. Linux and macOS, both in CI; on Windows, run it inside
+WSL (native Windows is not supported). Use `--ascii` if the Unicode
+characters do not render correctly.
 
 ---
 
