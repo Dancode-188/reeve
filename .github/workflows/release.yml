@@ -5,23 +5,59 @@ on:
     tags: ["v*"]
 
 jobs:
+  build:
+    name: Build (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: reeve-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: reeve-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: reeve-macos-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} -p reeve-cockpit
+      - name: Rename for the release page
+        run: cp target/${{ matrix.target }}/release/reeve ${{ matrix.artifact }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
   release:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc
-        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler
-      - name: Build release binary
-        run: cargo build --release
-      - name: Publish release binary
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish release with binaries
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload ${{ github.ref_name }} target/release/reeve --clobber 2>/dev/null || \
           gh release create ${{ github.ref_name }} \
             --title "Reeve ${{ github.ref_name }}" \
             --notes "See [CHANGELOG.md](https://github.com/Dancode-188/reeve/blob/main/CHANGELOG.md) for details." \
-            target/release/reeve
+            reeve-linux-x86_64 reeve-macos-arm64 reeve-macos-x86_64 || \
+          gh release upload ${{ github.ref_name }} \
+            reeve-linux-x86_64 reeve-macos-arm64 reeve-macos-x86_64 --clobber
