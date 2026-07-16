@@ -1,7 +1,8 @@
 # Getting started
 
-From nothing to watching a real agent, timed at under 90 seconds on a
-normal connection. Two terminals: Reeve owns one, your agent gets the
+From install to watching a real agent. The install compiles for a few
+minutes; everything after it took nine seconds on a machine that had
+never seen Reeve. Two terminals: Reeve owns one, your agent gets the
 other.
 
 ## Install
@@ -11,7 +12,7 @@ cargo install --git https://github.com/Dancode-188/reeve reeve-cockpit
 ```
 
 One binary, `reeve`, lands in your cargo bin. No config file, no
-account, no daemon.
+account, no daemon. The compile is the only slow step; get coffee.
 
 ## Terminal 1: the cockpit
 
