@@ -33,6 +33,12 @@ struct PendingEntry {
     agent_id: AgentId,
     queued_at: Instant,
     retry_count: u8,
+    /// Delivered through the proxy queue, not the control channel. The
+    /// retry loop skips these: a proxy agent has no stream to resend on,
+    /// and the command applies on the agent's next request, which can be
+    /// well past the ack timeout. They stay in pending only so the ack
+    /// can resolve them and feed the outcome tracker.
+    via_proxy: bool,
 }
 
 /// Routes `InterventionCommand` records from the policy engine and the UI to
@@ -161,6 +167,19 @@ impl Dispatcher {
                     command_type_tag(&command.command_type),
                     command.issued_by,
                 ));
+                // Track it in pending like a control-channel command, so
+                // the proxy's later ack can resolve it and feed the
+                // outcome tracker. via_proxy keeps the retry loop off it.
+                self.pending.lock().unwrap().insert(
+                    command_id.clone(),
+                    PendingEntry {
+                        command: command.clone(),
+                        agent_id: agent_id.clone(),
+                        queued_at: Instant::now(),
+                        retry_count: 0,
+                        via_proxy: true,
+                    },
+                );
                 let warm = self.warm.clone();
                 let persisted = command.clone();
                 tokio::spawn(async move {
@@ -195,6 +214,7 @@ impl Dispatcher {
                 agent_id: agent_id.clone(),
                 queued_at: Instant::now(),
                 retry_count: 0,
+                via_proxy: false,
             },
         );
 
@@ -391,7 +411,7 @@ impl Dispatcher {
         let now_ms = current_ms();
         let now = Instant::now();
 
-        let to_process: Vec<(CommandId, AgentId, u8, bool)> = {
+        let to_process: Vec<(CommandId, AgentId, u8, bool, bool)> = {
             let pending = self.pending.lock().unwrap();
             pending
                 .iter()
@@ -402,12 +422,22 @@ impl Dispatcher {
                         e.agent_id.clone(),
                         e.retry_count,
                         e.command.valid_until_ms < now_ms,
+                        e.via_proxy,
                     )
                 })
                 .collect()
         };
 
-        for (command_id, agent_id, retry_count, past_expiry) in to_process {
+        for (command_id, agent_id, retry_count, past_expiry, via_proxy) in to_process {
+            if via_proxy {
+                // A proxy command has no control channel to resend on. It
+                // waits in pending for the proxy to apply it on the next
+                // request, and only leaves on its own validity window.
+                if past_expiry {
+                    self.settle_expired(&command_id, &agent_id, now_ms).await;
+                }
+                continue;
+            }
             if past_expiry || retry_count >= 1 {
                 self.settle_expired(&command_id, &agent_id, now_ms).await;
             } else {
@@ -608,6 +638,7 @@ mod tests {
                 agent_id: agent_id.clone(),
                 queued_at: Instant::now(),
                 retry_count: 0,
+                via_proxy: false,
             },
         );
         d.handle_ack(AckNotification {
@@ -778,6 +809,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_command_reaches_pending_and_the_applied_feed() {
+        // Regression for #272. A proxy command used to return from dispatch
+        // before the pending insert, so its later ack found nothing and no
+        // outcome was ever measured on the proxy path. It must land in
+        // pending and, on ack, reach the applied feed like an SDK command.
+        let queue: reeve_model::entity::ProxyInterventions =
+            Arc::new(Mutex::new(Default::default()));
+        let (d, warm) = make_dispatcher_with_queue(Some(queue.clone()));
+
+        let agent_id = reeve_model::ids::agent_id_from_service("claude-cli", "proxy");
+        warm.upsert_agent(reeve_model::entity::Agent {
+            id: agent_id.clone(),
+            name: "claude-cli".to_string(),
+            framework: "proxy".to_string(),
+            integration: reeve_model::entity::IntegrationPath::Proxy,
+            status: reeve_model::entity::AgentStatus::Idle,
+            first_seen_at: 0,
+            last_seen_at: 0,
+        })
+        .await
+        .unwrap();
+
+        let command = pending_command(CommandType::Redirect {
+            instruction: "wrap up".to_string(),
+        });
+        let command_id = command.id.clone();
+        assert!(d.dispatch(&agent_id, command).await, "queued to the proxy");
+        assert!(
+            d.pending.lock().unwrap().contains_key(&command_id),
+            "the proxy command is tracked in pending"
+        );
+
+        // The proxy applies it on the agent's next request and acks back.
+        d.handle_ack(AckNotification {
+            command_id,
+            agent_id: agent_id.clone(),
+            status: AckStatus::Applied,
+        })
+        .await;
+
+        let feed = d.applied_feed.lock().unwrap();
+        assert_eq!(feed.len(), 1, "the applied proxy command reaches the feed");
+        assert_eq!(feed[0].agent_id, agent_id);
+    }
+
+    #[tokio::test]
     async fn received_ack_does_not_reach_applied_feed() {
         let d = make_dispatcher();
         let agent_id = AgentId::from("agent-feed-recv");
@@ -790,6 +867,7 @@ mod tests {
                 agent_id: agent_id.clone(),
                 queued_at: Instant::now(),
                 retry_count: 0,
+                via_proxy: false,
             },
         );
         d.handle_ack(AckNotification {
@@ -830,6 +908,7 @@ mod tests {
                 agent_id: agent_id.clone(),
                 queued_at: Instant::now(),
                 retry_count: 0,
+                via_proxy: false,
             },
         );
         d.handle_ack(AckNotification {
