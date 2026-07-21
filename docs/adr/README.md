@@ -3,6 +3,10 @@
 This directory is where reasoning lives. Every significant design choice in Reeve has a
 record here: what was decided, why, and what alternatives were considered and rejected.
 
+Records are numbered in order and never renumbered or deleted. When a decision is later
+reversed, a new record supersedes it and the original is marked `Superseded by 00NN`, so
+the reasoning as it stood survives next to what replaced it.
+
 | # | Title | Status | Date |
 |---|-------|--------|------|
 | [0001](./0001-two-channel-architecture.md) | Two-Channel Architecture | Accepted | 2026-06-23 |
