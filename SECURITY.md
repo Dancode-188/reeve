@@ -28,8 +28,17 @@ commands from off the machine, and anything that lets a watched agent
 break out of a kill.
 
 Things that are not: the loopback ports being open on localhost
-(deliberate: Reeve binds 127.0.0.1 only), and vulnerabilities in
-the agents Reeve watches, which are yours.
+(deliberate), and vulnerabilities in the agents Reeve watches, which
+are yours.
+
+"Loopback" comes with two caveats. The control channel and proxy bind
+`127.0.0.1` and stay there, but the OTLP receiver, though it also
+defaults to loopback, can be rebound by `REEVE_ADDR`; a non-loopback
+address there opens an unauthenticated ingestion port, so only set one
+behind a network you trust. And loopback is not authentication: any
+process on the machine can inject spans or reach the control channel,
+so Reeve trusts every local process and should not run on a shared
+host with people you don't trust.
 
 ## Supported versions
 

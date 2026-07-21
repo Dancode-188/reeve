@@ -58,6 +58,15 @@ code actually does.
 - Every config loader warns on a parse error, where three of them used
   to fall back silently on a typo.
 
+### Security
+
+- A `cargo audit` job runs in CI, and the one advisory it flagged is
+  cleared: `quinn-proto` moves to 0.11.16 past RUSTSEC-2026-0185, a
+  memory-exhaustion advisory in a crate that is not in the default
+  build graph. SECURITY.md now states the bind model precisely: only
+  the OTLP port takes `REEVE_ADDR`, and the local ports are
+  unauthenticated by design.
+
 ### Documentation
 
 - A full set for 1.0: `ARCHITECTURE.md`, a cockpit manual, a timed
