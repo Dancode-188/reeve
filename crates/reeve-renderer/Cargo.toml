@@ -7,6 +7,9 @@ repository.workspace = true
 description = "Reeve's terminal UI: the cockpit panels, replay, and keybindings"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [dependencies]
 serde_json = { workspace = true }
 reeve-model = { path = "../reeve-model" }

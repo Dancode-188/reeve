@@ -1,5 +1,3 @@
-#![deny(clippy::all)]
-
 use reeve_storage::warm::WarmStore;
 use std::collections::HashMap;
 use std::fs::OpenOptions;

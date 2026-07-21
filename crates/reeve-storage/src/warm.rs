@@ -266,12 +266,12 @@ fn row_to_policy_rule(row: &Row) -> rusqlite::Result<PolicyRule> {
         trigger_condition: row.get("trigger_condition")?,
         command_type: serde_json::from_str(&command_type).map_err(rusqlite_serde_err)?,
         requires_confirmation: row.get("requires_confirmation")?,
-        cooldown_secs: row.get::<_, i64>("cooldown_secs")? as u64,
+        cooldown_secs: row.get::<_, i64>("cooldown_secs")?.max(0) as u64,
         scope,
         enabled: row.get("enabled")?,
         auto_confirm_after_secs: row
             .get::<_, Option<i64>>("auto_confirm_after_secs")?
-            .map(|v| v as u64),
+            .map(|v| v.max(0) as u64),
     })
 }
 

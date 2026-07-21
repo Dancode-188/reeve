@@ -7,6 +7,9 @@ repository.workspace = true
 description = "Reeve's control plane: command dispatch, acks, and the audit log"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [dependencies]
 reeve-model = { path = "../reeve-model" }
 reeve-storage = { path = "../reeve-storage" }

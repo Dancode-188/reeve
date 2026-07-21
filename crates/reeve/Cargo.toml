@@ -9,6 +9,9 @@ repository.workspace = true
 description = "Terminal cockpit for AI agents: watch, score, and intervene in real time"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "reeve"
 path = "src/main.rs"

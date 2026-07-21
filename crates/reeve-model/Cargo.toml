@@ -7,6 +7,9 @@ repository.workspace = true
 description = "Shared entities, IDs, and signal types for the Reeve cockpit"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
