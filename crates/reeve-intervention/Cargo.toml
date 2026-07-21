@@ -11,8 +11,8 @@ readme = "README.md"
 workspace = true
 
 [dependencies]
-reeve-model = { path = "../reeve-model" }
-reeve-storage = { path = "../reeve-storage" }
+reeve-model = { path = "../reeve-model", version = "1.0.0" }
+reeve-storage = { path = "../reeve-storage", version = "1.0.0" }
 tokio = { workspace = true }
 tokio-stream = "0.1"
 tonic = { workspace = true }

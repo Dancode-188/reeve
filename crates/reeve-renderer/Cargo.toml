@@ -12,9 +12,9 @@ workspace = true
 
 [dependencies]
 serde_json = { workspace = true }
-reeve-model = { path = "../reeve-model" }
-reeve-storage = { path = "../reeve-storage" }
-reeve-intervention = { path = "../reeve-intervention" }
+reeve-model = { path = "../reeve-model", version = "1.0.0" }
+reeve-storage = { path = "../reeve-storage", version = "1.0.0" }
+reeve-intervention = { path = "../reeve-intervention", version = "1.0.0" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 indexmap = { workspace = true }

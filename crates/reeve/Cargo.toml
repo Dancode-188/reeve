@@ -17,12 +17,12 @@ name = "reeve"
 path = "src/main.rs"
 
 [dependencies]
-reeve-ingestion = { path = "../reeve-ingestion" }
-reeve-engine = { path = "../reeve-engine" }
-reeve-intervention = { path = "../reeve-intervention" }
-reeve-renderer = { path = "../reeve-renderer" }
-reeve-storage = { path = "../reeve-storage" }
-reeve-model = { path = "../reeve-model" }
+reeve-ingestion = { path = "../reeve-ingestion", version = "1.0.0" }
+reeve-engine = { path = "../reeve-engine", version = "1.0.0" }
+reeve-intervention = { path = "../reeve-intervention", version = "1.0.0" }
+reeve-renderer = { path = "../reeve-renderer", version = "1.0.0" }
+reeve-storage = { path = "../reeve-storage", version = "1.0.0" }
+reeve-model = { path = "../reeve-model", version = "1.0.0" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
