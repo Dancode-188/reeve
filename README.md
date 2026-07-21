@@ -2,11 +2,12 @@
 
 [![CI](https://github.com/Dancode-188/reeve/actions/workflows/ci.yml/badge.svg)](https://github.com/Dancode-188/reeve/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.78%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+
+A terminal cockpit for AI agents. Watch a run live, score it, and step in
+when it goes sideways.
 
 ![Reeve catching a looping research agent and redirecting it back to health, live through the proxy](docs/assets/demo.gif)
-
-<!-- Rough cut; a polished recording replaces it before v1.0.0. -->
 
 ---
 
@@ -30,13 +31,6 @@ going wrong right now and you want to stop it or change direction without killin
 whole process.
 
 Reeve is for that moment.
-
----
-
-The trace tree grows as spans arrive. The LLM response appears token by token with
-a blinking cursor. The health score tells you whether the agent is doing well: in the
-clip above it holds green through a real research turn, then craters when the agent
-gets stuck repeating one search and the loop rule fires. Press `i` to intervene.
 
 ---
 
@@ -65,10 +59,11 @@ accumulates in the terminal with a blinking cursor. You are watching the model t
 Nothing else does this.
 
 **Score.** Every span gets evaluated. Heuristic checks run in under a millisecond:
-loop detection, cost acceleration, latency anomalies, intent vs action mismatch. LLM
+loop detection, cost efficiency, latency anomalies, intent vs action mismatch. LLM
 judge scoring for faithfulness, hallucination, and tool selection quality runs in the
-background via Ollama locally. It all feeds a single health score from 0 to 100 that
-changes color as it drops. Green, amber, red. You know at a glance.
+background via Ollama locally. Most of these feed a single health score from 0 to 100 that
+changes color as it drops. Green, amber, red. The anomaly checks, like hallucination,
+raise alerts instead of quietly dragging the number. You know at a glance.
 
 **React.** Write policy rules in plain conditions: `health_score < 30`,
 `cost_usd > 5.0`, `predicted_cost_at_completion > 10.0` to fire before a limit
@@ -130,8 +125,8 @@ loop {
 }
 ```
 
-Adapters for the OpenAI Agents SDK and the Claude Agent SDK are planned for
-v1.0.0.
+The OpenAI Agents SDK and the Claude Agent SDK have adapters too, wiring
+the same checkpoints and spans.
 
 Any OTel-instrumented agent can point directly at Reeve:
 ```bash
@@ -183,8 +178,8 @@ wrong. Reeve biases toward redirecting the agent and letting it self-correct. A 
 redirect preserves the work done so far. Kill is there for when you need it. It is
 not the first suggestion.
 
-**One number, not ten.** Faithfulness, hallucination, tool selection, loop detection,
-cost, latency: it all feeds one health score. You set one threshold, not ten. The
+**One number, not ten.** Faithfulness, tool selection, loop detection, cost, latency: they feed
+one health score. You set one threshold, not ten. The
 individual metrics are still there when you want to understand why the score dropped.
 But the gauge in the header tells you at a glance.
 
@@ -204,8 +199,8 @@ something is going wrong right now.
 | LangChain | SDK | Full | Yes | Yes |
 | Custom Python | SDK | Full | Yes | Yes |
 | Rust agents | SDK | Full | Yes | Yes |
-| OpenAI Agents SDK | SDK | Planned (v1.0.0) | n/a | n/a |
-| Claude Agent SDK | SDK | Planned (v1.0.0) | n/a | n/a |
+| OpenAI Agents SDK | SDK | Full | Yes | Yes |
+| Claude Agent SDK | SDK | Full | Yes | Yes |
 | Claude Code | Proxy | Full | No (by design) | Yes |
 | Any OTel agent | OTel | Full | No | No |
 
@@ -226,7 +221,7 @@ Or straight from the repository:
 cargo install --git https://github.com/Dancode-188/reeve reeve-cockpit
 ```
 
-Requires Rust 1.78+. Linux and macOS, both in CI; on Windows, run it inside
+Requires Rust 1.85+. Linux and macOS, both in CI; on Windows, run it inside
 WSL (native Windows is not supported). Use `--ascii` if the Unicode
 characters do not render correctly.
 
@@ -250,9 +245,12 @@ cooldown_secs = 300               # default 300
 auto_confirm_after_secs = 30      # optional: auto-execute countdown
 ```
 
+Pause and resume reach the agent through its control channel, which only SDK
+agents have. To stop a proxied agent like Claude Code, use kill.
+
 Rules load at startup and reload on `SIGUSR1` without a restart. Conditions
 use the same primitives as the built-in rules: `health_score`, `cost_usd`,
-`span_count`, `predicted_cost`, and any evaluation metric by name.
+`span_count`, `predicted_cost_at_completion`, and any evaluation metric by name.
 
 ---
 
