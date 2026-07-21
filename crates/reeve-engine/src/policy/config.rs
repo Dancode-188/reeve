@@ -85,10 +85,13 @@ pub fn load_secrets_block(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
-    toml::from_str::<ConfigFile>(&text)
-        .ok()
-        .and_then(|c| c.secrets.and_then(|s| s.block))
-        .unwrap_or(false)
+    match toml::from_str::<ConfigFile>(&text) {
+        Ok(c) => c.secrets.and_then(|s| s.block).unwrap_or(false),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "could not parse config; secret blocking defaults to off");
+            false
+        }
+    }
 }
 
 /// How many days of completed traces the warm store keeps. Default 30:
@@ -101,10 +104,16 @@ pub fn load_retention_days(path: &Path) -> u32 {
     let Ok(text) = std::fs::read_to_string(path) else {
         return DEFAULT_DAYS;
     };
-    toml::from_str::<ConfigFile>(&text)
-        .ok()
-        .and_then(|c| c.retention.and_then(|r| r.max_trace_age_days))
-        .unwrap_or(DEFAULT_DAYS)
+    match toml::from_str::<ConfigFile>(&text) {
+        Ok(c) => c
+            .retention
+            .and_then(|r| r.max_trace_age_days)
+            .unwrap_or(DEFAULT_DAYS),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "could not parse config; retention defaults to 30 days");
+            DEFAULT_DAYS
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -232,10 +241,13 @@ pub fn load_notifications_enabled(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
-    toml::from_str::<ConfigFile>(&text)
-        .ok()
-        .and_then(|c| c.notifications.and_then(|n| n.enabled))
-        .unwrap_or(false)
+    match toml::from_str::<ConfigFile>(&text) {
+        Ok(c) => c.notifications.and_then(|n| n.enabled).unwrap_or(false),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "could not parse config; notifications default to off");
+            false
+        }
+    }
 }
 
 #[cfg(test)]

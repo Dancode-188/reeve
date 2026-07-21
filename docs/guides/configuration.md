@@ -31,6 +31,7 @@ always there; the words are not.
 [[rules]]
 id = "runaway-cost"
 name = "Cost runaway"
+description = "Pause when spend runs away"   # optional, human-readable
 trigger_condition = "cost_usd > 5.0"
 command_type = "pause"
 requires_confirmation = true
