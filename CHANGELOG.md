@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-22
+
+The loop has been whole since the intervention and learning layers
+landed. 1.0 is about making it something you can build on: the last two
+major-framework adapters ship, the surfaces you integrate against are
+pinned behind a stated stability boundary, the cockpit installs from a
+registry on Linux and macOS, and the documentation matches what the
+code actually does.
+
+### Added
+
+- OpenAI Agents SDK adapter, wiring the same checkpoints and spans as
+  the other SDK paths.
+- Claude Agent SDK adapter: a drop-in `ClaudeSDKClient` wrapper. The
+  agent loop runs inside the Claude Code CLI subprocess, so control
+  works through hooks, with `checkpoint()` holding at `PreToolUse`.
+- `reeve env` prints the exports an agent needs, so connecting one is a
+  single `eval` instead of two copied lines.
+- Warm-tier retention: a configurable maximum age for completed traces,
+  default 30 days, so the store stops growing without bound. Zero means
+  keep forever.
+
+### Changed
+
+- The project takes its registry names: the cockpit publishes as
+  `reeve-cockpit` on crates.io and the Python SDK as `reeve-sdk` on
+  PyPI. The installed binary is still `reeve`.
+- A stated API stability boundary: every surface you can build against
+  is documented as stable or internal, and the control-plane proto is
+  additive-only, so a 1.x upgrade never breaks a rule file, an SDK
+  integration, or the span attributes an instrumented agent emits.
+- `gen_ai` span attributes track the current OpenTelemetry GenAI
+  semantic conventions.
+- macOS joins Linux as a tier-1 platform, both built and tested in CI.
+- The warm store stops paying an fsync per statement, and budget resync
+  went incremental with an index on `completed_at`.
+
+### Fixed
+
+- Predictive cost stops read the cost the pipeline already stamped on
+  each span instead of a second price table that had drifted, so they
+  fire for every model family rather than only the ones the engine
+  happened to know.
+- Interventions through the proxy reach the outcome tracker, so a
+  redirect or inject-context on the proxy path gets the same
+  before/after health measurement the SDK path already had.
+- Budgets resync settled spend from the warm store on restart, so the
+  day's ledger survives a crash instead of resetting.
+- Every config loader warns on a parse error, where three of them used
+  to fall back silently on a typo.
+
+### Documentation
+
+- A full set for 1.0: `ARCHITECTURE.md`, a cockpit manual, a timed
+  getting-started guide, configuration and custom-agents guides, a
+  README and publish metadata for every crate, and `SECURITY.md`.
+
 ## [0.6.0] - 2026-07-14
 
 Reeve stops being only a window on the proxy path and becomes a guard.
@@ -411,6 +468,7 @@ spends; this release acts on that.
 - GitHub Actions CI: fmt check, clippy with `-D warnings`, tests, release build.
 - Issue templates, PR template, CONTRIBUTING.md, ROADMAP.md.
 
+[1.0.0]: https://github.com/Dancode-188/reeve/releases/tag/v1.0.0
 [0.6.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.6.0
 [0.5.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.4.0
