@@ -105,10 +105,10 @@ enough to protect an agent fleet, not just observe it.
 
 ## v1.0.0: Production
 
-All adapters. Full docs. Stable APIs. `cargo install reeve` actually works.
+All adapters. Full docs. Stable APIs. `cargo install reeve-cockpit` actually works.
 
 Claude Agent SDK adapter. Python SDK published to PyPI. ARCHITECTURE.md
-written. All 30+ ADRs complete. Demo GIF in README. Getting started guide
+written. All 43 ADRs complete. Demo GIF in README. Getting started guide
 works in under 90 seconds.
 
 **What this proves:** The project is ready for other people to use.

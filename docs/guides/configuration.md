@@ -13,11 +13,17 @@ privacy_tier = 1
 ```
 
 Tier 1 stores span metadata only: names, timings, token counts, cost.
-Tier 2 also stores message content, which is what the streaming box
-and content-based scoring read. The default is 1 and an unparseable
-file also means 1: privacy fails closed. Turning on tier 2 writes a
-consent line to `consent.log` next to the database, so the moment
-content capture was enabled is auditable later.
+Tier 2 also stores message content, which is what content-based scoring
+reads. The default is 1 and an unparseable file also means 1: privacy
+fails closed. Turning on tier 2 writes a consent line to `consent.log`
+next to the database, so the moment content capture was enabled is
+auditable later.
+
+This applies to the SDK path. Proxied traffic is a different story:
+the proxy shows the streaming response live but never writes its
+content to storage, at any tier, so a proxied trace has no captured
+content to replay. The metadata (tokens, cost, timings, tool calls) is
+always there; the words are not.
 
 ## Policy rules
 

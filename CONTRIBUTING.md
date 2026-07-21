@@ -46,6 +46,13 @@ something and you disagree, the PR explains why.
 **Doc comments.** Public functions get `///` doc comments. `cargo doc` should
 produce something readable.
 
+## AI-assisted contributions
+
+Welcome, and held to the same bar as any other. You are responsible for
+understanding and testing what you submit. The ADR requirement still applies.
+If a PR is substantially AI-generated, say so in the description so review can
+weight it accordingly.
+
 ## Workflow
 
 1. Open an issue first for anything non-trivial. Design is cheaper before code.
@@ -66,8 +73,8 @@ always.
 
 ## Framework adapters
 
-If you want to add a Python SDK adapter, look at the stubs in
-`sdk/python/reeve/adapters/`. The pattern is a callbacks or hooks class that
+If you want to add a Python SDK adapter, look at the existing adapters in
+`sdk/python/reeve_sdk/adapters/`. The pattern is a callbacks or hooks class that
 wraps the Reeve SDK and translates framework lifecycle events into OTel spans.
 Open an issue before starting so we can agree on the interface.
 
