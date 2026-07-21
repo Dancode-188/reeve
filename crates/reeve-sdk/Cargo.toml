@@ -7,6 +7,9 @@ repository.workspace = true
 description = "Rust SDK for agents observed by the Reeve cockpit"
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [dependencies]
 tokio = { workspace = true }
 tokio-stream = "0.1"
