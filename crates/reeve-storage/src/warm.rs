@@ -48,21 +48,15 @@ pub enum StorageError {
 /// Embedded at compile time so the binary doesn't depend on a migrations
 /// directory existing next to wherever it's installed.
 const MIGRATIONS: &[(i64, &str)] = &[
-    (1, include_str!("../../../migrations/0001_initial.sql")),
-    (2, include_str!("../../../migrations/0002_cot_json.sql")),
+    (1, include_str!("../migrations/0001_initial.sql")),
+    (2, include_str!("../migrations/0002_cot_json.sql")),
     (
         3,
-        include_str!("../../../migrations/0003_policy_rules_description.sql"),
+        include_str!("../migrations/0003_policy_rules_description.sql"),
     ),
-    (
-        4,
-        include_str!("../../../migrations/0004_policy_cooldowns.sql"),
-    ),
-    (
-        5,
-        include_str!("../../../migrations/0005_resumable_traces.sql"),
-    ),
-    (6, include_str!("../../../migrations/0006_indices.sql")),
+    (4, include_str!("../migrations/0004_policy_cooldowns.sql")),
+    (5, include_str!("../migrations/0005_resumable_traces.sql")),
+    (6, include_str!("../migrations/0006_indices.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
