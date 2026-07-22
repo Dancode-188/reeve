@@ -37,7 +37,7 @@ Reeve is for that moment.
 ## Quick start
 
 ```bash
-cargo install --git https://github.com/Dancode-188/reeve reeve-cockpit
+cargo install reeve-cockpit
 reeve
 ```
 
@@ -208,6 +208,15 @@ something is going wrong right now.
 
 ## Install
 
+Prebuilt binaries for Linux and macOS are on the
+[releases page](https://github.com/Dancode-188/reeve/releases/latest).
+Download, `chmod +x`, run. Nothing to build.
+
+From crates.io:
+```bash
+cargo install reeve-cockpit
+```
+
 From source:
 ```bash
 git clone https://github.com/Dancode-188/reeve
@@ -216,13 +225,10 @@ cargo build --release
 ./target/release/reeve
 ```
 
-Or straight from the repository:
-```bash
-cargo install --git https://github.com/Dancode-188/reeve reeve-cockpit
-```
-
-Requires Rust 1.85+. Linux and macOS, both in CI; on Windows, run it inside
-WSL (native Windows is not supported). Use `--ascii` if the Unicode
+Building from source needs Rust 1.85+ and `protoc` for the control-channel
+protocol (`apt install protobuf-compiler`, or `brew install protobuf`); the
+prebuilt binaries need neither. Linux and macOS, both in CI; on Windows, run
+it inside WSL (native Windows is not supported). Use `--ascii` if the Unicode
 characters do not render correctly.
 
 ---
