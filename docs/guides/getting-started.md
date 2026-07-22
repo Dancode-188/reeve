@@ -8,11 +8,15 @@ other.
 ## Install
 
 ```bash
-cargo install --git https://github.com/Dancode-188/reeve reeve-cockpit
+cargo install reeve-cockpit
 ```
 
 One binary, `reeve`, lands in your cargo bin. No config file, no
 account, no daemon. The compile is the only slow step; get coffee.
+It needs `protoc` on the way (`apt install protobuf-compiler`, or
+`brew install protobuf`). To skip the build entirely, take a binary
+from the [releases page](https://github.com/Dancode-188/reeve/releases/latest)
+instead.
 
 ## Terminal 1: the cockpit
 
