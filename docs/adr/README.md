@@ -52,6 +52,7 @@ the reasoning as it stood survives next to what replaced it.
 | [0041](./0041-a-streaming-trace-is-not-idle.md) | A Streaming Trace Is Not Idle | Accepted | 2026-07-11 |
 | [0042](./0042-per-agent-daily-budgets.md) | Per-Agent Daily Budgets Wire Cost to the Breaker | Accepted | 2026-07-12 |
 | [0043](./0043-outbound-secret-scanning.md) | Outbound Secret Scanning Warns First, Blocks by Consent | Accepted | 2026-07-13 |
+| [0044](./0044-committed-proto-bindings.md) | Committed Proto Bindings | Accepted | 2026-07-28 |
 
 ## Format
 

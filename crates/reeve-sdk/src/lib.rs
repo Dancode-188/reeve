@@ -5,7 +5,9 @@ pub use checkpoint::{AgentError, CheckpointResult};
 pub use span::{LlmSpan, ToolSpan};
 
 mod proto {
-    tonic::include_proto!("reeve");
+    // Committed rather than built, so no protoc is needed to compile this
+    // crate. See build.rs to regenerate.
+    include!("generated/reeve.rs");
 }
 
 use opentelemetry_otlp::WithExportConfig;
