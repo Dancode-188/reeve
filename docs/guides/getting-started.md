@@ -12,9 +12,8 @@ cargo install reeve-cockpit
 ```
 
 One binary, `reeve`, lands in your cargo bin. No config file, no
-account, no daemon. The compile is the only slow step; get coffee.
-It needs `protoc` on the way (`apt install protobuf-compiler`, or
-`brew install protobuf`). To skip the build entirely, take a binary
+account, no daemon, and nothing to install first. The compile is the
+only slow step; get coffee. To skip the build entirely, take a binary
 from the [releases page](https://github.com/Dancode-188/reeve/releases/latest)
 instead.
 

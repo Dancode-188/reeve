@@ -225,11 +225,10 @@ cargo build --release
 ./target/release/reeve
 ```
 
-Building from source needs Rust 1.85+ and `protoc` for the control-channel
-protocol (`apt install protobuf-compiler`, or `brew install protobuf`); the
-prebuilt binaries need neither. Linux and macOS, both in CI; on Windows, run
-it inside WSL (native Windows is not supported). Use `--ascii` if the Unicode
-characters do not render correctly.
+Building from source needs Rust 1.85+ and nothing else. Linux and macOS,
+both in CI; on Windows, run it inside WSL (native Windows is not
+supported). Use `--ascii` if the Unicode characters do not render
+correctly.
 
 ---
 

@@ -23,12 +23,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Install protoc (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
+      # No protoc here on purpose. The bindings are committed (ADR-0044), so
+      # this job doubles as the proof that a build needs nothing but Rust.
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --workspace -- -D warnings
@@ -49,3 +45,20 @@ jobs:
         with:
           tool: cargo-audit
       - run: cargo audit
+
+  # The proto bindings are committed so that building needs no protoc. This is
+  # the price of that: regenerate them here and fail if the result differs from
+  # what is checked in, so an edited proto cannot quietly ship stale bindings.
+  proto:
+    name: generated proto is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler
+      - run: REEVE_REGENERATE_PROTO=1 cargo build -p reeve-intervention -p reeve-sdk
+      - name: Fail if the committed bindings are stale
+        run: |
+          git diff --exit-code -- \
+            crates/reeve-intervention/src/generated \
+            crates/reeve-sdk/src/generated
