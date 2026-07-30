@@ -30,6 +30,7 @@ pub fn render(
     let bracket = Style::default().fg(theme.subtext());
     let warn = Style::default().fg(theme.health_warn());
 
+    let mut span_hint = false;
     let groups: Vec<Line> = if view_mode == ViewMode::Focus {
         vec![
             key_group("[\u{5B}/\u{5D}]", "traces", &kb, &action, &bracket),
@@ -75,29 +76,55 @@ pub fn render(
         ];
         if right_hidden {
             g.push(Line::from(Span::styled("SPAN \u{25B7}", warn)));
+            span_hint = true;
         }
         g
     };
 
-    // Each group takes the width it actually needs and the slack is shared out
-    // between them. Equal shares looked tidier but cut the longer labels once
-    // the terminal narrowed, which is precisely when the bar matters most.
+    // Each group takes the width it actually needs and the spare columns become
+    // the gaps between them. Equal shares looked tidier until the terminal
+    // narrowed, when they started cutting the longer labels in half.
+    //
+    // Whole labels are not enough on their own, so one column is reserved after
+    // every group but the last. When even that will not fit, groups come off in
+    // reverse order of usefulness: the SPAN hint first, being a signpost rather
+    // than a key you can press, then the view switches from the right, leaving
+    // [?] help and [q] quit standing longest.
+    let mut groups = groups;
+    if span_hint && required_width(&groups) > area.width {
+        groups.pop();
+    }
+    while groups.len() > 3 && required_width(&groups) > area.width {
+        groups.remove(groups.len() - 3);
+    }
+    while groups.len() > 1 && required_width(&groups) > area.width {
+        groups.pop();
+    }
+
+    let last = groups.len() - 1;
     let constraints: Vec<Constraint> = groups
         .iter()
-        .map(|g| Constraint::Length(g.width() as u16))
+        .enumerate()
+        .map(|(i, g)| Constraint::Length(g.width() as u16 + u16::from(i != last)))
         .collect();
     let chunks = Layout::horizontal(constraints)
-        .flex(Flex::SpaceAround)
+        .flex(Flex::SpaceBetween)
         .split(area);
 
     for (chunk, line) in chunks.iter().zip(groups) {
         frame.render_widget(
             Paragraph::new(line)
-                .alignment(Alignment::Center)
+                .alignment(Alignment::Left)
                 .style(chrome_style),
             *chunk,
         );
     }
+}
+
+/// What the bar needs to show these groups with a column between each pair.
+fn required_width(groups: &[Line]) -> u16 {
+    let text: u16 = groups.iter().map(|g| g.width() as u16).sum();
+    text + groups.len().saturating_sub(1) as u16
 }
 
 fn key_group<'a>(
@@ -123,6 +150,13 @@ fn key_group<'a>(
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    const JOINS: [&str; 7] = [
+        "nav[", "history[", "quitSPAN", "fold[", "focus[", "cost[", "help[",
+    ];
+    const LABELS: [&str; 8] = [
+        "nav", "panels", "fold", "focus", "history", "cost", "help", "quit",
+    ];
 
     fn footer_text(width: u16, right_hidden: bool) -> String {
         let theme = Theme::load();
@@ -150,22 +184,43 @@ mod tests {
     }
 
     #[test]
-    fn narrow_footer_keeps_whole_labels() {
-        // 100 columns with the right panel hidden is nine groups, the case that
-        // used to cut "panels" to "pane" and "fold" to "fo".
-        let bar = footer_text(100, true);
-        for label in [
-            "nav", "panels", "fold", "focus", "history", "cost", "help", "quit",
-        ] {
-            assert!(bar.contains(label), "{label} missing from footer: {bar:?}");
+    fn groups_never_run_into_each_other() {
+        for width in 60u16..=200 {
+            let bar = footer_text(width, true);
+            for join in JOINS {
+                assert!(
+                    !bar.contains(join),
+                    "{width} columns ran groups together at {join:?}: {bar:?}"
+                );
+            }
         }
     }
 
     #[test]
-    fn wide_footer_keeps_whole_labels_too() {
-        let bar = footer_text(160, false);
-        for label in ["panels", "fold", "history"] {
-            assert!(bar.contains(label), "{label} missing from footer: {bar:?}");
+    fn every_label_survives_once_the_bar_is_wide_enough() {
+        // The case that used to render "panels" as "panel" and "fold" as "fol".
+        for width in 84u16..=200 {
+            let bar = footer_text(width, true);
+            for label in LABELS {
+                assert!(
+                    bar.contains(label),
+                    "{label} missing at {width} columns: {bar:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn a_cramped_bar_drops_groups_instead_of_letters() {
+        // 80 is the real cramped case: the left panel appears at 80 and the
+        // right one hides below 120, so the nine-group bar has to shed
+        // something here. It sheds whole groups, and never the way out.
+        let bar = footer_text(80, true);
+        assert!(bar.contains("quit"), "quit should survive: {bar:?}");
+        assert!(bar.contains("help"), "help should survive: {bar:?}");
+        assert!(
+            LABELS.iter().filter(|l| bar.contains(**l)).count() < LABELS.len(),
+            "expected a group to be dropped at 80 columns: {bar:?}"
+        );
     }
 }
