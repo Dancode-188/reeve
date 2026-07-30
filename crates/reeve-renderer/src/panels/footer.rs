@@ -2,7 +2,7 @@ use crate::app::ViewMode;
 use crate::theme::Theme;
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Flex, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph},
@@ -79,9 +79,16 @@ pub fn render(
         g
     };
 
-    let n = groups.len();
-    let constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Fill(1)).collect();
-    let chunks = Layout::horizontal(constraints).split(area);
+    // Each group takes the width it actually needs and the slack is shared out
+    // between them. Equal shares looked tidier but cut the longer labels once
+    // the terminal narrowed, which is precisely when the bar matters most.
+    let constraints: Vec<Constraint> = groups
+        .iter()
+        .map(|g| Constraint::Length(g.width() as u16))
+        .collect();
+    let chunks = Layout::horizontal(constraints)
+        .flex(Flex::SpaceAround)
+        .split(area);
 
     for (chunk, line) in chunks.iter().zip(groups) {
         frame.render_widget(
@@ -110,4 +117,55 @@ fn key_group<'a>(
         Span::raw(" "),
         Span::styled(label, *action),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn footer_text(width: u16, right_hidden: bool) -> String {
+        let theme = Theme::load();
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    frame.area(),
+                    &theme,
+                    right_hidden,
+                    false,
+                    ViewMode::Fleet,
+                );
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn narrow_footer_keeps_whole_labels() {
+        // 100 columns with the right panel hidden is nine groups, the case that
+        // used to cut "panels" to "pane" and "fold" to "fo".
+        let bar = footer_text(100, true);
+        for label in [
+            "nav", "panels", "fold", "focus", "history", "cost", "help", "quit",
+        ] {
+            assert!(bar.contains(label), "{label} missing from footer: {bar:?}");
+        }
+    }
+
+    #[test]
+    fn wide_footer_keeps_whole_labels_too() {
+        let bar = footer_text(160, false);
+        for label in ["panels", "fold", "history"] {
+            assert!(bar.contains(label), "{label} missing from footer: {bar:?}");
+        }
+    }
 }
