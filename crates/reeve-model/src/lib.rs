@@ -1,3 +1,4 @@
+pub mod capability;
 pub mod entity;
 pub mod ids;
 pub mod scoring;

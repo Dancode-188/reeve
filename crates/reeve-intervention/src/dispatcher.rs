@@ -1,6 +1,8 @@
 use crate::proto::{self, CommandType as ProtoCommandType, control_message};
 use crate::server::ControlServer;
 use crate::types::AckNotification;
+use reeve_model::capability::path_supports;
+use reeve_model::entity::agent::IntegrationPath;
 use reeve_model::entity::intervention::{
     AckStatus, AppliedCommand, CommandStatus, CommandType, InterventionCommand,
 };
@@ -229,13 +231,30 @@ impl Dispatcher {
     }
 
     /// Queues a command for proxy application when the target is a
-    /// proxy-path agent and the command type survives without a control
-    /// channel. Pause and kill do not: pause has no safe hold on this
-    /// path, and kill has different semantics owned elsewhere.
+    /// proxy-path agent and the command survives without a control channel.
+    /// What survives is `reeve_model::capability`'s answer, not this
+    /// function's opinion; kill is the one that reaches here and is not
+    /// queued, because the breaker is enforced locally.
     async fn queue_for_proxy(&self, agent_id: &AgentId, command: &InterventionCommand) -> bool {
         let Some(ref queue) = self.proxy_interventions else {
             return false;
         };
+        // Resume against an engaged breaker is the revive: the one recovery
+        // short of restarting Reeve. It resets state Reeve holds rather than
+        // asking the agent for anything, so it settles before the capability
+        // question is asked at all.
+        if matches!(command.command_type, CommandType::Resume) {
+            let mut q = queue.lock().unwrap();
+            if q.killed.remove(agent_id) {
+                q.applied
+                    .push((command.id.clone(), agent_id.clone(), current_ms()));
+                return true;
+            }
+            return false;
+        }
+        if !path_supports(IntegrationPath::Proxy, &command.command_type) {
+            return false;
+        }
         let payload = match &command.command_type {
             CommandType::Redirect { instruction } => {
                 Some(reeve_model::entity::ProxyPayload::Redirect {
@@ -249,18 +268,7 @@ impl Dispatcher {
             }
             // Kill is the circuit breaker: engaged below, not queued.
             CommandType::Kill => None,
-            // Resume against an engaged breaker is the revive: the one
-            // recovery short of restarting Reeve. Anything else has no
-            // proxy meaning.
-            CommandType::Resume => {
-                let mut q = queue.lock().unwrap();
-                if q.killed.remove(agent_id) {
-                    q.applied
-                        .push((command.id.clone(), agent_id.clone(), current_ms()));
-                    return true;
-                }
-                return false;
-            }
+            // Unreachable: path_supports has already rejected the rest.
             _ => return false,
         };
         let is_proxy_agent = matches!(
