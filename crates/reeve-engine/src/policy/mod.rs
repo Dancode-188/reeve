@@ -2,6 +2,8 @@ pub mod config;
 pub mod dsl;
 
 use dsl::PolicyContext;
+use reeve_model::capability::{capability_name, path_supports};
+use reeve_model::entity::agent::IntegrationPath;
 use reeve_model::entity::intervention::{CommandStatus, CommandType, InterventionCommand};
 use reeve_model::entity::policy::{PolicyRule, RuleScope};
 use reeve_model::ids::{AgentId, CommandId, RuleId, TraceId};
@@ -115,17 +117,21 @@ impl PolicyEngine {
     ///
     /// Policy fires once per trace on Tier 1 results. The `now` parameter
     /// is passed in rather than read inside so tests can control the clock.
+    ///
+    /// `integration` is the agent's path, used to drop rules it could never
+    /// honor. See [`skips_rule`] for why that check comes first.
     pub fn evaluate(
         &mut self,
         agent_id: &AgentId,
         trace_id: &TraceId,
         ctx: &PolicyContext,
+        integration: IntegrationPath,
         now: Instant,
         now_ms: i64,
     ) -> Vec<FiredRule> {
         let mut fired = Vec::new();
         for rule in &self.rules {
-            if !rule.enabled {
+            if !rule.enabled || skips_rule(rule, integration) {
                 continue;
             }
             let key = (agent_id.clone(), rule.id.clone());
@@ -153,6 +159,7 @@ impl PolicyEngine {
         agent_id: &AgentId,
         trace_id: &TraceId,
         predicted_cost: f64,
+        integration: IntegrationPath,
         now: Instant,
         now_ms: i64,
     ) -> Vec<FiredRule> {
@@ -160,6 +167,7 @@ impl PolicyEngine {
         let mut fired = Vec::new();
         for rule in &self.rules {
             if !rule.enabled
+                || skips_rule(rule, integration)
                 || !rule
                     .trigger_condition
                     .contains("predicted_cost_at_completion")
@@ -205,21 +213,31 @@ fn build_command(rule: &PolicyRule, trace_id: &TraceId, now_ms: i64) -> Interven
     }
 }
 
-fn command_type_str(ct: &CommandType) -> &'static str {
-    match ct {
-        CommandType::Pause => "pause",
-        CommandType::Resume => "resume",
-        CommandType::Kill => "kill",
-        CommandType::Redirect { .. } => "redirect",
-        CommandType::InjectContext { .. } => "inject_context",
+/// Whether this rule should be ignored for an agent on this path.
+///
+/// Checked before the cooldown and before the condition, because the harm
+/// is the alert, not the dispatch. A pause rule matching a proxy agent used
+/// to raise "suggested action: pause" in the cockpit and then fail to
+/// deliver, leaving the operator staring at a suggestion the next line
+/// contradicted. A rule that cannot be honored is not a suggestion.
+fn skips_rule(rule: &PolicyRule, integration: IntegrationPath) -> bool {
+    if path_supports(integration, &rule.command_type) {
+        return false;
     }
+    tracing::debug!(
+        rule_id = %rule.id,
+        command = capability_name(&rule.command_type),
+        ?integration,
+        "skipping policy rule: this agent's integration path cannot run the command"
+    );
+    true
 }
 
 pub fn alert_fields(fired: &FiredRule) -> (&str, &str, &'static str, bool, Option<u64>) {
     (
         fired.rule.id.as_str(),
         &fired.rule.description,
-        command_type_str(&fired.rule.command_type),
+        capability_name(&fired.rule.command_type),
         fired.rule.requires_confirmation,
         fired.rule.auto_confirm_after_secs,
     )
@@ -244,10 +262,137 @@ mod tests {
         PolicyContext::build(health_score, cost_usd, 5, false, 0.45, 0.0, &metrics)
     }
 
+    /// Issue #274. Every builtin rule commands pause, and a proxy agent
+    /// cannot be paused, so all four must stay silent rather than alerting
+    /// with a suggestion the overlay contradicts one line later.
+    #[test]
+    fn a_pause_rule_never_fires_against_a_proxy_agent() {
+        let mut engine = PolicyEngine::with_defaults();
+        // Conditions chosen to trip low_health, high_cost and loop_detected
+        // at once: on the SDK path this is a three-alert trace.
+        let breaking = ctx(25.0, 6.0, 0.3);
+        let sdk = engine.evaluate(
+            &agent(),
+            &trace(),
+            &breaking,
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
+        assert!(
+            sdk.len() >= 3,
+            "the conditions should trip several rules on a path that can pause: {:?}",
+            sdk.iter().map(|f| f.rule.id.as_str()).collect::<Vec<_>>()
+        );
+
+        let mut engine = PolicyEngine::with_defaults();
+        let proxied = engine.evaluate(
+            &agent(),
+            &trace(),
+            &breaking,
+            IntegrationPath::Proxy,
+            Instant::now(),
+            0,
+        );
+        assert!(
+            proxied.is_empty(),
+            "a proxy agent cannot be paused, so nothing should have fired: {:?}",
+            proxied
+                .iter()
+                .map(|f| f.rule.id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_skipped_rule_does_not_burn_its_cooldown() {
+        // The proxy evaluation must leave no trace, so that an agent
+        // re-registering on a path that CAN pause is not silenced by a
+        // cooldown set while the rule was inapplicable.
+        let mut engine = PolicyEngine::with_defaults();
+        let now = Instant::now();
+        engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(25.0, 1.0, 0.9),
+            IntegrationPath::Proxy,
+            now,
+            0,
+        );
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(25.0, 1.0, 0.9),
+            IntegrationPath::Sdk,
+            now,
+            0,
+        );
+        assert!(
+            fired
+                .iter()
+                .any(|f| f.rule.id.as_str() == "builtin_low_health"),
+            "the earlier skip should not have started a cooldown"
+        );
+    }
+
+    #[test]
+    fn a_log_agent_gets_no_policy_alerts_at_all() {
+        let mut engine = PolicyEngine::with_defaults();
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(25.0, 6.0, 0.3),
+            IntegrationPath::Log,
+            Instant::now(),
+            0,
+        );
+        assert!(fired.is_empty(), "log agents have no control channel");
+    }
+
+    /// The mid-trace path is a separate loop and had to learn the same rule.
+    #[test]
+    fn predicted_cost_stays_quiet_for_a_proxy_agent() {
+        let mut engine = PolicyEngine::with_defaults();
+        assert!(
+            !engine
+                .evaluate_mid_trace(
+                    &agent(),
+                    &trace(),
+                    9.5,
+                    IntegrationPath::Sdk,
+                    Instant::now(),
+                    0
+                )
+                .is_empty(),
+            "the predicted-cost rule should fire on the sdk path"
+        );
+        let mut engine = PolicyEngine::with_defaults();
+        assert!(
+            engine
+                .evaluate_mid_trace(
+                    &agent(),
+                    &trace(),
+                    9.5,
+                    IntegrationPath::Proxy,
+                    Instant::now(),
+                    0
+                )
+                .is_empty(),
+            "but not on a path that cannot pause"
+        );
+    }
+
     #[test]
     fn low_health_score_fires_rule() {
         let mut engine = PolicyEngine::with_defaults();
-        let fired = engine.evaluate(&agent(), &trace(), &ctx(25.0, 1.0, 0.9), Instant::now(), 0);
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(25.0, 1.0, 0.9),
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
         assert!(
             fired
                 .iter()
@@ -258,7 +403,14 @@ mod tests {
     #[test]
     fn high_cost_fires_rule() {
         let mut engine = PolicyEngine::with_defaults();
-        let fired = engine.evaluate(&agent(), &trace(), &ctx(80.0, 6.0, 0.9), Instant::now(), 0);
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(80.0, 6.0, 0.9),
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
         assert!(
             fired
                 .iter()
@@ -269,7 +421,14 @@ mod tests {
     #[test]
     fn loop_detection_fires_rule() {
         let mut engine = PolicyEngine::with_defaults();
-        let fired = engine.evaluate(&agent(), &trace(), &ctx(80.0, 1.0, 0.3), Instant::now(), 0);
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(80.0, 1.0, 0.3),
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
         assert!(
             fired
                 .iter()
@@ -280,14 +439,28 @@ mod tests {
     #[test]
     fn healthy_trace_fires_no_rules() {
         let mut engine = PolicyEngine::with_defaults();
-        let fired = engine.evaluate(&agent(), &trace(), &ctx(85.0, 1.0, 0.9), Instant::now(), 0);
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(85.0, 1.0, 0.9),
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
         assert!(fired.is_empty());
     }
 
     #[test]
     fn multiple_rules_can_fire_together() {
         let mut engine = PolicyEngine::with_defaults();
-        let fired = engine.evaluate(&agent(), &trace(), &ctx(25.0, 6.0, 0.3), Instant::now(), 0);
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(25.0, 6.0, 0.3),
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
         assert_eq!(fired.len(), 3);
     }
 
@@ -296,13 +469,13 @@ mod tests {
         let mut engine = PolicyEngine::with_defaults();
         let c = ctx(25.0, 1.0, 0.9);
         let now = Instant::now();
-        let first = engine.evaluate(&agent(), &trace(), &c, now, 0);
+        let first = engine.evaluate(&agent(), &trace(), &c, IntegrationPath::Sdk, now, 0);
         assert!(
             first
                 .iter()
                 .any(|f| f.rule.id.as_str() == "builtin_low_health")
         );
-        let second = engine.evaluate(&agent(), &trace(), &c, now, 0);
+        let second = engine.evaluate(&agent(), &trace(), &c, IntegrationPath::Sdk, now, 0);
         assert!(
             second
                 .iter()
@@ -315,9 +488,9 @@ mod tests {
         let mut engine = PolicyEngine::with_defaults();
         let c = ctx(25.0, 1.0, 0.9);
         let now = Instant::now();
-        engine.evaluate(&agent(), &trace(), &c, now, 0);
+        engine.evaluate(&agent(), &trace(), &c, IntegrationPath::Sdk, now, 0);
         let later = now + Duration::from_secs(301);
-        let fired = engine.evaluate(&agent(), &trace(), &c, later, 0);
+        let fired = engine.evaluate(&agent(), &trace(), &c, IntegrationPath::Sdk, later, 0);
         assert!(
             fired
                 .iter()
@@ -328,7 +501,14 @@ mod tests {
     #[test]
     fn command_id_is_rule_and_trace_composite() {
         let mut engine = PolicyEngine::with_defaults();
-        let fired = engine.evaluate(&agent(), &trace(), &ctx(25.0, 1.0, 0.9), Instant::now(), 0);
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(25.0, 1.0, 0.9),
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
         let cmd = &fired
             .iter()
             .find(|f| f.rule.id.as_str() == "builtin_low_health")
@@ -340,7 +520,14 @@ mod tests {
     #[test]
     fn command_status_is_pending_confirmation_when_required() {
         let mut engine = PolicyEngine::with_defaults();
-        let fired = engine.evaluate(&agent(), &trace(), &ctx(25.0, 1.0, 0.9), Instant::now(), 0);
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(25.0, 1.0, 0.9),
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
         let cmd = &fired
             .iter()
             .find(|f| f.rule.id.as_str() == "builtin_low_health")
@@ -352,7 +539,14 @@ mod tests {
     #[test]
     fn predicted_cost_fires_mid_trace_rule() {
         let mut engine = PolicyEngine::with_defaults();
-        let fired = engine.evaluate_mid_trace(&agent(), &trace(), 9.5, Instant::now(), 0);
+        let fired = engine.evaluate_mid_trace(
+            &agent(),
+            &trace(),
+            9.5,
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
         assert!(
             fired
                 .iter()
@@ -363,7 +557,14 @@ mod tests {
     #[test]
     fn predicted_cost_below_threshold_does_not_fire() {
         let mut engine = PolicyEngine::with_defaults();
-        let fired = engine.evaluate_mid_trace(&agent(), &trace(), 4.0, Instant::now(), 0);
+        let fired = engine.evaluate_mid_trace(
+            &agent(),
+            &trace(),
+            4.0,
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
         assert!(fired.is_empty());
     }
 
@@ -371,7 +572,14 @@ mod tests {
     fn mid_trace_does_not_fire_trace_level_rules() {
         let mut engine = PolicyEngine::with_defaults();
         // Even with predicted_cost well above threshold, only the predicted_cost rule fires.
-        let fired = engine.evaluate_mid_trace(&agent(), &trace(), 20.0, Instant::now(), 0);
+        let fired = engine.evaluate_mid_trace(
+            &agent(),
+            &trace(),
+            20.0,
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].rule.id.as_str(), "builtin_predicted_cost");
     }
@@ -381,8 +589,22 @@ mod tests {
         let mut engine = PolicyEngine::with_defaults();
         let c = ctx(25.0, 1.0, 0.9);
         let now = Instant::now();
-        engine.evaluate(&AgentId::from("agent-a"), &trace(), &c, now, 0);
-        let fired = engine.evaluate(&AgentId::from("agent-b"), &trace(), &c, now, 0);
+        engine.evaluate(
+            &AgentId::from("agent-a"),
+            &trace(),
+            &c,
+            IntegrationPath::Sdk,
+            now,
+            0,
+        );
+        let fired = engine.evaluate(
+            &AgentId::from("agent-b"),
+            &trace(),
+            &c,
+            IntegrationPath::Sdk,
+            now,
+            0,
+        );
         assert!(
             fired
                 .iter()
@@ -409,7 +631,14 @@ mod tests {
     fn replace_user_rules_adds_valid_rule() {
         let mut engine = PolicyEngine::with_defaults();
         engine.replace_user_rules(vec![user_rule("custom_low_health", "health_score < 50")]);
-        let fired = engine.evaluate(&agent(), &trace(), &ctx(40.0, 1.0, 0.9), Instant::now(), 0);
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(40.0, 1.0, 0.9),
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
         assert!(
             fired
                 .iter()
@@ -421,7 +650,14 @@ mod tests {
     fn replace_user_rules_drops_invalid_condition() {
         let mut engine = PolicyEngine::with_defaults();
         engine.replace_user_rules(vec![user_rule("bad_rule", "not a valid !!!! expr ???")]);
-        let fired = engine.evaluate(&agent(), &trace(), &ctx(25.0, 1.0, 0.9), Instant::now(), 0);
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(25.0, 1.0, 0.9),
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
         assert!(fired.iter().all(|f| f.rule.id.as_str() != "bad_rule"));
     }
 
@@ -429,7 +665,14 @@ mod tests {
     fn replace_user_rules_preserves_builtins() {
         let mut engine = PolicyEngine::with_defaults();
         engine.replace_user_rules(vec![user_rule("custom_rule", "health_score < 50")]);
-        let fired = engine.evaluate(&agent(), &trace(), &ctx(25.0, 1.0, 0.9), Instant::now(), 0);
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(25.0, 1.0, 0.9),
+            IntegrationPath::Sdk,
+            Instant::now(),
+            0,
+        );
         assert!(
             fired
                 .iter()
@@ -459,6 +702,7 @@ mod tests {
             &agent(),
             &trace(),
             &ctx(25.0, 1.0, 0.9),
+            IntegrationPath::Sdk,
             Instant::now(),
             now_ms,
         );
@@ -479,7 +723,14 @@ mod tests {
         engine.load_cooldowns(&records, now_ms);
         // Evaluate 301s after last fire; cooldown should be expired.
         let later = Instant::now() + Duration::from_secs(1);
-        let fired = engine.evaluate(&agent(), &trace(), &ctx(25.0, 1.0, 0.9), later, now_ms);
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(25.0, 1.0, 0.9),
+            IntegrationPath::Sdk,
+            later,
+            now_ms,
+        );
         assert!(
             fired
                 .iter()

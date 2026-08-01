@@ -649,31 +649,21 @@ impl AppState {
         })
     }
 
-    /// What the agent can actually do. SDK agents declare capabilities
-    /// in their control handshake; proxy agents have no handshake, and
-    /// their capabilities are what the request path supports: redirect
-    /// and inject-context, applied on the next request. Pause is absent
-    /// rather than present-but-broken.
+    /// What the agent can actually do. SDK agents declare capabilities in
+    /// their control handshake, and that declaration wins. Everything else
+    /// falls back to what the integration path allows at all, which
+    /// `reeve_model::capability` owns so the dispatcher and the policy
+    /// engine cannot disagree with what these rows show.
     pub fn effective_capabilities(&self, agent_id: &AgentId) -> Vec<String> {
         if let Some(caps) = self.agent_capabilities.get(agent_id) {
             return caps.clone();
         }
-        let is_proxy = self
-            .agents
+        self.agents
             .get(agent_id)
-            .is_some_and(|a| a.agent.integration == reeve_model::entity::IntegrationPath::Proxy);
-        if is_proxy {
-            vec![
-                "redirect".to_string(),
-                "inject_context".to_string(),
-                "kill".to_string(),
-            ]
-        } else {
-            Vec::new()
-        }
+            .and_then(|a| reeve_model::capability::path_capabilities(a.agent.integration))
+            .unwrap_or_default()
     }
 
-    /// Whether the agent arrived via the proxy path.
     /// What the streaming box shows. Replay owns the box while active;
     /// live sessions show the selected agent's oldest active stream, so
     /// a quick side call never displaces the main generation, falling

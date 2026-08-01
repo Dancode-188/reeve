@@ -13,6 +13,7 @@ use evaluation::llm_judge::{self, LlmJudge};
 use outcome::OutcomeTracker;
 use policy::dsl::PolicyContext;
 use policy::{PolicyEngine, alert_fields};
+use reeve_model::entity::agent::IntegrationPath;
 use reeve_model::entity::evaluation::{EvaluationResult, EvaluatorType, TargetType};
 use reeve_model::entity::intervention::{
     AppliedCommand, CommandStatus, CommandType, InterventionCommand,
@@ -321,6 +322,7 @@ pub async fn run(
                         &agent_id,
                         &trace_id,
                         &policy_ctx,
+                        integration_path_for(&warm, &agent_id).await,
                         Instant::now(),
                         now_ms,
                     );
@@ -522,6 +524,7 @@ pub async fn run(
                     &agent_id,
                     &trace_id,
                     predicted,
+                    integration_path_for(&warm, &agent_id).await,
                     Instant::now(),
                     now_ms,
                 );
@@ -592,6 +595,26 @@ pub async fn run(
 /// measured-outcome aggregation. A minimum of three samples guards against
 /// suggesting from noise; below it the alert simply carries no hint. Query
 /// failure degrades the same way: an alert without a hint beats no alert.
+/// How this agent reaches Reeve, which decides what can be commanded of it.
+///
+/// Fails open to `Sdk`, the path that rules nothing out. A missing or
+/// unreadable agent row is a storage problem; silently suppressing every
+/// policy alert for that agent would turn it into a monitoring problem.
+async fn integration_path_for(warm: &WarmStore, agent_id: &AgentId) -> IntegrationPath {
+    match warm.get_agent(agent_id).await {
+        Ok(Some(agent)) => agent.integration,
+        Ok(None) => IntegrationPath::Sdk,
+        Err(e) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %e,
+                "could not read the agent's integration path; assuming sdk"
+            );
+            IntegrationPath::Sdk
+        }
+    }
+}
+
 async fn effectiveness_hint(
     warm: &WarmStore,
     rule_id: &RuleId,
