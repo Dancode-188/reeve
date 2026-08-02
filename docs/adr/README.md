@@ -53,6 +53,7 @@ the reasoning as it stood survives next to what replaced it.
 | [0042](./0042-per-agent-daily-budgets.md) | Per-Agent Daily Budgets Wire Cost to the Breaker | Accepted | 2026-07-12 |
 | [0043](./0043-outbound-secret-scanning.md) | Outbound Secret Scanning Warns First, Blocks by Consent | Accepted | 2026-07-13 |
 | [0044](./0044-committed-proto-bindings.md) | Committed Proto Bindings | Accepted | 2026-07-28 |
+| [0045](./0045-a-policy-alert-is-not-a-command.md) | A Policy Alert Is Not a Command | Accepted | 2026-08-03 |
 
 ## Format
 
