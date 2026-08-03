@@ -2,8 +2,7 @@ pub mod config;
 pub mod dsl;
 
 use dsl::PolicyContext;
-use reeve_model::capability::{capability_name, path_supports};
-use reeve_model::entity::agent::IntegrationPath;
+use reeve_model::capability::{AgentReach, can_command, capability_name};
 use reeve_model::entity::intervention::{CommandStatus, CommandType, InterventionCommand};
 use reeve_model::entity::policy::{PolicyRule, RuleScope};
 use reeve_model::ids::{AgentId, CommandId, RuleId, TraceId};
@@ -15,6 +14,10 @@ const COMMAND_VALIDITY_MS: i64 = 60_000;
 pub struct FiredRule {
     pub rule: PolicyRule,
     pub command: InterventionCommand,
+    /// Whether the target can actually run `command` right now. When false
+    /// the alert still goes out, carrying no suggested action, and nothing
+    /// is dispatched. The condition matched either way. ADR-0045.
+    pub command_available: bool,
 }
 
 pub struct PolicyEngine {
@@ -118,20 +121,21 @@ impl PolicyEngine {
     /// Policy fires once per trace on Tier 1 results. The `now` parameter
     /// is passed in rather than read inside so tests can control the clock.
     ///
-    /// `integration` is the agent's path, used to drop rules it could never
-    /// honor. See [`skips_rule`] for why that check comes first.
+    /// `integration` and `live_capabilities` decide only whether the fired
+    /// rule carries a usable command, never whether it fires. A rule whose
+    /// condition matched is reported either way. ADR-0045.
     pub fn evaluate(
         &mut self,
         agent_id: &AgentId,
         trace_id: &TraceId,
         ctx: &PolicyContext,
-        integration: IntegrationPath,
+        reach: AgentReach<'_>,
         now: Instant,
         now_ms: i64,
     ) -> Vec<FiredRule> {
         let mut fired = Vec::new();
         for rule in &self.rules {
-            if !rule.enabled || skips_rule(rule, integration) {
+            if !rule.enabled {
                 continue;
             }
             let key = (agent_id.clone(), rule.id.clone());
@@ -144,6 +148,7 @@ impl PolicyEngine {
                 self.cooldowns.insert(key, now);
                 fired.push(FiredRule {
                     command: build_command(rule, trace_id, now_ms),
+                    command_available: can_command(reach, &rule.command_type),
                     rule: rule.clone(),
                 });
             }
@@ -159,7 +164,7 @@ impl PolicyEngine {
         agent_id: &AgentId,
         trace_id: &TraceId,
         predicted_cost: f64,
-        integration: IntegrationPath,
+        reach: AgentReach<'_>,
         now: Instant,
         now_ms: i64,
     ) -> Vec<FiredRule> {
@@ -167,7 +172,6 @@ impl PolicyEngine {
         let mut fired = Vec::new();
         for rule in &self.rules {
             if !rule.enabled
-                || skips_rule(rule, integration)
                 || !rule
                     .trigger_condition
                     .contains("predicted_cost_at_completion")
@@ -184,6 +188,7 @@ impl PolicyEngine {
                 self.cooldowns.insert(key, now);
                 fired.push(FiredRule {
                     command: build_command(rule, trace_id, now_ms),
+                    command_available: can_command(reach, &rule.command_type),
                     rule: rule.clone(),
                 });
             }
@@ -213,39 +218,32 @@ fn build_command(rule: &PolicyRule, trace_id: &TraceId, now_ms: i64) -> Interven
     }
 }
 
-/// Whether this rule should be ignored for an agent on this path.
+/// What the renderer needs to draw this alert.
 ///
-/// Checked before the cooldown and before the condition, because the harm
-/// is the alert, not the dispatch. A pause rule matching a proxy agent used
-/// to raise "suggested action: pause" in the cockpit and then fail to
-/// deliver, leaving the operator staring at a suggestion the next line
-/// contradicted. A rule that cannot be honored is not a suggestion.
-fn skips_rule(rule: &PolicyRule, integration: IntegrationPath) -> bool {
-    if path_supports(integration, &rule.command_type) {
-        return false;
-    }
-    tracing::debug!(
-        rule_id = %rule.id,
-        command = capability_name(&rule.command_type),
-        ?integration,
-        "skipping policy rule: this agent's integration path cannot run the command"
-    );
-    true
-}
-
-pub fn alert_fields(fired: &FiredRule) -> (&str, &str, &'static str, bool, Option<u64>) {
+/// The command is `None` when the target cannot run it. `requires_confirmation`
+/// is passed through either way, because an alert with nothing to offer still
+/// deserves the operator's attention; what it loses is the countdown, since
+/// auto-dispatching a command that cannot be delivered would fire a guaranteed
+/// dead letter. The alert itself is never withheld. ADR-0045.
+pub fn alert_fields(fired: &FiredRule) -> (&str, &str, Option<&'static str>, bool, Option<u64>) {
     (
         fired.rule.id.as_str(),
         &fired.rule.description,
-        capability_name(&fired.rule.command_type),
+        fired
+            .command_available
+            .then(|| capability_name(&fired.rule.command_type)),
         fired.rule.requires_confirmation,
-        fired.rule.auto_confirm_after_secs,
+        fired
+            .rule
+            .auto_confirm_after_secs
+            .filter(|_| fired.command_available),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reeve_model::entity::agent::IntegrationPath;
     use std::collections::HashMap;
 
     fn agent() -> AgentId {
@@ -262,124 +260,118 @@ mod tests {
         PolicyContext::build(health_score, cost_usd, 5, false, 0.45, 0.0, &metrics)
     }
 
-    /// Issue #274. Every builtin rule commands pause, and a proxy agent
-    /// cannot be paused, so all four must stay silent rather than alerting
-    /// with a suggestion the overlay contradicts one line later.
-    #[test]
-    fn a_pause_rule_never_fires_against_a_proxy_agent() {
-        let mut engine = PolicyEngine::with_defaults();
-        // Conditions chosen to trip low_health, high_cost and loop_detected
-        // at once: on the SDK path this is a three-alert trace.
-        let breaking = ctx(25.0, 6.0, 0.3);
-        let sdk = engine.evaluate(
-            &agent(),
-            &trace(),
-            &breaking,
-            IntegrationPath::Sdk,
-            Instant::now(),
-            0,
-        );
-        assert!(
-            sdk.len() >= 3,
-            "the conditions should trip several rules on a path that can pause: {:?}",
-            sdk.iter().map(|f| f.rule.id.as_str()).collect::<Vec<_>>()
-        );
+    /// An agent holding a live control stream that declared `pause`.
+    fn can_pause() -> Vec<String> {
+        vec!["pause".to_string()]
+    }
 
+    /// Issues #274 and #296, and the behaviour ADR-0045 settled. Every
+    /// builtin rule commands pause. A proxy agent cannot be paused, so the
+    /// rules still fire and still report, they just carry no action.
+    #[test]
+    fn a_proxy_agent_still_gets_its_alerts_without_a_pause_to_offer() {
+        // Conditions chosen to trip low_health, high_cost and loop_detected
+        // at once.
+        let breaking = ctx(25.0, 6.0, 0.3);
         let mut engine = PolicyEngine::with_defaults();
         let proxied = engine.evaluate(
             &agent(),
             &trace(),
             &breaking,
-            IntegrationPath::Proxy,
+            AgentReach::new(IntegrationPath::Proxy, None),
             Instant::now(),
             0,
         );
         assert!(
-            proxied.is_empty(),
-            "a proxy agent cannot be paused, so nothing should have fired: {:?}",
+            proxied.len() >= 3,
+            "the conditions matched, so the operator must hear about them: {:?}",
             proxied
                 .iter()
                 .map(|f| f.rule.id.as_str())
                 .collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn a_skipped_rule_does_not_burn_its_cooldown() {
-        // The proxy evaluation must leave no trace, so that an agent
-        // re-registering on a path that CAN pause is not silenced by a
-        // cooldown set while the rule was inapplicable.
-        let mut engine = PolicyEngine::with_defaults();
-        let now = Instant::now();
-        engine.evaluate(
-            &agent(),
-            &trace(),
-            &ctx(25.0, 1.0, 0.9),
-            IntegrationPath::Proxy,
-            now,
-            0,
-        );
-        let fired = engine.evaluate(
-            &agent(),
-            &trace(),
-            &ctx(25.0, 1.0, 0.9),
-            IntegrationPath::Sdk,
-            now,
-            0,
-        );
         assert!(
-            fired
-                .iter()
-                .any(|f| f.rule.id.as_str() == "builtin_low_health"),
-            "the earlier skip should not have started a cooldown"
+            proxied.iter().all(|f| !f.command_available),
+            "no proxy agent can be paused, so none of these may offer one"
         );
+        for fr in &proxied {
+            let (_, _, cmd, _, auto) = alert_fields(fr);
+            assert_eq!(cmd, None, "an unavailable command must not be suggested");
+            assert_eq!(auto, None, "and must never run a countdown to dispatch");
+        }
     }
 
+    /// The #296 case: spans arrived over OTLP so the path reads as Sdk, but
+    /// no control channel was ever opened, so there is no wire to send down.
     #[test]
-    fn a_log_agent_gets_no_policy_alerts_at_all() {
+    fn an_sdk_agent_with_no_live_stream_is_alerted_but_offered_nothing() {
         let mut engine = PolicyEngine::with_defaults();
         let fired = engine.evaluate(
             &agent(),
             &trace(),
             &ctx(25.0, 6.0, 0.3),
-            IntegrationPath::Log,
+            AgentReach::new(IntegrationPath::Sdk, None),
             Instant::now(),
             0,
         );
-        assert!(fired.is_empty(), "log agents have no control channel");
+        assert!(!fired.is_empty(), "the conditions still matched");
+        assert!(
+            fired.iter().all(|f| !f.command_available),
+            "there is no control channel, so nothing can be offered"
+        );
     }
 
-    /// The mid-trace path is a separate loop and had to learn the same rule.
     #[test]
-    fn predicted_cost_stays_quiet_for_a_proxy_agent() {
+    fn a_live_handshake_is_what_makes_a_command_offerable() {
         let mut engine = PolicyEngine::with_defaults();
-        assert!(
-            !engine
-                .evaluate_mid_trace(
-                    &agent(),
-                    &trace(),
-                    9.5,
-                    IntegrationPath::Sdk,
-                    Instant::now(),
-                    0
-                )
-                .is_empty(),
-            "the predicted-cost rule should fire on the sdk path"
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(25.0, 6.0, 0.3),
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
+            Instant::now(),
+            0,
         );
+        assert!(
+            fired.iter().all(|f| f.command_available),
+            "an agent that declared pause can be sent one"
+        );
+        let (_, _, cmd, _, _) = alert_fields(&fired[0]);
+        assert_eq!(cmd, Some("pause"));
+    }
+
+    #[test]
+    fn a_log_agent_is_alerted_and_offered_nothing() {
         let mut engine = PolicyEngine::with_defaults();
-        assert!(
-            engine
-                .evaluate_mid_trace(
-                    &agent(),
-                    &trace(),
-                    9.5,
-                    IntegrationPath::Proxy,
-                    Instant::now(),
-                    0
-                )
-                .is_empty(),
-            "but not on a path that cannot pause"
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &ctx(25.0, 6.0, 0.3),
+            AgentReach::new(IntegrationPath::Log, None),
+            Instant::now(),
+            0,
         );
+        assert!(!fired.is_empty(), "a log agent is still worth reporting on");
+        assert!(fired.iter().all(|f| !f.command_available));
+    }
+
+    /// The mid-trace loop is separate code and has to behave the same.
+    #[test]
+    fn predicted_cost_alerts_a_proxy_agent_without_offering_pause() {
+        let mut engine = PolicyEngine::with_defaults();
+        let fired = engine.evaluate_mid_trace(
+            &agent(),
+            &trace(),
+            9.5,
+            AgentReach::new(IntegrationPath::Proxy, None),
+            Instant::now(),
+            0,
+        );
+        assert!(
+            !fired.is_empty(),
+            "the predicted overrun is real either way"
+        );
+        assert!(fired.iter().all(|f| !f.command_available));
     }
 
     #[test]
@@ -389,7 +381,7 @@ mod tests {
             &agent(),
             &trace(),
             &ctx(25.0, 1.0, 0.9),
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             0,
         );
@@ -407,7 +399,7 @@ mod tests {
             &agent(),
             &trace(),
             &ctx(80.0, 6.0, 0.9),
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             0,
         );
@@ -425,7 +417,7 @@ mod tests {
             &agent(),
             &trace(),
             &ctx(80.0, 1.0, 0.3),
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             0,
         );
@@ -443,7 +435,7 @@ mod tests {
             &agent(),
             &trace(),
             &ctx(85.0, 1.0, 0.9),
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             0,
         );
@@ -457,7 +449,7 @@ mod tests {
             &agent(),
             &trace(),
             &ctx(25.0, 6.0, 0.3),
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             0,
         );
@@ -469,13 +461,27 @@ mod tests {
         let mut engine = PolicyEngine::with_defaults();
         let c = ctx(25.0, 1.0, 0.9);
         let now = Instant::now();
-        let first = engine.evaluate(&agent(), &trace(), &c, IntegrationPath::Sdk, now, 0);
+        let first = engine.evaluate(
+            &agent(),
+            &trace(),
+            &c,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
+            now,
+            0,
+        );
         assert!(
             first
                 .iter()
                 .any(|f| f.rule.id.as_str() == "builtin_low_health")
         );
-        let second = engine.evaluate(&agent(), &trace(), &c, IntegrationPath::Sdk, now, 0);
+        let second = engine.evaluate(
+            &agent(),
+            &trace(),
+            &c,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
+            now,
+            0,
+        );
         assert!(
             second
                 .iter()
@@ -488,9 +494,23 @@ mod tests {
         let mut engine = PolicyEngine::with_defaults();
         let c = ctx(25.0, 1.0, 0.9);
         let now = Instant::now();
-        engine.evaluate(&agent(), &trace(), &c, IntegrationPath::Sdk, now, 0);
+        engine.evaluate(
+            &agent(),
+            &trace(),
+            &c,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
+            now,
+            0,
+        );
         let later = now + Duration::from_secs(301);
-        let fired = engine.evaluate(&agent(), &trace(), &c, IntegrationPath::Sdk, later, 0);
+        let fired = engine.evaluate(
+            &agent(),
+            &trace(),
+            &c,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
+            later,
+            0,
+        );
         assert!(
             fired
                 .iter()
@@ -505,7 +525,7 @@ mod tests {
             &agent(),
             &trace(),
             &ctx(25.0, 1.0, 0.9),
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             0,
         );
@@ -524,7 +544,7 @@ mod tests {
             &agent(),
             &trace(),
             &ctx(25.0, 1.0, 0.9),
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             0,
         );
@@ -543,7 +563,7 @@ mod tests {
             &agent(),
             &trace(),
             9.5,
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             0,
         );
@@ -561,7 +581,7 @@ mod tests {
             &agent(),
             &trace(),
             4.0,
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             0,
         );
@@ -576,7 +596,7 @@ mod tests {
             &agent(),
             &trace(),
             20.0,
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             0,
         );
@@ -593,7 +613,7 @@ mod tests {
             &AgentId::from("agent-a"),
             &trace(),
             &c,
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             now,
             0,
         );
@@ -601,7 +621,7 @@ mod tests {
             &AgentId::from("agent-b"),
             &trace(),
             &c,
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             now,
             0,
         );
@@ -635,7 +655,7 @@ mod tests {
             &agent(),
             &trace(),
             &ctx(40.0, 1.0, 0.9),
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             0,
         );
@@ -654,7 +674,7 @@ mod tests {
             &agent(),
             &trace(),
             &ctx(25.0, 1.0, 0.9),
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             0,
         );
@@ -669,7 +689,7 @@ mod tests {
             &agent(),
             &trace(),
             &ctx(25.0, 1.0, 0.9),
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             0,
         );
@@ -702,7 +722,7 @@ mod tests {
             &agent(),
             &trace(),
             &ctx(25.0, 1.0, 0.9),
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             Instant::now(),
             now_ms,
         );
@@ -727,7 +747,7 @@ mod tests {
             &agent(),
             &trace(),
             &ctx(25.0, 1.0, 0.9),
-            IntegrationPath::Sdk,
+            AgentReach::new(IntegrationPath::Sdk, Some(&can_pause())),
             later,
             now_ms,
         );

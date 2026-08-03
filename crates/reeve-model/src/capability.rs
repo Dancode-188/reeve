@@ -66,6 +66,54 @@ pub fn path_capabilities(path: IntegrationPath) -> Option<Vec<String>> {
     )
 }
 
+/// How an agent can be reached right now: the path its spans arrive on,
+/// plus whatever it declared over a live control stream, if it holds one.
+///
+/// The two travel together because neither answers the question alone. The
+/// path knows what a proxy agent can take without any handshake; the
+/// handshake knows what one particular SDK agent implements. `live: None`
+/// means no stream exists, which is why an SDK agent can end up reachable
+/// by nothing at all. ADR-0045.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentReach<'a> {
+    pub path: IntegrationPath,
+    pub live: Option<&'a [String]>,
+}
+
+impl<'a> AgentReach<'a> {
+    pub fn new(path: IntegrationPath, live: Option<&'a [String]>) -> Self {
+        Self { path, live }
+    }
+}
+
+/// Whether this agent can be sent this command right now.
+///
+/// A live control stream is authoritative in both directions: what it
+/// declared is what the agent can do, and what it left out the agent
+/// cannot. With no live stream the answer comes from the path, and on the
+/// SDK path that means nothing at all, because the channel that would
+/// carry the command is exactly the thing that is missing.
+///
+/// This never decides whether a rule fires, only whether its command is
+/// worth offering. ADR-0045.
+pub fn can_command(reach: AgentReach<'_>, command: &CommandType) -> bool {
+    let needed = required_capability(command);
+    match reach.live {
+        Some(declared) => declared.iter().any(|c| c == needed),
+        None => path_capabilities(reach.path).is_some_and(|caps| caps.iter().any(|c| c == needed)),
+    }
+}
+
+/// The capability a command requires, which is not always its own name.
+/// An adapter declaring `pause` is declaring that it can stop and start,
+/// so `resume` rides on the same declaration rather than needing its own.
+fn required_capability(command: &CommandType) -> &'static str {
+    match command {
+        CommandType::Resume => "pause",
+        other => capability_name(other),
+    }
+}
+
 /// The wire/display name for a command, shared so the overlay's capability
 /// strings and the policy engine's alert text cannot disagree.
 pub fn capability_name(command: &CommandType) -> &'static str {
@@ -132,6 +180,63 @@ mod tests {
             vec!["redirect", "inject_context", "kill"]
         );
         assert!(path_capabilities(IntegrationPath::Log).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_live_handshake_overrides_the_path_in_both_directions() {
+        // It grants what the path would not...
+        assert!(can_command(
+            AgentReach::new(IntegrationPath::Proxy, Some(&["pause".to_string()])),
+            &CommandType::Pause
+        ));
+        // ...and withholds what the path would have allowed.
+        assert!(!can_command(
+            AgentReach::new(IntegrationPath::Proxy, Some(&["pause".to_string()])),
+            &CommandType::Kill
+        ));
+    }
+
+    #[test]
+    fn an_sdk_agent_with_no_live_stream_can_be_sent_nothing() {
+        // The #296 case: spans arrive over OTLP so the path reads as Sdk,
+        // but no control channel was ever opened. There is no wire.
+        for c in [CommandType::Pause, CommandType::Kill, redirect()] {
+            assert!(
+                !can_command(AgentReach::new(IntegrationPath::Sdk, None), &c),
+                "no channel exists, yet {c:?} was offered"
+            );
+        }
+    }
+
+    #[test]
+    fn a_proxy_agent_needs_no_handshake_to_be_redirected() {
+        // Proxy agents never handshake, so None must not mean "nothing".
+        assert!(can_command(
+            AgentReach::new(IntegrationPath::Proxy, None),
+            &redirect()
+        ));
+        assert!(can_command(
+            AgentReach::new(IntegrationPath::Proxy, None),
+            &CommandType::Kill
+        ));
+        assert!(!can_command(
+            AgentReach::new(IntegrationPath::Proxy, None),
+            &CommandType::Pause
+        ));
+    }
+
+    #[test]
+    fn resume_rides_on_the_pause_declaration() {
+        // An adapter that says it can pause is saying it can stop and
+        // start; it does not have to list "resume" separately.
+        assert!(can_command(
+            AgentReach::new(IntegrationPath::Sdk, Some(&["pause".to_string()])),
+            &CommandType::Resume
+        ));
+        assert!(!can_command(
+            AgentReach::new(IntegrationPath::Sdk, Some(&["kill".to_string()])),
+            &CommandType::Resume
+        ));
     }
 
     #[test]

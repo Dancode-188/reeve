@@ -108,7 +108,13 @@ pub fn render_intervention_overlay(frame: &mut Frame, area: Rect, state: &AppSta
 
 pub fn render_confirmation_modal(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if let Some(ref pc) = state.pending_confirmation {
-        confirm::render(frame, area, pc, theme);
+        // Whether anything else is on offer decides how an empty suggestion
+        // reads: a proxy agent that cannot be paused can still be redirected
+        // or killed, while an agent with no control channel can do nothing
+        // at all. Saying the wrong one is how this modal got into trouble
+        // the first time.
+        let has_alternatives = !state.effective_capabilities(&pc.agent_id).is_empty();
+        confirm::render(frame, area, pc, has_alternatives, theme);
     }
 }
 

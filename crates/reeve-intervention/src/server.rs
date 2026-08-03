@@ -4,7 +4,7 @@ use crate::proto::{
     reeve_control_server::ReeveControlServer,
 };
 use crate::types::AckNotification;
-use reeve_model::entity::intervention::AckStatus;
+use reeve_model::entity::intervention::{AckStatus, LiveCapabilities};
 use reeve_model::ids::AgentId;
 use reeve_model::signal::EngineEvent;
 use std::collections::HashMap;
@@ -49,6 +49,10 @@ pub struct ControlServer {
     /// that crashes or disconnects does not hold its traces in flight forever.
     paused: PausedAgents,
     disconnected: DisconnectedAgents,
+    /// Mirror of each connected agent's declared capabilities, shared with
+    /// the policy engine, which cannot depend on this crate and otherwise
+    /// has no way to know what an agent can be asked to do. ADR-0045.
+    live_capabilities: LiveCapabilities,
 }
 
 impl ControlServer {
@@ -57,6 +61,7 @@ impl ControlServer {
         ntp_offsets: NtpOffsets,
         paused: PausedAgents,
         disconnected: DisconnectedAgents,
+        live_capabilities: LiveCapabilities,
     ) -> Self {
         Self {
             connected: Arc::new(Mutex::new(HashMap::new())),
@@ -66,6 +71,7 @@ impl ControlServer {
             ntp_offsets,
             paused,
             disconnected,
+            live_capabilities,
         }
     }
 
@@ -164,6 +170,11 @@ impl ReeveControl for ControlServer {
             );
         }
 
+        self.live_capabilities
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), capabilities.clone());
+
         // A reconnect within the grace period clears the mark; the
         // assembler's next tick resumes the idle clock from fresh.
         self.disconnected.lock().unwrap().remove(&agent_id);
@@ -182,6 +193,7 @@ impl ReeveControl for ControlServer {
         let ntp_pending = self.ntp_pending.clone();
         let ntp_offsets = self.ntp_offsets.clone();
         let paused = self.paused.clone();
+        let live_capabilities = self.live_capabilities.clone();
 
         tokio::spawn(async move {
             while let Ok(Some(msg)) = inbound.message().await {
@@ -229,6 +241,10 @@ impl ReeveControl for ControlServer {
             }
 
             connected.lock().unwrap().remove(&agent_id);
+            // The declaration dies with the stream. An agent with no live
+            // channel can be sent nothing, which is not the same as an
+            // agent that declared nothing. ADR-0045.
+            live_capabilities.lock().unwrap().remove(&agent_id);
             disconnected
                 .lock()
                 .unwrap()
@@ -255,8 +271,15 @@ pub async fn run(
     ntp_offsets: NtpOffsets,
     paused: PausedAgents,
     disconnected: DisconnectedAgents,
+    live_capabilities: LiveCapabilities,
 ) -> Arc<ControlServer> {
-    let server = ControlServer::new(engine_tx, ntp_offsets, paused, disconnected);
+    let server = ControlServer::new(
+        engine_tx,
+        ntp_offsets,
+        paused,
+        disconnected,
+        live_capabilities,
+    );
     let handle = Arc::new(server.clone());
 
     let addr = "127.0.0.1:4316"
@@ -322,6 +345,7 @@ pub fn new_for_test(engine_tx: broadcast::Sender<EngineEvent>) -> Arc<ControlSer
         Arc::new(Mutex::new(HashMap::new())),
         Arc::new(Mutex::new(std::collections::HashSet::new())),
         Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(Mutex::new(HashMap::new())),
     ))
 }
 
@@ -335,6 +359,7 @@ mod tests {
             tx,
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(std::collections::HashSet::new())),
+            Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
         )
     }
@@ -412,6 +437,7 @@ mod tests {
                 tx,
                 ntp_offsets.clone(),
                 Arc::new(Mutex::new(std::collections::HashSet::new())),
+                Arc::new(Mutex::new(HashMap::new())),
                 Arc::new(Mutex::new(HashMap::new())),
             )
         };

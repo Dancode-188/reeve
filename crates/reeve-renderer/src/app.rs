@@ -24,7 +24,9 @@ pub struct MetricScore {
 
 pub struct PolicyAlertEntry {
     pub description: String,
-    pub command_type: String,
+    /// The action the rule proposes, absent when the target cannot run it.
+    /// The alert still belongs in the list either way. ADR-0045.
+    pub command_type: Option<String>,
     /// Preformatted effectiveness note, e.g. "redirect: +0.42 avg · 5 tries".
     /// None until enough measured outcomes exist for the firing rule.
     pub effectiveness: Option<String>,
@@ -436,25 +438,13 @@ pub struct PendingConfirmation {
     pub agent_id: AgentId,
     pub rule_id: String,
     pub description: String,
-    pub command_type: String,
+    /// The action to confirm. `None` when the engine found nothing the
+    /// target can run, in which case the modal reports the condition and
+    /// offers no action rather than one the next line contradicts.
+    /// ADR-0045.
+    pub command_type: Option<String>,
     pub auto_confirm_after_secs: Option<u64>,
     pub arrived_at_ms: i64,
-    /// Whether the target agent's integration can actually apply the
-    /// suggested command. When false, confirm opens the intervention
-    /// overlay instead of dispatching a guaranteed dead letter, and no
-    /// auto-confirm countdown runs.
-    pub supported: bool,
-}
-
-/// Whether a policy-suggested command can be dispatched to an agent
-/// with these capabilities. Resume rides the pause capability.
-pub fn suggestion_supported(caps: &[String], command_type: &str) -> bool {
-    let needed = if command_type == "resume" {
-        "pause"
-    } else {
-        command_type
-    };
-    caps.iter().any(|c| c == needed)
 }
 
 pub struct InterventionTemplate {
@@ -954,7 +944,7 @@ impl App {
                 }
                 self.state.policy_alerts.push_back(PolicyAlertEntry {
                     description: message,
-                    command_type: "warning".to_string(),
+                    command_type: Some("warning".to_string()),
                     effectiveness: None,
                 });
                 self.state.flash_targets.insert(
@@ -1136,6 +1126,7 @@ impl App {
                 self.update_ctx_suggestion();
             }
             EngineEvent::PolicyAlert {
+                agent_id,
                 rule_id,
                 description,
                 command_type,
@@ -1163,7 +1154,7 @@ impl App {
                 // rank, then reverse so severity ascends front to back.
                 let mut entries: Vec<PolicyAlertEntry> =
                     self.state.policy_alerts.drain(..).rev().collect();
-                entries.sort_by_key(|e| alert_severity_rank(&e.command_type));
+                entries.sort_by_key(|e| alert_severity_rank(e.command_type.as_deref()));
                 entries.reverse();
                 self.state.policy_alerts = entries.into();
                 self.state.flash_targets.insert(
@@ -1176,24 +1167,22 @@ impl App {
                 if requires_confirmation {
                     self.state
                         .notify(&format!("policy alert needs confirmation: {description}"));
-                    if let Some(agent_id) = self.state.selected_agent_id().cloned() {
-                        // A suggestion the target cannot apply must not
-                        // dispatch, and must never auto-dispatch: the
-                        // countdown would fire a guaranteed dead letter.
-                        let supported = suggestion_supported(
-                            &self.state.effective_capabilities(&agent_id),
-                            &command_type,
-                        );
-                        self.state.pending_confirmation = Some(PendingConfirmation {
-                            agent_id,
-                            rule_id,
-                            description,
-                            command_type,
-                            auto_confirm_after_secs: auto_confirm_after_secs.filter(|_| supported),
-                            arrived_at_ms: current_ms(),
-                            supported,
-                        });
-                    }
+                    // The alert names its own agent. Reading the selected
+                    // one instead meant a confirmed alert could dispatch to
+                    // whichever agent the operator happened to be looking at.
+                    //
+                    // Whether an action is available was settled by the
+                    // engine, which can see the live control stream this
+                    // side cannot. Deciding it again here is what let the
+                    // two answers drift apart. ADR-0045.
+                    self.state.pending_confirmation = Some(PendingConfirmation {
+                        agent_id,
+                        rule_id,
+                        description,
+                        command_type,
+                        auto_confirm_after_secs,
+                        arrived_at_ms: current_ms(),
+                    });
                 }
             }
             EngineEvent::AgentControlConnected {
@@ -1897,10 +1886,11 @@ impl App {
         match action {
             Action::Select => {
                 if let Some(pc) = self.state.pending_confirmation.take() {
-                    if !pc.supported {
-                        // The suggestion cannot apply on this agent's
-                        // path: hand the operator the actions that can,
-                        // instead of dispatching a dead letter.
+                    if pc.command_type.is_none() {
+                        // Nothing was offered, so there is nothing to
+                        // confirm: open the overlay so the operator can see
+                        // for themselves what this agent does support,
+                        // which may be nothing at all.
                         self.state.overlay = Some(InterventionOverlayState {
                             agent_id: pc.agent_id,
                             mode: OverlayMode::Menu,
@@ -1919,9 +1909,10 @@ impl App {
     }
 
     async fn dispatch_confirmation(&mut self, pc: PendingConfirmation, issued_by: String) {
-        let Some(cmd_type) = confirmation_command_type(&pc.command_type, &pc.description) else {
+        let proposed = pc.command_type.clone().unwrap_or_default();
+        let Some(cmd_type) = confirmation_command_type(&proposed, &pc.description) else {
             tracing::warn!(
-                command_type = %pc.command_type,
+                command_type = %proposed,
                 rule_id = %pc.rule_id,
                 "confirmed policy command has unknown type; nothing dispatched"
             );
@@ -3039,13 +3030,17 @@ fn edit_buffer(buffer: &mut String, word_only: bool) {
 
 /// Alert stacking order: the weight of the command the firing rule
 /// carries. Lower ranks stack higher in ALERTS.
-fn alert_severity_rank(command_type: &str) -> u8 {
+/// Orders the ALERTS panel. An alert carrying no action sorts last, below
+/// every actionable one: it is still worth reporting, but an operator
+/// scanning the list should reach what they can act on first.
+fn alert_severity_rank(command_type: Option<&str>) -> u8 {
     match command_type {
-        "kill" => 0,
-        "pause" => 1,
-        "redirect" => 2,
-        "inject_context" => 3,
-        _ => 4,
+        Some("kill") => 0,
+        Some("pause") => 1,
+        Some("redirect") => 2,
+        Some("inject_context") => 3,
+        Some(_) => 4,
+        None => 5,
     }
 }
 
@@ -3224,31 +3219,6 @@ mod tests {
     }
 
     #[test]
-    fn suggestions_check_the_target_capabilities() {
-        // The #192 shape: policy suggested pause for a proxy agent,
-        // whose path has no pause by design; confirming dead-lettered.
-        let proxy_caps = vec![
-            "redirect".to_string(),
-            "inject_context".to_string(),
-            "kill".to_string(),
-        ];
-        assert!(!suggestion_supported(&proxy_caps, "pause"));
-        assert!(suggestion_supported(&proxy_caps, "redirect"));
-        assert!(suggestion_supported(&proxy_caps, "kill"));
-
-        let sdk_caps = vec!["pause".to_string(), "redirect".to_string()];
-        assert!(suggestion_supported(&sdk_caps, "pause"));
-        assert!(
-            suggestion_supported(&sdk_caps, "resume"),
-            "resume rides the pause capability"
-        );
-        assert!(
-            !suggestion_supported(&[], "redirect"),
-            "no capabilities, no dispatchable suggestions"
-        );
-    }
-
-    #[test]
     fn side_call_stubs_never_steal_the_panel() {
         // The #201 shape: a 100-span build turn loads, then a trailing
         // 2-span title-generation stub completes and used to mask it.
@@ -3356,10 +3326,18 @@ mod tests {
 
     #[test]
     fn alert_severity_ranks_kill_above_all() {
-        assert!(alert_severity_rank("kill") < alert_severity_rank("pause"));
-        assert!(alert_severity_rank("pause") < alert_severity_rank("redirect"));
-        assert!(alert_severity_rank("redirect") < alert_severity_rank("inject_context"));
-        assert!(alert_severity_rank("inject_context") < alert_severity_rank("unknown"));
+        let rank = |c| alert_severity_rank(Some(c));
+        assert!(rank("kill") < rank("pause"));
+        assert!(rank("pause") < rank("redirect"));
+        assert!(rank("redirect") < rank("inject_context"));
+        assert!(rank("inject_context") < rank("unknown"));
+    }
+
+    #[test]
+    fn an_alert_with_no_action_sorts_below_every_actionable_one() {
+        // It is still worth reporting, but someone scanning the panel
+        // should reach what they can act on first. ADR-0045.
+        assert!(alert_severity_rank(Some("unknown")) < alert_severity_rank(None));
     }
 
     #[test]
