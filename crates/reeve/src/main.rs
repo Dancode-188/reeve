@@ -172,6 +172,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let reprobe_requested: reeve_engine::ReprobeRequested =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Written by the control server on handshake, read by the policy engine
+    // when it decides whether a fired rule has an action to offer. ADR-0045.
+    let live_capabilities: reeve_model::entity::intervention::LiveCapabilities =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     tokio::spawn(reeve_engine::run(
         engine_ingestion_rx,
         engine_event_tx.clone(),
@@ -179,12 +183,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(dispatch_tx),
         Some(applied_commands.clone()),
         Some(reprobe_requested.clone()),
+        Some(live_capabilities.clone()),
     ));
     let control_server = reeve_intervention::server::run(
         engine_event_tx.clone(),
         ntp_offsets,
         paused_agents.clone(),
         disconnected_agents,
+        live_capabilities,
     )
     .await;
     let audit_path = db_path

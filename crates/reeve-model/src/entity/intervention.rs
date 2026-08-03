@@ -111,3 +111,14 @@ pub struct ProxyInterventionState {
 }
 
 pub type ProxyInterventions = std::sync::Arc<std::sync::Mutex<ProxyInterventionState>>;
+
+/// What every agent currently holding a live control stream declared it
+/// can do, keyed by agent id.
+///
+/// Written by `reeve-intervention` on handshake and cleared on disconnect.
+/// Read by the policy engine, which cannot depend on that crate and until
+/// now could not see any of this. A missing entry means there is no live
+/// channel at all, which is a different thing from an agent that declared
+/// an empty list: see ADR-0045.
+pub type LiveCapabilities =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<crate::ids::AgentId, Vec<String>>>>;

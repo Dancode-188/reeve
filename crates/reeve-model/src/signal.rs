@@ -114,12 +114,20 @@ pub enum EngineEvent {
         privacy_tier: u8,
     },
     PolicyAlert {
+        /// Which agent the rule fired for. Without this the renderer had to
+        /// guess, and it guessed the selected agent, so with more than one
+        /// agent on screen a confirmed alert could dispatch to the wrong one.
+        agent_id: AgentId,
         rule_id: String,
         /// Human-readable description owned by the engine and carried from the firing
         /// PolicyRule. The renderer never looks this up; user-defined rules would break
         /// any renderer-side table.
         description: String,
-        command_type: String,
+        /// The command the rule proposes, present only when the target can
+        /// actually run it. `None` means the condition still matched and is
+        /// worth reporting, but no action is available to offer: see
+        /// ADR-0045. Never suppress the alert to avoid a `None` here.
+        command_type: Option<String>,
         requires_confirmation: bool,
         /// When set, the renderer shows a countdown bar and auto-dispatches the command
         /// after this many seconds if the operator does not act first.

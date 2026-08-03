@@ -13,10 +13,11 @@ use evaluation::llm_judge::{self, LlmJudge};
 use outcome::OutcomeTracker;
 use policy::dsl::PolicyContext;
 use policy::{PolicyEngine, alert_fields};
+use reeve_model::capability::AgentReach;
 use reeve_model::entity::agent::IntegrationPath;
 use reeve_model::entity::evaluation::{EvaluationResult, EvaluatorType, TargetType};
 use reeve_model::entity::intervention::{
-    AppliedCommand, CommandStatus, CommandType, InterventionCommand,
+    AppliedCommand, CommandStatus, CommandType, InterventionCommand, LiveCapabilities,
 };
 use reeve_model::entity::span::InternalSpan;
 use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, TraceId};
@@ -47,6 +48,7 @@ pub async fn run(
     dispatch_tx: Option<DispatchSender>,
     applied_commands: Option<AppliedCommands>,
     reprobe_requested: Option<ReprobeRequested>,
+    live_capabilities: Option<LiveCapabilities>,
 ) {
     let backend = llm_judge::probe().await;
     let (backend_name, backend_reason) = match &backend {
@@ -318,11 +320,15 @@ pub async fn run(
                         0.0,
                         &metric_scores,
                     );
+                    let live = declared_capabilities(&live_capabilities, &agent_id);
                     let fired = policy_engine.evaluate(
                         &agent_id,
                         &trace_id,
                         &policy_ctx,
-                        integration_path_for(&warm, &agent_id).await,
+                        AgentReach::new(
+                            integration_path_for(&warm, &agent_id).await,
+                            live.as_deref(),
+                        ),
                         Instant::now(),
                         now_ms,
                     );
@@ -337,9 +343,10 @@ pub async fn run(
                         let rule_id_owned = rule_id_str.to_string();
                         let effectiveness = effectiveness_hint(&warm, &fr.rule.id, &agent_id).await;
                         let _ = engine_tx.send(EngineEvent::PolicyAlert {
+                            agent_id: agent_id.clone(),
                             rule_id: rule_id_owned.clone(),
                             description: description.to_string(),
-                            command_type: cmd_type.to_string(),
+                            command_type: cmd_type.map(str::to_string),
                             requires_confirmation,
                             auto_confirm_after_secs,
                             effectiveness,
@@ -352,15 +359,19 @@ pub async fn run(
                             fr.rule.cooldown_secs,
                         )
                         .await;
-                        dispatch_or_save(
-                            &dispatch_tx,
-                            &warm,
-                            &agent_id,
-                            fr.command,
-                            requires_confirmation,
-                            &rule_id_owned,
-                        )
-                        .await;
+                        // Nothing to dispatch when the target cannot run it.
+                        // The alert above already went out. ADR-0045.
+                        if fr.command_available {
+                            dispatch_or_save(
+                                &dispatch_tx,
+                                &warm,
+                                &agent_id,
+                                fr.command,
+                                requires_confirmation,
+                                &rule_id_owned,
+                            )
+                            .await;
+                        }
                     }
                 }
 
@@ -520,11 +531,15 @@ pub async fn run(
                     continue;
                 }
 
+                let live = declared_capabilities(&live_capabilities, &agent_id);
                 let mid_fired = policy_engine.evaluate_mid_trace(
                     &agent_id,
                     &trace_id,
                     predicted,
-                    integration_path_for(&warm, &agent_id).await,
+                    AgentReach::new(
+                        integration_path_for(&warm, &agent_id).await,
+                        live.as_deref(),
+                    ),
                     Instant::now(),
                     now_ms,
                 );
@@ -539,24 +554,27 @@ pub async fn run(
                     let rule_id_owned = rule_id_str.to_string();
                     let effectiveness = effectiveness_hint(&warm, &fr.rule.id, &agent_id).await;
                     let _ = engine_tx.send(EngineEvent::PolicyAlert {
+                        agent_id: agent_id.clone(),
                         rule_id: rule_id_owned.clone(),
                         description: description.to_string(),
-                        command_type: cmd_type.to_string(),
+                        command_type: cmd_type.map(str::to_string),
                         requires_confirmation,
                         auto_confirm_after_secs,
                         effectiveness,
                     });
                     persist_cooldown(&warm, &agent_id, &fr.rule.id, now_ms, fr.rule.cooldown_secs)
                         .await;
-                    dispatch_or_save(
-                        &dispatch_tx,
-                        &warm,
-                        &agent_id,
-                        fr.command,
-                        requires_confirmation,
-                        &rule_id_owned,
-                    )
-                    .await;
+                    if fr.command_available {
+                        dispatch_or_save(
+                            &dispatch_tx,
+                            &warm,
+                            &agent_id,
+                            fr.command,
+                            requires_confirmation,
+                            &rule_id_owned,
+                        )
+                        .await;
+                    }
                 }
 
                 // Fold the predicted final cost of this in-flight trace into
@@ -595,6 +613,16 @@ pub async fn run(
 /// measured-outcome aggregation. A minimum of three samples guards against
 /// suggesting from noise; below it the alert simply carries no hint. Query
 /// failure degrades the same way: an alert without a hint beats no alert.
+/// What this agent declared over a live control stream, or `None` if it
+/// holds none. `None` is not "declared nothing": it means no channel, which
+/// is what `can_command` needs to tell apart. ADR-0045.
+fn declared_capabilities(
+    live: &Option<LiveCapabilities>,
+    agent_id: &AgentId,
+) -> Option<Vec<String>> {
+    live.as_ref()?.lock().ok()?.get(agent_id).cloned()
+}
+
 /// How this agent reaches Reeve, which decides what can be commanded of it.
 ///
 /// Fails open to `Sdk`, the path that rules nothing out. A missing or
@@ -696,9 +724,10 @@ async fn enforce_budget(
         )
     {
         let _ = engine_tx.send(EngineEvent::PolicyAlert {
+            agent_id: agent_id.clone(),
             rule_id: "builtin_budget_warn".to_string(),
             description: format!("budget: {agent_id} nearing its ${cap:.2} daily cap ({pct}%)"),
-            command_type: "warning".to_string(),
+            command_type: Some("warning".to_string()),
             requires_confirmation: false,
             auto_confirm_after_secs: None,
             effectiveness: None,
@@ -707,9 +736,10 @@ async fn enforce_budget(
 
     if over && prev != Some(budget::BudgetState::Over) {
         let _ = engine_tx.send(EngineEvent::PolicyAlert {
+            agent_id: agent_id.clone(),
             rule_id: "builtin_budget_kill".to_string(),
             description: format!("budget: stopped {agent_id} at its ${cap:.2} daily cap"),
-            command_type: "kill".to_string(),
+            command_type: Some("kill".to_string()),
             requires_confirmation: false,
             auto_confirm_after_secs: None,
             effectiveness: None,
