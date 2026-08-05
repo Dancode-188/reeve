@@ -20,7 +20,7 @@ use reeve_model::entity::intervention::{
     AppliedCommand, CommandStatus, CommandType, InterventionCommand, LiveCapabilities,
 };
 use reeve_model::entity::span::InternalSpan;
-use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, TraceId};
+use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, SpanId, TraceId};
 use reeve_model::signal::{EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::WarmStore;
 use std::collections::{HashMap, VecDeque};
@@ -40,6 +40,500 @@ pub type AppliedCommands = Arc<std::sync::Mutex<Vec<AppliedCommand>>>;
 /// banner; consumed by the engine, which re-probes the evaluation backend.
 /// Same shared-state pattern as the NTP offset map and the paused set.
 pub type ReprobeRequested = Arc<std::sync::atomic::AtomicBool>;
+
+/// Everything the run loop carries between events.
+///
+/// It exists so the event arms can be methods. They touch sixteen values
+/// between them, and a free function taking those is harder to read than
+/// the inline arm it would replace, which is why #277 could not be done
+/// the way it was first written.
+///
+/// The split is by lifetime, not by topic: the first block is fixed once
+/// the loop starts, `judge` is replaced when the backend is re-probed, and
+/// the rest accumulates as events arrive.
+struct EngineLoop {
+    warm: Arc<WarmStore>,
+    engine_tx: broadcast::Sender<EngineEvent>,
+    dispatch_tx: Option<DispatchSender>,
+    applied_commands: Option<AppliedCommands>,
+    live_capabilities: Option<LiveCapabilities>,
+    evaluators: Vec<Box<dyn Evaluator>>,
+    budgets: policy::config::Budgets,
+
+    judge: Arc<LlmJudge>,
+
+    fingerprints: HashMap<AgentId, AgentFingerprint>,
+    score_histories: HashMap<AgentId, VecDeque<f64>>,
+    cost_accumulators: HashMap<TraceId, CostAccumulator>,
+    trace_agents: HashMap<TraceId, AgentId>,
+    policy_engine: PolicyEngine,
+    outcome_tracker: OutcomeTracker,
+    budget_tracker: budget::BudgetTracker,
+    /// Where each agent last sat against its cap, so only a crossing warns
+    /// or kills rather than every tick.
+    budget_states: HashMap<AgentId, budget::BudgetState>,
+}
+
+impl EngineLoop {
+    /// A trace finished: score it, run policy against the result, settle
+    /// its cost, and decide whether to sample it for Tier 2. Extracted
+    /// from the select! arm it used to be, which is why the steps read as
+    /// one sequence rather than as separate concerns.
+    async fn handle_trace_completed(
+        &mut self,
+        trace_id: TraceId,
+        agent_id: AgentId,
+        span_count: usize,
+        cost: f64,
+    ) {
+        let spans = self
+            .warm
+            .list_spans_for_trace(&trace_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    trace_id = %trace_id,
+                    error = %e,
+                    "engine failed to load spans for evaluation"
+                );
+                vec![]
+            });
+
+        let min_start = spans.iter().map(|s| s.start_time).min();
+        let max_end = spans.iter().filter_map(|s| s.end_time).max();
+        let duration_secs = match (min_start, max_end) {
+            (Some(s), Some(e)) => e.saturating_sub(s).max(0) as f64 / 1e9,
+            _ => 0.0,
+        };
+
+        let fp = self.fingerprints.get(&agent_id);
+
+        let ctx = TraceContext {
+            trace_id: trace_id.clone(),
+            agent_id: agent_id.clone(),
+            span_count,
+            cost,
+            spans: &spans,
+            fingerprint: fp,
+        };
+
+        let mut metric_scores: HashMap<&str, f64> = HashMap::new();
+
+        for evaluator in &self.evaluators {
+            if let Some(score) = evaluator.evaluate(&ctx) {
+                let _ = self.engine_tx.send(EngineEvent::EvaluationComplete {
+                    trace_id: trace_id.clone(),
+                    span_id: None,
+                    metric: evaluator.name().to_string(),
+                    score,
+                    confidence: None,
+                });
+                metric_scores.insert(evaluator.name(), score);
+            }
+        }
+
+        let mut tier1_health: Option<f64> = None;
+
+        if let Some(hs) = reeve_model::scoring::compute(&metric_scores) {
+            tier1_health = Some(hs.value);
+            let event = EngineEvent::HealthScoreUpdated {
+                agent_id: agent_id.clone(),
+                trace_id: trace_id.clone(),
+                score: hs.value,
+                tier2_pending: hs.tier2_pending,
+                weight_coverage: hs.weight_coverage,
+            };
+            if self.engine_tx.send(event).is_err() {
+                tracing::debug!("no engine event subscribers");
+            }
+
+            if let Err(e) = self
+                .warm
+                .update_trace_health_score(&trace_id, hs.value)
+                .await
+            {
+                tracing::warn!(
+                    trace_id = %trace_id,
+                    error = %e,
+                    "failed to persist health score"
+                );
+            }
+
+            // Policy evaluation runs on Tier 1 results. Tier 2 does not
+            // re-trigger to avoid double-firing on the same trace.
+            let policy_ctx = PolicyContext::build(
+                hs.value,
+                cost,
+                span_count,
+                hs.tier2_pending,
+                hs.weight_coverage,
+                0.0,
+                &metric_scores,
+            );
+            self.run_policy(&agent_id, &trace_id, &policy_ctx).await;
+        }
+
+        // Settle this trace's real cost against the agent's daily
+        // budget. The completion path folds in no prediction: the
+        // number is now known, so the check is exact.
+        if self.budgets.cap_for(agent_id.as_str()).is_some() {
+            self.budget_tracker.add_spend(&agent_id, cost);
+            self.enforce_budget(&agent_id, &trace_id, 0.0, current_ms())
+                .await;
+        }
+
+        self.fingerprints
+            .entry(agent_id.clone())
+            .or_default()
+            .update(span_count, cost, duration_secs);
+
+        let rate = self
+            .record_outcomes(&agent_id, tier1_health, span_count)
+            .await;
+
+        // Tier 2 runs asynchronously after Tier 1 completes. Tier 1
+        // always runs; only the Tier 2 spawn is gated by the sample rate.
+        let tier1_scores: HashMap<String, f64> = metric_scores
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
+        if rand::random::<f64>() < rate {
+            tokio::spawn(run_tier2(
+                trace_id.clone(),
+                agent_id.clone(),
+                spans,
+                tier1_scores,
+                self.engine_tx.clone(),
+                self.warm.clone(),
+                self.judge.clone(),
+            ));
+        }
+
+        self.cost_accumulators.remove(&trace_id);
+        self.trace_agents.remove(&trace_id);
+    }
+
+    /// Fires every rule whose condition the trace met, and for each one
+    /// alerts, records the cooldown, and dispatches when the target can
+    /// take the command. The alert goes out either way: ADR-0045.
+    async fn run_policy(
+        &mut self,
+        agent_id: &AgentId,
+        trace_id: &TraceId,
+        policy_ctx: &PolicyContext,
+    ) {
+        let now_ms = current_ms();
+        let live = declared_capabilities(&self.live_capabilities, agent_id);
+        let reach = AgentReach::new(
+            integration_path_for(&self.warm, agent_id).await,
+            live.as_deref(),
+        );
+        let fired = self.policy_engine.evaluate(
+            agent_id,
+            trace_id,
+            policy_ctx,
+            reach,
+            Instant::now(),
+            now_ms,
+        );
+        for fr in fired {
+            let (rule_id_str, description, cmd_type, requires_confirmation, auto_confirm) =
+                alert_fields(&fr);
+            let rule_id = rule_id_str.to_string();
+            let effectiveness = effectiveness_hint(&self.warm, &fr.rule.id, agent_id).await;
+            let _ = self.engine_tx.send(EngineEvent::PolicyAlert {
+                agent_id: agent_id.clone(),
+                rule_id: rule_id.clone(),
+                description: description.to_string(),
+                command_type: cmd_type.map(str::to_string),
+                requires_confirmation,
+                auto_confirm_after_secs: auto_confirm,
+                effectiveness,
+            });
+            persist_cooldown(
+                &self.warm,
+                agent_id,
+                &fr.rule.id,
+                now_ms,
+                fr.rule.cooldown_secs,
+            )
+            .await;
+            // Nothing to dispatch when the target cannot run it. The alert
+            // above already went out. ADR-0045.
+            if fr.command_available {
+                dispatch_or_save(
+                    &self.dispatch_tx,
+                    &self.warm,
+                    agent_id,
+                    fr.command,
+                    requires_confirmation,
+                    &rule_id,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Folds this trace's score into the agent's history and closes out any
+    /// intervention still waiting to be measured against it. Returns the
+    /// Tier 2 sampling rate, which the history is what decides.
+    ///
+    /// Applied commands are picked up BEFORE the new score lands, because
+    /// the last score recorded at pickup time is the honest before-picture
+    /// for an intervention.
+    async fn record_outcomes(
+        &mut self,
+        agent_id: &AgentId,
+        tier1_health: Option<f64>,
+        span_count: usize,
+    ) -> f64 {
+        if let Some(feed) = &self.applied_commands {
+            let drained: Vec<AppliedCommand> = feed.lock().unwrap().drain(..).collect();
+            for record in drained {
+                let pre = self
+                    .score_histories
+                    .get(&record.agent_id)
+                    .and_then(|h| h.back().copied());
+                self.outcome_tracker.command_applied(record, pre);
+            }
+        }
+
+        let history = self.score_histories.entry(agent_id.clone()).or_default();
+        if let Some(score) = tier1_health {
+            history.push_back(score);
+            if history.len() > 5 {
+                history.pop_front();
+            }
+        }
+        let rate = tier2_sample_rate(history);
+
+        if let Some(score) = tier1_health {
+            let now_ms = current_ms();
+            for outcome in
+                self.outcome_tracker
+                    .trace_scored(agent_id, score, span_count as u32, now_ms)
+            {
+                tracing::info!(
+                    command_id = %outcome.command_id,
+                    delta = ?outcome.delta,
+                    "intervention outcome measured"
+                );
+                if let Err(e) = self.warm.save_intervention_outcome(outcome).await {
+                    tracing::warn!(error = %e, "failed to persist intervention outcome");
+                }
+            }
+        }
+        rate
+    }
+
+    /// A span landed mid-trace: accumulate its cost, extrapolate where the
+    /// trace is heading, and let the predicted-cost rules and the budget
+    /// see that figure before the trace finishes.
+    async fn handle_span_completed(&mut self, trace_id: TraceId, span_id: SpanId) {
+        let span = match self.warm.get_span(&span_id).await {
+            Ok(Some(s)) => s,
+            _ => return,
+        };
+
+        // The pipeline already priced every priceable span (the
+        // proxy for its own traffic, normalize for SDK spans), so
+        // prediction accumulates the stamped cost instead of
+        // re-deriving it from tokens. The engine keeping its own
+        // price table meant two tables for one quantity, and the
+        // engine's had drifted: predictive stops silently never
+        // fired for model families only the pipeline knew.
+        let span_cost = span
+            .attributes
+            .get("gen_ai.usage.cost")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+
+        if span_cost <= 0.0 {
+            return;
+        }
+
+        let agent_id = match self.trace_agents.get(&trace_id) {
+            Some(a) => a.clone(),
+            None => match self.warm.get_trace(&trace_id).await {
+                Ok(Some(t)) => {
+                    let id = t.agent_id.clone();
+                    self.trace_agents.insert(trace_id.clone(), id.clone());
+                    id
+                }
+                _ => return,
+            },
+        };
+
+        let now_ms = current_ms();
+        let acc = self
+            .cost_accumulators
+            .entry(trace_id.clone())
+            .or_insert_with(|| CostAccumulator {
+                started_at_ms: now_ms,
+                current_cost: 0.0,
+                samples: VecDeque::new(),
+            });
+
+        acc.current_cost += span_cost;
+        acc.samples.push_back((acc.current_cost, now_ms));
+        if acc.samples.len() > 5 {
+            acc.samples.pop_front();
+        }
+
+        if acc.samples.len() < 2 {
+            return;
+        }
+
+        let (old_cost, old_ts) = *acc.samples.front().unwrap();
+        let window_secs = (now_ms - old_ts).max(1) as f64 / 1000.0;
+        let rate = (acc.current_cost - old_cost) / window_secs;
+
+        let elapsed_total = (now_ms - acc.started_at_ms).max(0) as f64 / 1000.0;
+        let avg_duration = self
+            .fingerprints
+            .get(&agent_id)
+            .map(|fp| fp.avg_duration_secs)
+            .unwrap_or(30.0);
+        let remaining = (avg_duration - elapsed_total).max(0.0);
+        let predicted = acc.current_cost + rate * remaining;
+
+        if predicted <= 0.0 {
+            return;
+        }
+
+        let live = declared_capabilities(&self.live_capabilities, &agent_id);
+        let mid_fired = self.policy_engine.evaluate_mid_trace(
+            &agent_id,
+            &trace_id,
+            predicted,
+            AgentReach::new(
+                integration_path_for(&self.warm, &agent_id).await,
+                live.as_deref(),
+            ),
+            Instant::now(),
+            now_ms,
+        );
+        for fr in mid_fired {
+            let (
+                rule_id_str,
+                description,
+                cmd_type,
+                requires_confirmation,
+                auto_confirm_after_secs,
+            ) = alert_fields(&fr);
+            let rule_id_owned = rule_id_str.to_string();
+            let effectiveness = effectiveness_hint(&self.warm, &fr.rule.id, &agent_id).await;
+            let _ = self.engine_tx.send(EngineEvent::PolicyAlert {
+                agent_id: agent_id.clone(),
+                rule_id: rule_id_owned.clone(),
+                description: description.to_string(),
+                command_type: cmd_type.map(str::to_string),
+                requires_confirmation,
+                auto_confirm_after_secs,
+                effectiveness,
+            });
+            persist_cooldown(
+                &self.warm,
+                &agent_id,
+                &fr.rule.id,
+                now_ms,
+                fr.rule.cooldown_secs,
+            )
+            .await;
+            if fr.command_available {
+                dispatch_or_save(
+                    &self.dispatch_tx,
+                    &self.warm,
+                    &agent_id,
+                    fr.command,
+                    requires_confirmation,
+                    &rule_id_owned,
+                )
+                .await;
+            }
+        }
+
+        // Fold the predicted final cost of this in-flight trace into
+        // the budget check so a run that will blow the cap is stopped
+        // before it finishes spending. Settled spend does not yet
+        // include this trace, so `predicted` is the whole extra.
+        if self.budgets.cap_for(agent_id.as_str()).is_some() {
+            self.enforce_budget(&agent_id, &trace_id, predicted, now_ms)
+                .await;
+        }
+    }
+
+    /// Checks an agent's spend against its cap and acts on it: always emits a
+    /// `BudgetUpdated` so the cockpit's bar tracks the ceiling, warns ALERTS once
+    /// on entry into the warn band, and fires a kill the moment settled or
+    /// predicted spend crosses the cap. `extra` folds a mid-trace prediction into
+    /// the check so the stop lands before the money is gone; it is zero at
+    /// completion, when spend is already settled. `last_states` remembers where
+    /// each agent sat so only a transition speaks: a fresh alert every tick, or a
+    /// re-fired kill against an already-engaged breaker, would be noise.
+    async fn enforce_budget(
+        &mut self,
+        agent_id: &AgentId,
+        trace_id: &TraceId,
+        extra: f64,
+        now_ms: i64,
+    ) {
+        let Some(cap) = self.budgets.cap_for(agent_id.as_str()) else {
+            return;
+        };
+        let view = self.budget_tracker.view(agent_id, cap, extra);
+        let over = view.state == budget::BudgetState::Over;
+        let _ = self.engine_tx.send(EngineEvent::BudgetUpdated {
+            agent_id: agent_id.clone(),
+            spent_today: view.spent_today,
+            cap: view.cap,
+            over,
+        });
+
+        let prev = self.budget_states.insert(agent_id.clone(), view.state);
+        let projected = view.spent_today + extra.max(0.0);
+        let pct = (projected / cap * 100.0).round() as i64;
+
+        if view.state == budget::BudgetState::Warn
+            && !matches!(
+                prev,
+                Some(budget::BudgetState::Warn | budget::BudgetState::Over)
+            )
+        {
+            let _ = self.engine_tx.send(EngineEvent::PolicyAlert {
+                agent_id: agent_id.clone(),
+                rule_id: "builtin_budget_warn".to_string(),
+                description: format!("budget: {agent_id} nearing its ${cap:.2} daily cap ({pct}%)"),
+                command_type: Some("warning".to_string()),
+                requires_confirmation: false,
+                auto_confirm_after_secs: None,
+                effectiveness: None,
+            });
+        }
+
+        if over && prev != Some(budget::BudgetState::Over) {
+            let _ = self.engine_tx.send(EngineEvent::PolicyAlert {
+                agent_id: agent_id.clone(),
+                rule_id: "builtin_budget_kill".to_string(),
+                description: format!("budget: stopped {agent_id} at its ${cap:.2} daily cap"),
+                command_type: Some("kill".to_string()),
+                requires_confirmation: false,
+                auto_confirm_after_secs: None,
+                effectiveness: None,
+            });
+            let command = budget_kill_command(agent_id, trace_id, now_ms);
+            dispatch_or_save(
+                &self.dispatch_tx,
+                &self.warm,
+                agent_id,
+                command,
+                false,
+                "builtin_budget",
+            )
+            .await;
+        }
+    }
+}
 
 pub async fn run(
     mut ingestion_rx: broadcast::Receiver<IngestionEvent>,
@@ -70,20 +564,32 @@ pub async fn run(
         reason: backend_reason,
         privacy_tier: startup_privacy_tier,
     });
-    let mut judge = Arc::new(LlmJudge::new(backend));
-
-    let mut fingerprints: HashMap<AgentId, AgentFingerprint> = HashMap::new();
-    let mut score_histories: HashMap<AgentId, VecDeque<f64>> = HashMap::new();
-    let mut cost_accumulators: HashMap<TraceId, CostAccumulator> = HashMap::new();
-    let mut trace_agents: HashMap<TraceId, AgentId> = HashMap::new();
-    let mut policy_engine = PolicyEngine::with_defaults();
-    let mut outcome_tracker = OutcomeTracker::default();
     // Daily budgets: read once at startup like the rest of the config.
     let budgets = policy::config::load_budgets(&config_path);
-    let mut budget_tracker = budget::BudgetTracker::default();
-    // Where each agent last sat against its cap, so only a crossing warns
-    // or kills rather than every tick.
-    let mut budget_states: HashMap<AgentId, budget::BudgetState> = HashMap::new();
+    let mut engine = EngineLoop {
+        warm: warm.clone(),
+        engine_tx: engine_tx.clone(),
+        dispatch_tx,
+        applied_commands,
+        live_capabilities,
+        evaluators: vec![
+            Box::new(LoopDetector::new(3)),
+            Box::new(CostEfficiencyEvaluator),
+            Box::new(LatencyNormalityEvaluator),
+            Box::new(IntentActionDivergenceEvaluator),
+            Box::new(FingerprintDeviationEvaluator),
+        ],
+        budgets: budgets.clone(),
+        judge: Arc::new(LlmJudge::new(backend)),
+        fingerprints: HashMap::new(),
+        score_histories: HashMap::new(),
+        cost_accumulators: HashMap::new(),
+        trace_agents: HashMap::new(),
+        policy_engine: PolicyEngine::with_defaults(),
+        outcome_tracker: OutcomeTracker::default(),
+        budget_tracker: budget::BudgetTracker::default(),
+        budget_states: HashMap::new(),
+    };
 
     {
         let db_rules = warm.load_policy_rules().await.unwrap_or_else(|e| {
@@ -93,7 +599,7 @@ pub async fn run(
         let cfg_rules = policy::config::load(&config_path);
         let mut combined = db_rules;
         combined.extend(cfg_rules);
-        policy_engine.replace_user_rules(combined);
+        engine.policy_engine.replace_user_rules(combined);
     }
 
     {
@@ -108,7 +614,7 @@ pub async fn run(
         if !cooldowns.is_empty() {
             tracing::info!(count = cooldowns.len(), "restored active policy cooldowns");
         }
-        policy_engine.load_cooldowns(&cooldowns, startup_ms);
+        engine.policy_engine.load_cooldowns(&cooldowns, startup_ms);
     }
 
     // SIGUSR1 triggers a policy rule reload. SIGHUP deliberately keeps its
@@ -118,14 +624,6 @@ pub async fn run(
     let mut reload_signal =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
             .expect("failed to install SIGUSR1 handler");
-
-    let evaluators: Vec<Box<dyn Evaluator>> = vec![
-        Box::new(LoopDetector::new(3)),
-        Box::new(CostEfficiencyEvaluator),
-        Box::new(LatencyNormalityEvaluator),
-        Box::new(IntentActionDivergenceEvaluator),
-        Box::new(FingerprintDeviationEvaluator),
-    ];
 
     // The reprobe flag needs a timer, not event piggybacking: with no
     // agents connected there are no events, and that is exactly when a
@@ -171,23 +669,20 @@ pub async fn run(
                                 continue;
                             }
                             let agent_id = agent_id.clone();
-                            budget_tracker.resync(&agent_id, *settled);
+                            engine.budget_tracker.resync(&agent_id, *settled);
                             // A crossing the dropped events hid fires here,
                             // late but fired. Trace id is synthetic: the
                             // kill is day-scoped, not trace-scoped.
-                            enforce_budget(
-                                &budgets,
-                                &budget_tracker,
-                                &mut budget_states,
-                                &engine_tx,
-                                &dispatch_tx,
-                                &warm,
-                                &agent_id,
-                                &TraceId::from(format!("budget-resync-{}", current_ms()).as_str()),
-                                0.0,
-                                current_ms(),
-                            )
-                            .await;
+                            engine
+                                .enforce_budget(
+                                    &agent_id,
+                                    &TraceId::from(
+                                        format!("budget-resync-{}", current_ms()).as_str(),
+                                    ),
+                                    0.0,
+                                    current_ms(),
+                                )
+                                .await;
                         }
                     }
                     Err(e) => {
@@ -216,7 +711,7 @@ pub async fn run(
                         reason: backend_reason,
                         privacy_tier: startup_privacy_tier,
                     });
-                    judge = Arc::new(LlmJudge::new(backend));
+                    engine.judge = Arc::new(LlmJudge::new(backend));
                 }
                 continue;
             }
@@ -228,7 +723,7 @@ pub async fn run(
                 let cfg_rules = policy::config::load(&config_path);
                 let mut combined = db_rules;
                 combined.extend(cfg_rules);
-                policy_engine.replace_user_rules(combined);
+                engine.policy_engine.replace_user_rules(combined);
                 continue;
             }
             ev = ingestion_rx.recv() => ev,
@@ -240,362 +735,12 @@ pub async fn run(
                 span_count,
                 cost,
             }) => {
-                let spans = warm
-                    .list_spans_for_trace(&trace_id)
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            trace_id = %trace_id,
-                            error = %e,
-                            "engine failed to load spans for evaluation"
-                        );
-                        vec![]
-                    });
-
-                let min_start = spans.iter().map(|s| s.start_time).min();
-                let max_end = spans.iter().filter_map(|s| s.end_time).max();
-                let duration_secs = match (min_start, max_end) {
-                    (Some(s), Some(e)) => e.saturating_sub(s).max(0) as f64 / 1e9,
-                    _ => 0.0,
-                };
-
-                let fp = fingerprints.get(&agent_id);
-
-                let ctx = TraceContext {
-                    trace_id: trace_id.clone(),
-                    agent_id: agent_id.clone(),
-                    span_count,
-                    cost,
-                    spans: &spans,
-                    fingerprint: fp,
-                };
-
-                let mut metric_scores: HashMap<&str, f64> = HashMap::new();
-
-                for evaluator in &evaluators {
-                    if let Some(score) = evaluator.evaluate(&ctx) {
-                        let _ = engine_tx.send(EngineEvent::EvaluationComplete {
-                            trace_id: trace_id.clone(),
-                            span_id: None,
-                            metric: evaluator.name().to_string(),
-                            score,
-                            confidence: None,
-                        });
-                        metric_scores.insert(evaluator.name(), score);
-                    }
-                }
-
-                let mut tier1_health: Option<f64> = None;
-
-                if let Some(hs) = reeve_model::scoring::compute(&metric_scores) {
-                    tier1_health = Some(hs.value);
-                    let event = EngineEvent::HealthScoreUpdated {
-                        agent_id: agent_id.clone(),
-                        trace_id: trace_id.clone(),
-                        score: hs.value,
-                        tier2_pending: hs.tier2_pending,
-                        weight_coverage: hs.weight_coverage,
-                    };
-                    if engine_tx.send(event).is_err() {
-                        tracing::debug!("no engine event subscribers");
-                    }
-
-                    if let Err(e) = warm.update_trace_health_score(&trace_id, hs.value).await {
-                        tracing::warn!(
-                            trace_id = %trace_id,
-                            error = %e,
-                            "failed to persist health score"
-                        );
-                    }
-
-                    // Policy evaluation runs on Tier 1 results. Tier 2 does not
-                    // re-trigger to avoid double-firing on the same trace.
-                    let now_ms = current_ms();
-                    let policy_ctx = PolicyContext::build(
-                        hs.value,
-                        cost,
-                        span_count,
-                        hs.tier2_pending,
-                        hs.weight_coverage,
-                        0.0,
-                        &metric_scores,
-                    );
-                    let live = declared_capabilities(&live_capabilities, &agent_id);
-                    let fired = policy_engine.evaluate(
-                        &agent_id,
-                        &trace_id,
-                        &policy_ctx,
-                        AgentReach::new(
-                            integration_path_for(&warm, &agent_id).await,
-                            live.as_deref(),
-                        ),
-                        Instant::now(),
-                        now_ms,
-                    );
-                    for fr in fired {
-                        let (
-                            rule_id_str,
-                            description,
-                            cmd_type,
-                            requires_confirmation,
-                            auto_confirm_after_secs,
-                        ) = alert_fields(&fr);
-                        let rule_id_owned = rule_id_str.to_string();
-                        let effectiveness = effectiveness_hint(&warm, &fr.rule.id, &agent_id).await;
-                        let _ = engine_tx.send(EngineEvent::PolicyAlert {
-                            agent_id: agent_id.clone(),
-                            rule_id: rule_id_owned.clone(),
-                            description: description.to_string(),
-                            command_type: cmd_type.map(str::to_string),
-                            requires_confirmation,
-                            auto_confirm_after_secs,
-                            effectiveness,
-                        });
-                        persist_cooldown(
-                            &warm,
-                            &agent_id,
-                            &fr.rule.id,
-                            now_ms,
-                            fr.rule.cooldown_secs,
-                        )
-                        .await;
-                        // Nothing to dispatch when the target cannot run it.
-                        // The alert above already went out. ADR-0045.
-                        if fr.command_available {
-                            dispatch_or_save(
-                                &dispatch_tx,
-                                &warm,
-                                &agent_id,
-                                fr.command,
-                                requires_confirmation,
-                                &rule_id_owned,
-                            )
-                            .await;
-                        }
-                    }
-                }
-
-                // Settle this trace's real cost against the agent's daily
-                // budget. The completion path folds in no prediction: the
-                // number is now known, so the check is exact.
-                if budgets.cap_for(agent_id.as_str()).is_some() {
-                    budget_tracker.add_spend(&agent_id, cost);
-                    enforce_budget(
-                        &budgets,
-                        &budget_tracker,
-                        &mut budget_states,
-                        &engine_tx,
-                        &dispatch_tx,
-                        &warm,
-                        &agent_id,
-                        &trace_id,
-                        0.0,
-                        current_ms(),
-                    )
+                engine
+                    .handle_trace_completed(trace_id, agent_id, span_count, cost)
                     .await;
-                }
-
-                fingerprints.entry(agent_id.clone()).or_default().update(
-                    span_count,
-                    cost,
-                    duration_secs,
-                );
-
-                // Pick up newly applied commands before this trace's score
-                // enters the history: the last recorded score at pickup time
-                // is the honest before-picture for the intervention.
-                if let Some(feed) = &applied_commands {
-                    let drained: Vec<AppliedCommand> = feed.lock().unwrap().drain(..).collect();
-                    for record in drained {
-                        let pre = score_histories
-                            .get(&record.agent_id)
-                            .and_then(|h| h.back().copied());
-                        outcome_tracker.command_applied(record, pre);
-                    }
-                }
-
-                // Update per-agent health score history and compute Tier 2 rate.
-                let history = score_histories.entry(agent_id.clone()).or_default();
-                if let Some(score) = tier1_health {
-                    history.push_back(score);
-                    if history.len() > 5 {
-                        history.pop_front();
-                    }
-                }
-                let rate = tier2_sample_rate(history);
-
-                if let Some(score) = tier1_health {
-                    let now_ms = current_ms();
-                    for outcome in
-                        outcome_tracker.trace_scored(&agent_id, score, span_count as u32, now_ms)
-                    {
-                        tracing::info!(
-                            command_id = %outcome.command_id,
-                            delta = ?outcome.delta,
-                            "intervention outcome measured"
-                        );
-                        if let Err(e) = warm.save_intervention_outcome(outcome).await {
-                            tracing::warn!(error = %e, "failed to persist intervention outcome");
-                        }
-                    }
-                }
-
-                // Tier 2 runs asynchronously after Tier 1 completes. Tier 1
-                // always runs; only the Tier 2 spawn is gated by the sample rate.
-                let tier1_scores: HashMap<String, f64> = metric_scores
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), *v))
-                    .collect();
-                if rand::random::<f64>() < rate {
-                    tokio::spawn(run_tier2(
-                        trace_id.clone(),
-                        agent_id.clone(),
-                        spans,
-                        tier1_scores,
-                        engine_tx.clone(),
-                        warm.clone(),
-                        judge.clone(),
-                    ));
-                }
-
-                cost_accumulators.remove(&trace_id);
-                trace_agents.remove(&trace_id);
             }
             Ok(IngestionEvent::SpanCompleted { trace_id, span_id }) => {
-                let span = match warm.get_span(&span_id).await {
-                    Ok(Some(s)) => s,
-                    _ => continue,
-                };
-
-                // The pipeline already priced every priceable span (the
-                // proxy for its own traffic, normalize for SDK spans), so
-                // prediction accumulates the stamped cost instead of
-                // re-deriving it from tokens. The engine keeping its own
-                // price table meant two tables for one quantity, and the
-                // engine's had drifted: predictive stops silently never
-                // fired for model families only the pipeline knew.
-                let span_cost = span
-                    .attributes
-                    .get("gen_ai.usage.cost")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-
-                if span_cost <= 0.0 {
-                    continue;
-                }
-
-                let agent_id = match trace_agents.get(&trace_id) {
-                    Some(a) => a.clone(),
-                    None => match warm.get_trace(&trace_id).await {
-                        Ok(Some(t)) => {
-                            let id = t.agent_id.clone();
-                            trace_agents.insert(trace_id.clone(), id.clone());
-                            id
-                        }
-                        _ => continue,
-                    },
-                };
-
-                let now_ms = current_ms();
-                let acc = cost_accumulators
-                    .entry(trace_id.clone())
-                    .or_insert_with(|| CostAccumulator {
-                        started_at_ms: now_ms,
-                        current_cost: 0.0,
-                        samples: VecDeque::new(),
-                    });
-
-                acc.current_cost += span_cost;
-                acc.samples.push_back((acc.current_cost, now_ms));
-                if acc.samples.len() > 5 {
-                    acc.samples.pop_front();
-                }
-
-                if acc.samples.len() < 2 {
-                    continue;
-                }
-
-                let (old_cost, old_ts) = *acc.samples.front().unwrap();
-                let window_secs = (now_ms - old_ts).max(1) as f64 / 1000.0;
-                let rate = (acc.current_cost - old_cost) / window_secs;
-
-                let elapsed_total = (now_ms - acc.started_at_ms).max(0) as f64 / 1000.0;
-                let avg_duration = fingerprints
-                    .get(&agent_id)
-                    .map(|fp| fp.avg_duration_secs)
-                    .unwrap_or(30.0);
-                let remaining = (avg_duration - elapsed_total).max(0.0);
-                let predicted = acc.current_cost + rate * remaining;
-
-                if predicted <= 0.0 {
-                    continue;
-                }
-
-                let live = declared_capabilities(&live_capabilities, &agent_id);
-                let mid_fired = policy_engine.evaluate_mid_trace(
-                    &agent_id,
-                    &trace_id,
-                    predicted,
-                    AgentReach::new(
-                        integration_path_for(&warm, &agent_id).await,
-                        live.as_deref(),
-                    ),
-                    Instant::now(),
-                    now_ms,
-                );
-                for fr in mid_fired {
-                    let (
-                        rule_id_str,
-                        description,
-                        cmd_type,
-                        requires_confirmation,
-                        auto_confirm_after_secs,
-                    ) = alert_fields(&fr);
-                    let rule_id_owned = rule_id_str.to_string();
-                    let effectiveness = effectiveness_hint(&warm, &fr.rule.id, &agent_id).await;
-                    let _ = engine_tx.send(EngineEvent::PolicyAlert {
-                        agent_id: agent_id.clone(),
-                        rule_id: rule_id_owned.clone(),
-                        description: description.to_string(),
-                        command_type: cmd_type.map(str::to_string),
-                        requires_confirmation,
-                        auto_confirm_after_secs,
-                        effectiveness,
-                    });
-                    persist_cooldown(&warm, &agent_id, &fr.rule.id, now_ms, fr.rule.cooldown_secs)
-                        .await;
-                    if fr.command_available {
-                        dispatch_or_save(
-                            &dispatch_tx,
-                            &warm,
-                            &agent_id,
-                            fr.command,
-                            requires_confirmation,
-                            &rule_id_owned,
-                        )
-                        .await;
-                    }
-                }
-
-                // Fold the predicted final cost of this in-flight trace into
-                // the budget check so a run that will blow the cap is stopped
-                // before it finishes spending. Settled spend does not yet
-                // include this trace, so `predicted` is the whole extra.
-                if budgets.cap_for(agent_id.as_str()).is_some() {
-                    enforce_budget(
-                        &budgets,
-                        &budget_tracker,
-                        &mut budget_states,
-                        &engine_tx,
-                        &dispatch_tx,
-                        &warm,
-                        &agent_id,
-                        &trace_id,
-                        predicted,
-                        now_ms,
-                    )
-                    .await;
-                }
+                engine.handle_span_completed(trace_id, span_id).await;
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -677,83 +822,6 @@ async fn persist_cooldown(
         .await
     {
         tracing::warn!(rule_id = %rule_id, error = %e, "failed to persist cooldown");
-    }
-}
-
-/// Checks an agent's spend against its cap and acts on it: always emits a
-/// `BudgetUpdated` so the cockpit's bar tracks the ceiling, warns ALERTS once
-/// on entry into the warn band, and fires a kill the moment settled or
-/// predicted spend crosses the cap. `extra` folds a mid-trace prediction into
-/// the check so the stop lands before the money is gone; it is zero at
-/// completion, when spend is already settled. `last_states` remembers where
-/// each agent sat so only a transition speaks: a fresh alert every tick, or a
-/// re-fired kill against an already-engaged breaker, would be noise.
-#[allow(clippy::too_many_arguments)]
-async fn enforce_budget(
-    budgets: &policy::config::Budgets,
-    tracker: &budget::BudgetTracker,
-    last_states: &mut HashMap<AgentId, budget::BudgetState>,
-    engine_tx: &broadcast::Sender<EngineEvent>,
-    dispatch_tx: &Option<DispatchSender>,
-    warm: &WarmStore,
-    agent_id: &AgentId,
-    trace_id: &TraceId,
-    extra: f64,
-    now_ms: i64,
-) {
-    let Some(cap) = budgets.cap_for(agent_id.as_str()) else {
-        return;
-    };
-    let view = tracker.view(agent_id, cap, extra);
-    let over = view.state == budget::BudgetState::Over;
-    let _ = engine_tx.send(EngineEvent::BudgetUpdated {
-        agent_id: agent_id.clone(),
-        spent_today: view.spent_today,
-        cap: view.cap,
-        over,
-    });
-
-    let prev = last_states.insert(agent_id.clone(), view.state);
-    let projected = view.spent_today + extra.max(0.0);
-    let pct = (projected / cap * 100.0).round() as i64;
-
-    if view.state == budget::BudgetState::Warn
-        && !matches!(
-            prev,
-            Some(budget::BudgetState::Warn | budget::BudgetState::Over)
-        )
-    {
-        let _ = engine_tx.send(EngineEvent::PolicyAlert {
-            agent_id: agent_id.clone(),
-            rule_id: "builtin_budget_warn".to_string(),
-            description: format!("budget: {agent_id} nearing its ${cap:.2} daily cap ({pct}%)"),
-            command_type: Some("warning".to_string()),
-            requires_confirmation: false,
-            auto_confirm_after_secs: None,
-            effectiveness: None,
-        });
-    }
-
-    if over && prev != Some(budget::BudgetState::Over) {
-        let _ = engine_tx.send(EngineEvent::PolicyAlert {
-            agent_id: agent_id.clone(),
-            rule_id: "builtin_budget_kill".to_string(),
-            description: format!("budget: stopped {agent_id} at its ${cap:.2} daily cap"),
-            command_type: Some("kill".to_string()),
-            requires_confirmation: false,
-            auto_confirm_after_secs: None,
-            effectiveness: None,
-        });
-        let command = budget_kill_command(agent_id, trace_id, now_ms);
-        dispatch_or_save(
-            dispatch_tx,
-            warm,
-            agent_id,
-            command,
-            false,
-            "builtin_budget",
-        )
-        .await;
     }
 }
 

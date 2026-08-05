@@ -2,7 +2,11 @@ use super::TraceContext;
 use std::collections::HashMap;
 
 pub trait Evaluator: Send + Sync {
-    fn name(&self) -> &str;
+    /// A fixed metric name, not derived from instance state. Static
+    /// because it is: tying it to `&self` made every score map borrow the
+    /// evaluator list that produced it, which kept that list borrowed for
+    /// as long as the scores lived.
+    fn name(&self) -> &'static str;
     fn evaluate(&self, ctx: &TraceContext<'_>) -> Option<f64>;
 }
 
@@ -17,7 +21,7 @@ impl LoopDetector {
 }
 
 impl Evaluator for LoopDetector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "loop_detection"
     }
 
@@ -69,7 +73,7 @@ impl Evaluator for LoopDetector {
 pub struct CostEfficiencyEvaluator;
 
 impl Evaluator for CostEfficiencyEvaluator {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "cost_efficiency"
     }
 
@@ -87,7 +91,7 @@ impl Evaluator for CostEfficiencyEvaluator {
 pub struct LatencyNormalityEvaluator;
 
 impl Evaluator for LatencyNormalityEvaluator {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "latency_normality"
     }
 
@@ -109,7 +113,7 @@ impl Evaluator for LatencyNormalityEvaluator {
 pub struct IntentActionDivergenceEvaluator;
 
 impl Evaluator for IntentActionDivergenceEvaluator {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "intent_action_divergence"
     }
 
@@ -125,7 +129,7 @@ impl Evaluator for IntentActionDivergenceEvaluator {
 pub struct FingerprintDeviationEvaluator;
 
 impl Evaluator for FingerprintDeviationEvaluator {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "fingerprint_deviation"
     }
 
