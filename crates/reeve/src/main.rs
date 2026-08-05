@@ -86,7 +86,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = std::env::var("HOME")
         .map(|h| PathBuf::from(h).join(".config/reeve/config.toml"))
         .unwrap_or_else(|_| PathBuf::from(".config/reeve/config.toml"));
-    let privacy_tier = reeve_engine::policy::config::load_privacy_tier(&config_path);
+    // One read for every setting the binary needs.
+    let config = reeve_engine::policy::config::Config::load(&config_path);
+    let privacy_tier = config.privacy_tier;
     if privacy_tier >= 2 {
         let consent_path = db_path
             .parent()
@@ -144,12 +146,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         disconnected_agents.clone(),
         proxy_interventions.clone(),
         privacy_tier >= 2,
-        reeve_engine::policy::config::load_secrets_block(&config_path),
+        config.secrets_block,
     ));
     // Retention: completed traces older than the configured age are
     // pruned on startup and then hourly, through the same atomic delete
     // path the History view uses. Zero days disables pruning entirely.
-    let retention_days = reeve_engine::policy::config::load_retention_days(&config_path);
+    let retention_days = config.retention_days;
     if retention_days > 0 {
         let warm_for_retention = warm.clone();
         tokio::spawn(async move {
@@ -232,8 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let notifications_enabled =
-        reeve_engine::policy::config::load_notifications_enabled(&config_path);
+    let notifications_enabled = config.notifications_enabled;
     reeve_renderer::run(
         ingestion_rx,
         engine_event_rx,

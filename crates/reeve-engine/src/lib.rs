@@ -20,13 +20,13 @@ use reeve_model::entity::intervention::{
     AppliedCommand, CommandStatus, CommandType, InterventionCommand, LiveCapabilities,
 };
 use reeve_model::entity::span::InternalSpan;
-use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, SpanId, TraceId};
+use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, SpanId, TraceId, current_ms};
 use reeve_model::signal::{EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::WarmStore;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 
 pub type DispatchSender = mpsc::Sender<(AgentId, InterventionCommand)>;
@@ -556,16 +556,17 @@ pub async fn run(
         .unwrap_or_else(|_| PathBuf::from(".config/reeve/config.toml"));
 
     tracing::info!(backend = %backend_name, "evaluation backend ready");
-    // Read once at startup, resent unchanged on reprobe: the privacy tier
-    // deliberately does not reload while Reeve runs.
-    let startup_privacy_tier = policy::config::load_privacy_tier(&config_path);
+    // One read for every setting this crate needs. The privacy tier is
+    // resent unchanged on reprobe: it deliberately does not reload while
+    // Reeve runs.
+    let config = policy::config::Config::load(&config_path);
+    let startup_privacy_tier = config.privacy_tier;
     let _ = engine_tx.send(EngineEvent::EvaluationBackendReady {
         backend: backend_name,
         reason: backend_reason,
         privacy_tier: startup_privacy_tier,
     });
-    // Daily budgets: read once at startup like the rest of the config.
-    let budgets = policy::config::load_budgets(&config_path);
+    let budgets = config.budgets.clone();
     let mut engine = EngineLoop {
         warm: warm.clone(),
         engine_tx: engine_tx.clone(),
@@ -596,9 +597,8 @@ pub async fn run(
             tracing::warn!(error = %e, "failed to load policy rules from database");
             vec![]
         });
-        let cfg_rules = policy::config::load(&config_path);
         let mut combined = db_rules;
-        combined.extend(cfg_rules);
+        combined.extend(config.rules.clone());
         engine.policy_engine.replace_user_rules(combined);
     }
 
@@ -720,7 +720,7 @@ pub async fn run(
                     tracing::warn!(error = %e, "failed to reload policy rules from database");
                     vec![]
                 });
-                let cfg_rules = policy::config::load(&config_path);
+                let cfg_rules = policy::config::Config::load(&config_path).rules;
                 let mut combined = db_rules;
                 combined.extend(cfg_rules);
                 engine.policy_engine.replace_user_rules(combined);
@@ -861,13 +861,6 @@ async fn dispatch_or_save(
     } else if let Err(e) = warm.save_intervention_command(command).await {
         tracing::warn!(rule_id, error = %e, "failed to persist intervention command");
     }
-}
-
-fn current_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 /// Returns the Tier 2 sampling rate for an agent based on recent health scores.
