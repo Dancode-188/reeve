@@ -360,16 +360,17 @@ async fn forward(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("text/event-stream"));
 
+    let span_ctx = SpanContext {
+        state: state.clone(),
+        agent_name,
+        placement,
+        arrived,
+        overhead_ms,
+        secret_kinds,
+    };
+
     if streaming {
-        let body = stream_and_accumulate(
-            state.clone(),
-            upstream_resp,
-            agent_name,
-            placement,
-            arrived,
-            overhead_ms,
-            secret_kinds,
-        );
+        let body = stream_and_accumulate(span_ctx, upstream_resp);
         return build_response(status, &resp_headers, body);
     }
 
@@ -377,7 +378,7 @@ async fn forward(
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "proxy failed reading upstream response");
-            if let Some(ref p) = placement {
+            if let Some(ref p) = span_ctx.placement {
                 mark_stream(&state, &p.trace_id, -1);
             }
             return Response::builder()
@@ -389,19 +390,9 @@ async fn forward(
 
     // Unmark only after the span has entered the pipeline: the trace
     // stays exempt from the idle timeout until its evidence is in.
-    let placement_trace_id = placement.as_ref().map(|p| p.trace_id.clone());
+    let placement_trace_id = span_ctx.placement.as_ref().map(|p| p.trace_id.clone());
     if method == Method::POST && uri.path().ends_with("/v1/messages") {
-        synthesize_span(
-            &state,
-            &agent_name,
-            placement,
-            &resp_body,
-            status.as_u16(),
-            arrived,
-            overhead_ms,
-            &secret_kinds,
-        )
-        .await;
+        synthesize_span(&span_ctx, &resp_body, status.as_u16()).await;
     }
     if let Some(tid) = placement_trace_id {
         mark_stream(&state, &tid, -1);
@@ -455,39 +446,60 @@ impl StreamOutcome {
     }
 }
 
+/// What every span this proxy emits needs to know about the request that
+/// produced it.
+///
+/// These six values travelled together as separate arguments through each
+/// function that emits a span, which is how three of them ended up over
+/// clippy's argument limit. Owned rather than borrowed because the
+/// streaming path moves the whole thing into a spawned task that outlives
+/// the request handler.
+struct SpanContext {
+    state: Arc<ProxyState>,
+    agent_name: String,
+    placement: Option<TurnPlacement>,
+    arrived: SystemTime,
+    overhead_ms: f64,
+    secret_kinds: Vec<&'static str>,
+}
+
+/// The identity a streamed span will carry, generated when the stream
+/// opens rather than when it closes, so the trace exists before the first
+/// chunk lands.
+struct SpanIds {
+    trace_id: Vec<u8>,
+    parent_span_id: Vec<u8>,
+    span_id: Vec<u8>,
+}
+
 /// Forwards SSE chunks to the client the moment they arrive while a side
 /// accumulator reconstructs the round trip. Chunks go client-first: the
 /// send happens before the parse, so the proxy adds no latency the
 /// client can observe. Emits StreamingUpdate per text delta so the
 /// cockpit's streaming box renders the generation live, and finalizes a
 /// span through every exit path.
-#[allow(clippy::too_many_arguments)]
-fn stream_and_accumulate(
-    state: Arc<ProxyState>,
-    upstream_resp: reqwest::Response,
-    agent_name: String,
-    placement: Option<TurnPlacement>,
-    arrived: SystemTime,
-    overhead_ms: f64,
-    secret_kinds: Vec<&'static str>,
-) -> Body {
+fn stream_and_accumulate(ctx: SpanContext, upstream_resp: reqwest::Response) -> Body {
     let (body_tx, body_rx) = mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
 
     tokio::spawn(async move {
         let mut upstream = upstream_resp.bytes_stream();
         let mut acc = SseAccumulator::default();
-        let (trace_id, parent_span_id) = match &placement {
+        let (trace_id, parent_span_id) = match &ctx.placement {
             Some(p) => (p.trace_id.clone(), p.root_span_id.clone()),
             None => (random_bytes(16), Vec::new()),
         };
-        let span_id = random_bytes(8);
-        let span_id_hex: String = span_id.iter().map(|b| format!("{:02x}", b)).collect();
-        let trace_id_hex: String = trace_id.iter().map(|b| format!("{:02x}", b)).collect();
+        let ids = SpanIds {
+            trace_id,
+            parent_span_id,
+            span_id: random_bytes(8),
+        };
+        let span_id_hex: String = ids.span_id.iter().map(|b| format!("{:02x}", b)).collect();
+        let trace_id_hex: String = ids.trace_id.iter().map(|b| format!("{:02x}", b)).collect();
         let mut first_chunk_at: Option<SystemTime> = None;
         let mut outcome = StreamOutcome::Completed;
 
         loop {
-            let next = tokio::time::timeout(state.stream_chunk_timeout, upstream.next()).await;
+            let next = tokio::time::timeout(ctx.state.stream_chunk_timeout, upstream.next()).await;
             let chunk = match next {
                 Err(_) => {
                     outcome = StreamOutcome::StreamTimedOut;
@@ -534,10 +546,10 @@ fn stream_and_accumulate(
                         acc.cache_creation_tokens,
                     )
                 });
-                let _ = state.signal_tx.send(IngestionEvent::StreamingUpdate {
+                let _ = ctx.state.signal_tx.send(IngestionEvent::StreamingUpdate {
                     trace_id: trace_id_hex.clone().into(),
                     span_id: span_id_hex.clone().into(),
-                    agent_id: reeve_model::ids::agent_id_from_service(&agent_name, "proxy"),
+                    agent_id: reeve_model::ids::agent_id_from_service(&ctx.agent_name, "proxy"),
                     content: acc.content.clone(),
                     cost_so_far,
                 });
@@ -546,30 +558,16 @@ fn stream_and_accumulate(
         drop(body_tx);
 
         let ttft_ms = first_chunk_at.and_then(|t| {
-            t.duration_since(arrived)
+            t.duration_since(ctx.arrived)
                 .ok()
                 .map(|d| d.as_secs_f64() * 1e3)
         });
         // The idle exemption holds through every stream outcome; drop it
         // only once the finalized span has entered the pipeline.
-        let placement_trace_id = placement.as_ref().map(|p| p.trace_id.clone());
-        finalize_stream_span(
-            &state,
-            &agent_name,
-            placement,
-            acc,
-            outcome,
-            trace_id,
-            parent_span_id,
-            span_id,
-            arrived,
-            ttft_ms,
-            overhead_ms,
-            &secret_kinds,
-        )
-        .await;
+        let placement_trace_id = ctx.placement.as_ref().map(|p| p.trace_id.clone());
+        finalize_stream_span(&ctx, &ids, acc, outcome, ttft_ms).await;
         if let Some(tid) = placement_trace_id {
-            mark_stream(&state, &tid, -1);
+            mark_stream(&ctx.state, &tid, -1);
         }
     });
 
@@ -578,20 +576,12 @@ fn stream_and_accumulate(
 
 /// The streaming counterpart of synthesize_span: same shape of span,
 /// built from the accumulator, plus the outcome and time-to-first-token.
-#[allow(clippy::too_many_arguments)]
 async fn finalize_stream_span(
-    state: &ProxyState,
-    agent_name: &str,
-    placement: Option<TurnPlacement>,
+    ctx: &SpanContext,
+    ids: &SpanIds,
     acc: SseAccumulator,
     outcome: StreamOutcome,
-    trace_id: Vec<u8>,
-    parent_span_id: Vec<u8>,
-    span_id: Vec<u8>,
-    arrived: SystemTime,
     ttft_ms: Option<f64>,
-    overhead_ms: f64,
-    secret_kinds: &[&'static str],
 ) {
     let model = acc.model.unwrap_or_else(|| "unknown".to_string());
     let mut attributes = vec![
@@ -605,12 +595,12 @@ async fn finalize_stream_span(
             (acc.input_tokens + acc.output_tokens) as i64,
         ),
         kv_str("reeve.proxy.stream_outcome", outcome.label()),
-        kv_double("reeve.proxy.overhead_ms", overhead_ms),
+        kv_double("reeve.proxy.overhead_ms", ctx.overhead_ms),
     ];
     if let Some(ttft) = ttft_ms {
         attributes.push(kv_double("reeve.proxy.ttft_ms", ttft));
     }
-    if let Some(ref p) = placement {
+    if let Some(ref p) = ctx.placement {
         attributes.push(kv_int(
             "reeve.proxy.context_messages",
             p.message_count as i64,
@@ -622,8 +612,13 @@ async fn finalize_stream_span(
             acc.thinking_tokens as i64,
         ));
     }
-    surface_compaction(state, agent_name, &acc.applied_edits, &mut attributes);
-    stamp_secret_findings(secret_kinds, &mut attributes);
+    surface_compaction(
+        &ctx.state,
+        &ctx.agent_name,
+        &acc.applied_edits,
+        &mut attributes,
+    );
+    stamp_secret_findings(&ctx.secret_kinds, &mut attributes);
     if acc.cache_read_tokens > 0 {
         attributes.push(kv_int(
             "gen_ai.usage.cache_read.input_tokens",
@@ -662,11 +657,11 @@ async fn finalize_stream_span(
 
     let ended = SystemTime::now();
     let span = OtlpSpan {
-        trace_id,
-        span_id: span_id.clone(),
-        parent_span_id,
+        trace_id: ids.trace_id.clone(),
+        span_id: ids.span_id.clone(),
+        parent_span_id: ids.parent_span_id.clone(),
         name: "gen_ai.chat".to_string(),
-        start_time_unix_nano: to_nanos(arrived),
+        start_time_unix_nano: to_nanos(ctx.arrived),
         end_time_unix_nano: to_nanos(ended),
         attributes,
         status: Some(OtlpStatus {
@@ -675,9 +670,9 @@ async fn finalize_stream_span(
         }),
         ..Default::default()
     };
-    emit_pipeline_span(state, agent_name, span, arrived).await;
+    emit_pipeline_span(&ctx.state, &ctx.agent_name, span, ctx.arrived).await;
 
-    if let Some(ref p) = placement {
+    if let Some(ref p) = ctx.placement {
         // A dead stream still ends its turn: whatever the outcome, the
         // assistant is not going to request more tools on this round trip,
         // so an outcome other than tool_use closes the turn honestly.
@@ -685,22 +680,23 @@ async fn finalize_stream_span(
             StreamOutcome::Completed => acc.stop_reason,
             _ => Some(format!("proxy:{}", outcome.label())),
         };
-        let root = state
+        let root = ctx
+            .state
             .tracker
             .lock()
             .expect("tracker mutex poisoned")
             .record_response(
-                agent_name,
+                &ctx.agent_name,
                 &p.trace_id,
                 ResponseInfo {
-                    chat_span_id: span_id,
+                    chat_span_id: ids.span_id.clone(),
                     tool_uses: acc.tool_uses,
                     stop_reason,
                     ended_at: ended,
                 },
             );
         if let Some(root) = root {
-            emit_turn_root(state, agent_name, root).await;
+            emit_turn_root(&ctx.state, &ctx.agent_name, root).await;
         }
     }
 }
@@ -876,17 +872,7 @@ async fn emit_turn_root(state: &ProxyState, agent_name: &str, root: TurnRoot) {
 /// model, token usage, and estimated cost, threaded into its turn's trace
 /// as a child of the turn root. Upstream failures (429s, 5xx) synthesize
 /// failed spans so retry storms render visibly.
-#[allow(clippy::too_many_arguments)]
-async fn synthesize_span(
-    state: &ProxyState,
-    agent_name: &str,
-    placement: Option<TurnPlacement>,
-    resp_body: &[u8],
-    http_status: u16,
-    arrived: SystemTime,
-    overhead_ms: f64,
-    secret_kinds: &[&'static str],
-) {
+async fn synthesize_span(ctx: &SpanContext, resp_body: &[u8], http_status: u16) {
     let ended = SystemTime::now();
 
     let parsed: serde_json::Value = serde_json::from_slice(resp_body).unwrap_or_default();
@@ -943,9 +929,9 @@ async fn synthesize_span(
             (input_tokens + output_tokens) as i64,
         ),
         kv_int("http.response.status_code", http_status as i64),
-        kv_double("reeve.proxy.overhead_ms", overhead_ms),
+        kv_double("reeve.proxy.overhead_ms", ctx.overhead_ms),
     ];
-    if let Some(ref p) = placement {
+    if let Some(ref p) = ctx.placement {
         attributes.push(kv_int(
             "reeve.proxy.context_messages",
             p.message_count as i64,
@@ -969,8 +955,8 @@ async fn synthesize_span(
                 .collect()
         })
         .unwrap_or_default();
-    surface_compaction(state, agent_name, &applied_edits, &mut attributes);
-    stamp_secret_findings(secret_kinds, &mut attributes);
+    surface_compaction(&ctx.state, &ctx.agent_name, &applied_edits, &mut attributes);
+    stamp_secret_findings(&ctx.secret_kinds, &mut attributes);
     if cache_read > 0 {
         attributes.push(kv_int(
             "gen_ai.usage.cache_read.input_tokens",
@@ -1003,7 +989,7 @@ async fn synthesize_span(
     // A request without a parseable conversation synthesizes a standalone
     // span, its own root in its own trace: the pre-threading behavior,
     // kept as the fallback so unusual clients still render.
-    let (trace_id, parent_span_id) = match &placement {
+    let (trace_id, parent_span_id) = match &ctx.placement {
         Some(p) => (p.trace_id.clone(), p.root_span_id.clone()),
         None => (random_bytes(16), Vec::new()),
     };
@@ -1013,7 +999,7 @@ async fn synthesize_span(
         span_id: chat_span_id.clone(),
         parent_span_id,
         name: "gen_ai.chat".to_string(),
-        start_time_unix_nano: to_nanos(arrived),
+        start_time_unix_nano: to_nanos(ctx.arrived),
         end_time_unix_nano: to_nanos(ended),
         attributes,
         status: Some(OtlpStatus {
@@ -1022,15 +1008,16 @@ async fn synthesize_span(
         }),
         ..Default::default()
     };
-    emit_pipeline_span(state, agent_name, span, arrived).await;
+    emit_pipeline_span(&ctx.state, &ctx.agent_name, span, ctx.arrived).await;
 
-    if let Some(ref p) = placement {
-        let root = state
+    if let Some(ref p) = ctx.placement {
+        let root = ctx
+            .state
             .tracker
             .lock()
             .expect("tracker mutex poisoned")
             .record_response(
-                agent_name,
+                &ctx.agent_name,
                 &p.trace_id,
                 ResponseInfo {
                     chat_span_id,
@@ -1040,7 +1027,7 @@ async fn synthesize_span(
                 },
             );
         if let Some(root) = root {
-            emit_turn_root(state, agent_name, root).await;
+            emit_turn_root(&ctx.state, &ctx.agent_name, root).await;
         }
     }
 }
