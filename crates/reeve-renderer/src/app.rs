@@ -8,12 +8,11 @@ use reeve_model::entity::agent::Agent;
 use reeve_model::entity::intervention::{CommandStatus, CommandType, InterventionCommand};
 use reeve_model::entity::span::InternalSpan;
 use reeve_model::entity::trace::Trace;
-use reeve_model::ids::{AgentId, CommandId, SpanId, TraceId};
+use reeve_model::ids::{AgentId, CommandId, SpanId, TraceId, current_ms};
 use reeve_model::signal::{CostTrend, EngineEvent, EvaluationConfidence, IngestionEvent};
 use reeve_storage::warm::{CostSummary, WarmStore};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 pub struct MetricScore {
@@ -3054,13 +3053,6 @@ fn band_rank(score: f64) -> u8 {
     } else {
         0
     }
-}
-
-fn current_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 fn suggestion_for_rule(rule_id: &str) -> Option<SuggestedIntervention> {

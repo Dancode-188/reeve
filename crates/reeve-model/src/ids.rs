@@ -69,3 +69,20 @@ pub fn agent_id_from_service(service_name: &str, service_instance_id: &str) -> A
 
 /// Unix epoch milliseconds.
 pub type Timestamp = i64;
+
+/// Wall clock now, as a [`Timestamp`].
+///
+/// Four crates each had their own copy of this, and each repeated the same
+/// `u128 as i64` narrowing. The cast is safe for any clock this side of the
+/// year 292 million, but it is the kind of thing worth writing once rather
+/// than four times.
+///
+/// Steps backwards on a clock adjustment, by design: every consumer here
+/// stamps observations that must line up with what the agent reported, and
+/// a monotonic source cannot be compared across processes.
+pub fn current_ms() -> Timestamp {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as Timestamp
+}

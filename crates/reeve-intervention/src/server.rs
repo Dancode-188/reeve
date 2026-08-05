@@ -5,7 +5,7 @@ use crate::proto::{
 };
 use crate::types::AckNotification;
 use reeve_model::entity::intervention::{AckStatus, LiveCapabilities};
-use reeve_model::ids::AgentId;
+use reeve_model::ids::{AgentId, current_ms};
 use reeve_model::signal::EngineEvent;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -327,13 +327,6 @@ fn proto_ack_to_domain(status: i32) -> Option<AckStatus> {
         6 => Some(AckStatus::Cancelled),
         _ => None,
     }
-}
-
-fn current_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 /// Create an `Arc<ControlServer>` without binding any port. For use in

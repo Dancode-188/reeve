@@ -6,14 +6,14 @@ use reeve_model::entity::agent::IntegrationPath;
 use reeve_model::entity::intervention::{
     AckStatus, AppliedCommand, CommandStatus, CommandType, InterventionCommand,
 };
-use reeve_model::ids::{AgentId, CommandId};
+use reeve_model::ids::{AgentId, CommandId, current_ms};
 use reeve_storage::warm::WarmStore;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -580,13 +580,6 @@ fn ack_status_tag(s: AckStatus) -> &'static str {
         AckStatus::Expired => "expired",
         AckStatus::Cancelled => "cancelled",
     }
-}
-
-fn current_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 #[cfg(test)]
