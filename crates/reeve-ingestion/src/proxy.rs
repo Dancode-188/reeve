@@ -123,44 +123,57 @@ pub async fn run(
         std::env::var("REEVE_PROXY_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
     run_with(
         addr,
-        upstream,
-        std::env::var("REEVE_PROXY_AGENT_NAME").ok(),
-        std::time::Duration::from_millis(DEFAULT_STREAM_CHUNK_TIMEOUT_MS),
-        pipeline_tx,
-        signal_tx,
-        Some(interventions),
-        Some(active_streams),
-        Some(open_turns),
-        secrets_block,
+        ProxyConfig {
+            upstream,
+            agent_name_override: std::env::var("REEVE_PROXY_AGENT_NAME").ok(),
+            stream_chunk_timeout: std::time::Duration::from_millis(DEFAULT_STREAM_CHUNK_TIMEOUT_MS),
+            pipeline_tx,
+            signal_tx,
+            interventions: Some(interventions),
+            active_streams: Some(active_streams),
+            open_turns: Some(open_turns),
+            secrets_block,
+        },
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Everything the proxy is handed from outside: where to forward, how it
+/// is wired into the pipeline, and the shared state it coordinates
+/// through. `ProxyState` adds the three pieces it builds for itself.
+///
+/// A struct rather than nine arguments because the tail of those nine
+/// read `None, None, false` at every call site, and nothing there said
+/// which `None` was which.
+pub struct ProxyConfig {
+    pub upstream: String,
+    /// Overrides User-Agent derivation when set (REEVE_PROXY_AGENT_NAME).
+    pub agent_name_override: Option<String>,
+    pub stream_chunk_timeout: std::time::Duration,
+    pub pipeline_tx: mpsc::Sender<PipelineSpan>,
+    pub signal_tx: broadcast::Sender<IngestionEvent>,
+    pub interventions: Option<ProxyInterventions>,
+    pub active_streams: Option<crate::assemble::ActiveStreams>,
+    pub open_turns: Option<crate::assemble::OpenTurns>,
+    pub secrets_block: bool,
+}
+
 pub async fn run_with(
     addr: SocketAddr,
-    upstream: String,
-    agent_name_override: Option<String>,
-    stream_chunk_timeout: std::time::Duration,
-    pipeline_tx: mpsc::Sender<PipelineSpan>,
-    signal_tx: broadcast::Sender<IngestionEvent>,
-    interventions: Option<ProxyInterventions>,
-    active_streams: Option<crate::assemble::ActiveStreams>,
-    open_turns: Option<crate::assemble::OpenTurns>,
-    secrets_block: bool,
+    config: ProxyConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = Arc::new(ProxyState {
         client: reqwest::Client::new(),
-        upstream,
-        pipeline_tx,
-        signal_tx,
-        agent_name_override,
-        stream_chunk_timeout,
+        upstream: config.upstream,
+        pipeline_tx: config.pipeline_tx,
+        signal_tx: config.signal_tx,
+        agent_name_override: config.agent_name_override,
+        stream_chunk_timeout: config.stream_chunk_timeout,
         tracker: std::sync::Mutex::new(ConversationTracker::default()),
-        interventions,
-        active_streams,
-        open_turns,
-        secrets_block,
+        interventions: config.interventions,
+        active_streams: config.active_streams,
+        open_turns: config.open_turns,
+        secrets_block: config.secrets_block,
         seen_secrets: std::sync::Mutex::new(HashMap::new()),
     });
 
@@ -1208,15 +1221,17 @@ mod tests {
         drop(proxy_listener);
         tokio::spawn(run_with(
             proxy_addr,
-            format!("http://{}", upstream_addr),
-            None,
-            std::time::Duration::from_millis(500),
-            tx,
-            signal_tx,
-            Some(interventions.clone()),
-            None,
-            None,
-            false,
+            ProxyConfig {
+                upstream: format!("http://{}", upstream_addr),
+                agent_name_override: None,
+                stream_chunk_timeout: std::time::Duration::from_millis(500),
+                pipeline_tx: tx,
+                signal_tx,
+                interventions: Some(interventions.clone()),
+                active_streams: None,
+                open_turns: None,
+                secrets_block: false,
+            },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         (format!("http://{}", proxy_addr), rx, interventions)
@@ -1318,15 +1333,17 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
         drop(proxy_listener);
         tokio::spawn(run_with(
             proxy_addr,
-            format!("http://{}", upstream_addr),
-            None,
-            std::time::Duration::from_millis(500),
-            tx,
-            signal_tx,
-            None,
-            None,
-            None,
-            false,
+            ProxyConfig {
+                upstream: format!("http://{}", upstream_addr),
+                agent_name_override: None,
+                stream_chunk_timeout: std::time::Duration::from_millis(500),
+                pipeline_tx: tx,
+                signal_tx,
+                interventions: None,
+                active_streams: None,
+                open_turns: None,
+                secrets_block: false,
+            },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         (format!("http://{}", proxy_addr), rx, signal_rx)
@@ -1387,15 +1404,17 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
         drop(proxy_listener);
         tokio::spawn(run_with(
             proxy_addr,
-            format!("http://{}", upstream_addr),
-            None,
-            std::time::Duration::from_millis(500),
-            tx,
-            signal_tx,
-            None,
-            None,
-            None,
-            block,
+            ProxyConfig {
+                upstream: format!("http://{}", upstream_addr),
+                agent_name_override: None,
+                stream_chunk_timeout: std::time::Duration::from_millis(500),
+                pipeline_tx: tx,
+                signal_tx,
+                interventions: None,
+                active_streams: None,
+                open_turns: None,
+                secrets_block: block,
+            },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         (format!("http://{}", proxy_addr), rx, signal_rx)
@@ -1572,15 +1591,17 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
         drop(proxy_listener);
         tokio::spawn(run_with(
             proxy_addr,
-            format!("http://{}", upstream_addr),
-            None,
-            std::time::Duration::from_millis(500),
-            tx,
-            signal_tx,
-            None,
-            None,
-            None,
-            false,
+            ProxyConfig {
+                upstream: format!("http://{}", upstream_addr),
+                agent_name_override: None,
+                stream_chunk_timeout: std::time::Duration::from_millis(500),
+                pipeline_tx: tx,
+                signal_tx,
+                interventions: None,
+                active_streams: None,
+                open_turns: None,
+                secrets_block: false,
+            },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -1641,15 +1662,17 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
         drop(proxy_listener);
         tokio::spawn(run_with(
             proxy_addr,
-            format!("http://{}", upstream_addr),
-            None,
-            std::time::Duration::from_millis(500),
-            tx,
-            signal_tx,
-            None,
-            None,
-            Some(open_turns.clone()),
-            false,
+            ProxyConfig {
+                upstream: format!("http://{}", upstream_addr),
+                agent_name_override: None,
+                stream_chunk_timeout: std::time::Duration::from_millis(500),
+                pipeline_tx: tx,
+                signal_tx,
+                interventions: None,
+                active_streams: None,
+                open_turns: Some(open_turns.clone()),
+                secrets_block: false,
+            },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 

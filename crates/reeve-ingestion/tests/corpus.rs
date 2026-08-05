@@ -11,7 +11,7 @@
 
 use opentelemetry_proto::tonic::common::v1::any_value;
 use reeve_ingestion::normalize::PipelineSpan;
-use reeve_ingestion::proxy::run_with;
+use reeve_ingestion::proxy::{ProxyConfig, run_with};
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -129,15 +129,17 @@ async fn replay(scenario: &str) -> Vec<PipelineSpan> {
     drop(proxy_listener);
     tokio::spawn(run_with(
         proxy_addr,
-        format!("http://{upstream_addr}"),
-        None,
-        std::time::Duration::from_millis(2_000),
-        pipeline_tx,
-        signal_tx,
-        None,
-        None,
-        None,
-        false,
+        ProxyConfig {
+            upstream: format!("http://{upstream_addr}"),
+            agent_name_override: None,
+            stream_chunk_timeout: std::time::Duration::from_millis(2_000),
+            pipeline_tx,
+            signal_tx,
+            interventions: None,
+            active_streams: None,
+            open_turns: None,
+            secrets_block: false,
+        },
     ));
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
