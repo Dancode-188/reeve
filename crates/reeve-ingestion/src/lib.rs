@@ -19,19 +19,47 @@ use tokio::sync::broadcast;
 use tonic::transport::Server;
 use tonic_health::{ServingStatus, server::health_reporter};
 
-#[allow(clippy::too_many_arguments)]
+/// Everything the ingestion stack is handed from outside: the two ports it
+/// listens on, the store and channel it writes through, and the state it
+/// shares with the rest of Reeve.
+///
+/// Both addresses live here rather than staying positional, which is where
+/// this differs from `ProxyConfig`. That one has a single listen address
+/// and reads fine beside its config; two of the same type in a row is a
+/// different problem, and naming them is the point of the exercise.
+pub struct IngestionConfig {
+    /// OTLP receiver.
+    pub addr: SocketAddr,
+    /// HTTP proxy.
+    pub proxy_addr: SocketAddr,
+    pub warm: Arc<WarmStore>,
+    pub signal_tx: broadcast::Sender<IngestionEvent>,
+    pub ntp_offsets: receive::NtpOffsets,
+    pub paused: assemble::PausedAgents,
+    pub disconnected: assemble::DisconnectedAgents,
+    pub proxy_interventions: reeve_model::entity::ProxyInterventions,
+    /// Privacy tier 2 or above, where span events carry content.
+    pub capture_content: bool,
+    /// A detected outbound secret blocks the request rather than only
+    /// warning about it.
+    pub secrets_block: bool,
+}
+
 pub async fn serve(
-    addr: SocketAddr,
-    proxy_addr: SocketAddr,
-    warm: Arc<WarmStore>,
-    signal_tx: broadcast::Sender<IngestionEvent>,
-    ntp_offsets: receive::NtpOffsets,
-    paused: assemble::PausedAgents,
-    disconnected: assemble::DisconnectedAgents,
-    proxy_interventions: reeve_model::entity::ProxyInterventions,
-    capture_content: bool,
-    secrets_block: bool,
+    config: IngestionConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let IngestionConfig {
+        addr,
+        proxy_addr,
+        warm,
+        signal_tx,
+        ntp_offsets,
+        paused,
+        disconnected,
+        proxy_interventions,
+        capture_content,
+        secrets_block,
+    } = config;
     let hot = Arc::new(Mutex::new(HotStore::new(10_000)));
 
     let (pipeline_tx, pipeline_rx) = tokio::sync::mpsc::channel(1024);
