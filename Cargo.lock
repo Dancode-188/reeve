@@ -1687,6 +1687,7 @@ dependencies = [
  "reeve-model",
  "reeve-renderer",
  "reeve-storage",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
