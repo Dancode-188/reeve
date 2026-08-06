@@ -8,6 +8,7 @@ use reeve_model::entity::intervention::{AckStatus, LiveCapabilities};
 use reeve_model::ids::{AgentId, current_ms};
 use reeve_model::signal::EngineEvent;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
@@ -273,6 +274,32 @@ pub async fn run(
     disconnected: DisconnectedAgents,
     live_capabilities: LiveCapabilities,
 ) -> Arc<ControlServer> {
+    let addr = "127.0.0.1:4316"
+        .parse()
+        .expect("control server address is hardcoded and valid");
+    run_on(
+        addr,
+        engine_tx,
+        ntp_offsets,
+        paused,
+        disconnected,
+        live_capabilities,
+    )
+    .await
+}
+
+/// The same server on a caller-chosen address, which is what makes the
+/// dispatch-to-ack path reachable from a test: the port above is fixed,
+/// and a test that needs it cannot run beside a live Reeve or beside
+/// itself. Same split as `proxy::run` and `proxy::run_with`.
+pub async fn run_on(
+    addr: SocketAddr,
+    engine_tx: broadcast::Sender<EngineEvent>,
+    ntp_offsets: NtpOffsets,
+    paused: PausedAgents,
+    disconnected: DisconnectedAgents,
+    live_capabilities: LiveCapabilities,
+) -> Arc<ControlServer> {
     let server = ControlServer::new(
         engine_tx,
         ntp_offsets,
@@ -281,10 +308,6 @@ pub async fn run(
         live_capabilities,
     );
     let handle = Arc::new(server.clone());
-
-    let addr = "127.0.0.1:4316"
-        .parse()
-        .expect("control server address is hardcoded and valid");
 
     tokio::spawn(async move {
         tracing::info!(%addr, "control server listening");
