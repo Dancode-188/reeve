@@ -136,18 +136,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let proxy_interventions: reeve_model::entity::ProxyInterventions =
         std::sync::Arc::new(std::sync::Mutex::new(Default::default()));
-    tokio::spawn(reeve_ingestion::serve(
+    tokio::spawn(reeve_ingestion::serve(reeve_ingestion::IngestionConfig {
         addr,
         proxy_addr,
-        warm.clone(),
-        ingestion_tx,
-        ntp_offsets.clone(),
-        paused_agents.clone(),
-        disconnected_agents.clone(),
-        proxy_interventions.clone(),
-        privacy_tier >= 2,
-        config.secrets_block,
-    ));
+        warm: warm.clone(),
+        signal_tx: ingestion_tx,
+        ntp_offsets: ntp_offsets.clone(),
+        paused: paused_agents.clone(),
+        disconnected: disconnected_agents.clone(),
+        proxy_interventions: proxy_interventions.clone(),
+        capture_content: privacy_tier >= 2,
+        secrets_block: config.secrets_block,
+    }));
     // Retention: completed traces older than the configured age are
     // pruned on startup and then hourly, through the same atomic delete
     // path the History view uses. Zero days disables pruning entirely.
