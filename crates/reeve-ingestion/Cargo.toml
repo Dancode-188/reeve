@@ -2,17 +2,18 @@
 name = "reeve-ingestion"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Reeve's ingestion: OTLP receiver, Anthropic HTTP proxy, and the span pipeline"
+description = "Reeve's ingestion: OTLP receiver, Anthropic HTTP proxy, and the span pipeline. Internal; its API may change in any release."
 readme = "README.md"
 
 [lints]
 workspace = true
 
 [dependencies]
-reeve-model = { path = "../reeve-model", version = "1.0.0" }
-reeve-storage = { path = "../reeve-storage", version = "1.0.0" }
+reeve-model = { path = "../reeve-model", version = "1.1.0" }
+reeve-storage = { path = "../reeve-storage", version = "1.1.0" }
 opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic", "trace"] }
 tonic = { workspace = true }
 axum = "0.8"

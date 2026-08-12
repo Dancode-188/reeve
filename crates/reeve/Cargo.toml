@@ -4,10 +4,13 @@
 name = "reeve-cockpit"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Terminal cockpit for AI agents: watch, score, and intervene in real time"
 readme = "README.md"
+keywords = ["agent", "observability", "llm", "tui", "opentelemetry"]
+categories = ["command-line-utilities", "development-tools::debugging", "visualization"]
 
 [lints]
 workspace = true
@@ -17,12 +20,12 @@ name = "reeve"
 path = "src/main.rs"
 
 [dependencies]
-reeve-ingestion = { path = "../reeve-ingestion", version = "1.0.0" }
-reeve-engine = { path = "../reeve-engine", version = "1.0.0" }
-reeve-intervention = { path = "../reeve-intervention", version = "1.0.0" }
-reeve-renderer = { path = "../reeve-renderer", version = "1.0.0" }
-reeve-storage = { path = "../reeve-storage", version = "1.0.0" }
-reeve-model = { path = "../reeve-model", version = "1.0.0" }
+reeve-ingestion = { path = "../reeve-ingestion", version = "1.1.0" }
+reeve-engine = { path = "../reeve-engine", version = "1.1.0" }
+reeve-intervention = { path = "../reeve-intervention", version = "1.1.0" }
+reeve-renderer = { path = "../reeve-renderer", version = "1.1.0" }
+reeve-storage = { path = "../reeve-storage", version = "1.1.0" }
+reeve-model = { path = "../reeve-model", version = "1.1.0" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

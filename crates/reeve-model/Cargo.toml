@@ -2,9 +2,10 @@
 name = "reeve-model"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared entities, IDs, and signal types for the Reeve cockpit"
+description = "Shared entities, IDs, and signal types for the Reeve cockpit. Internal; its API may change in any release."
 readme = "README.md"
 
 [lints]

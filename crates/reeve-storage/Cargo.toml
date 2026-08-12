@@ -2,16 +2,17 @@
 name = "reeve-storage"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Reeve's storage tiers: hot ring buffer and warm SQLite store"
+description = "Reeve's storage tiers: hot ring buffer and warm SQLite store. Internal; its API may change in any release."
 readme = "README.md"
 
 [lints]
 workspace = true
 
 [dependencies]
-reeve-model = { path = "../reeve-model", version = "1.0.0" }
+reeve-model = { path = "../reeve-model", version = "1.1.0" }
 rusqlite = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

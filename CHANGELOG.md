@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-13
+
+Installing from the registry no longer needs a protobuf compiler, which
+was the last tool a source install asked for and the first thing it failed
+on. The rest is correctness: policy alerts stop contradicting themselves,
+and the keybinding bar stops eating its own labels on a narrow terminal.
+
+### Changed
+
+- A source install needs Rust and nothing else. The generated proto
+  bindings are committed rather than built, so `cargo install
+  reeve-cockpit` no longer stops on a missing `protoc` after several
+  minutes of compiling. Regenerating them is a deliberate command, and CI
+  fails if the committed files drift from the proto.
+- An alert reports that its condition matched, and offers a command only
+  when the target can run it. Two things came out of that. A rule the
+  agent could not accept used to be dropped whole, so a proxy agent whose
+  health collapsed raised nothing at all; it now raises the alert without
+  the action. And an agent reachable only over OTLP, with no control
+  channel, is told plainly that nothing can be dispatched to it instead of
+  being offered something the next line takes back.
+
+### Fixed
+
+- An alert names the agent whose rule fired. It carried no agent id, so
+  the cockpit attributed every alert to whichever agent happened to be
+  selected, and confirming one could have dispatched to another.
+- The keybinding bar keeps whole labels. Below 120 columns it truncated
+  mid-word and ran groups together; it now drops whole groups in reverse
+  order of usefulness, leaving help and quit standing longest.
+- The Linux binary is built against musl in the repository, not only in
+  the release asset. The 1.0.0 asset was rebuilt by hand after the
+  glibc-linked one refused to start on older distributions; building the
+  tag now produces what was already being shipped.
+
 ## [1.0.0] - 2026-07-22
 
 The loop has been whole since the intervention and learning layers
@@ -477,6 +512,7 @@ spends; this release acts on that.
 - GitHub Actions CI: fmt check, clippy with `-D warnings`, tests, release build.
 - Issue templates, PR template, CONTRIBUTING.md, ROADMAP.md.
 
+[1.1.0]: https://github.com/Dancode-188/reeve/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Dancode-188/reeve/releases/tag/v1.0.0
 [0.6.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.6.0
 [0.5.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.5.0
