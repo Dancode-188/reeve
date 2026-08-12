@@ -29,12 +29,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Install protoc and the musl toolchain (Linux)
+      # No protoc on any runner: the bindings are committed (ADR-0044).
+      # musl-tools is the linker for the static Linux target, not a
+      # build dependency of the crates.
+      - name: Install the musl toolchain (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler musl-tools
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
+        run: sudo apt-get update -y && sudo apt-get install -y musl-tools
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p reeve-cockpit
       - name: Rename for the release page
