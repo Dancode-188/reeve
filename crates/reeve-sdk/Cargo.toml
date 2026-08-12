@@ -2,10 +2,13 @@
 name = "reeve-sdk"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Rust SDK for agents observed by the Reeve cockpit"
 readme = "README.md"
+keywords = ["agent", "observability", "llm", "sdk", "opentelemetry"]
+categories = ["development-tools::debugging", "api-bindings", "asynchronous"]
 
 [lints]
 workspace = true
