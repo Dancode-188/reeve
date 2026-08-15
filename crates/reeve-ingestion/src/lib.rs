@@ -1,4 +1,14 @@
+//! Ingestion for the `reeve` binary: the OTLP receiver, the HTTP proxy,
+//! and the pipeline that turns what they collect into traces.
+//!
+//! This crate is published so `cargo install reeve-cockpit` can resolve
+//! it. It is not a supported library: items are `pub` because the binary
+//! needs them across module boundaries, and their signatures change
+//! whenever the binary's needs do. Depend on it directly and a refactor
+//! will break you without a major version to warn you first.
+
 pub mod assemble;
+pub mod capture;
 pub mod normalize;
 pub mod pricing;
 pub mod proxy;
@@ -43,6 +53,16 @@ pub struct IngestionConfig {
     /// A detected outbound secret blocks the request rather than only
     /// warning about it.
     pub secrets_block: bool,
+    /// Where the proxy stores round trips, at privacy tier 2. The OTLP
+    /// path has carried content since the tier existed, through span
+    /// events; the proxy path emitted none and so honoured the tier by
+    /// storing nothing at all. This is that path's half.
+    ///
+    /// Opened by the caller rather than from a path here, because `serve`
+    /// is spawned and its `Result` is dropped: a failure raised inside it
+    /// would be a corpus that silently collects nothing. Opened in `main`
+    /// it stops startup with a message.
+    pub capture: Option<Arc<capture::Capture>>,
 }
 
 pub async fn serve(
@@ -59,6 +79,7 @@ pub async fn serve(
         proxy_interventions,
         capture_content,
         secrets_block,
+        capture,
     } = config;
     let hot = Arc::new(Mutex::new(HotStore::new(10_000)));
 
@@ -85,22 +106,20 @@ pub async fn serve(
 
     // The HTTP proxy is a second producer into the same pipeline: spans it
     // synthesizes are normalized, assembled, and routed like SDK spans.
-    let proxy_pipeline_tx = pipeline_tx.clone();
-    let proxy_signal_tx = signal_tx.clone();
-    let proxy_active_streams = active_streams.clone();
-    let proxy_open_turns = open_turns.clone();
+    let proxy_config = proxy::ProxyConfig {
+        upstream: proxy::upstream_from_env(),
+        agent_name_override: proxy::agent_name_override_from_env(),
+        stream_chunk_timeout: proxy::DEFAULT_STREAM_CHUNK_TIMEOUT,
+        pipeline_tx: pipeline_tx.clone(),
+        signal_tx: signal_tx.clone(),
+        interventions: Some(proxy_interventions),
+        active_streams: Some(active_streams.clone()),
+        open_turns: Some(open_turns.clone()),
+        secrets_block,
+        capture,
+    };
     tokio::spawn(async move {
-        if let Err(e) = proxy::run(
-            proxy_addr,
-            proxy_pipeline_tx,
-            proxy_signal_tx,
-            proxy_interventions,
-            proxy_active_streams,
-            proxy_open_turns,
-            secrets_block,
-        )
-        .await
-        {
+        if let Err(e) = proxy::run_with(proxy_addr, proxy_config).await {
             tracing::error!(error = %e, "HTTP proxy exited");
         }
     });

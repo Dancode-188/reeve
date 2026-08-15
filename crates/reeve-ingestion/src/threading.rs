@@ -65,6 +65,20 @@ pub struct TurnPlacement {
     pub message_count: usize,
     /// True when this request started a brand new conversation.
     pub new_conversation: bool,
+    /// One fingerprint per message, in order. Stamped on the span so a
+    /// threading decision can be re-derived from storage afterwards;
+    /// hashes, not content, so this survives at any privacy tier.
+    pub message_hashes: Vec<u64>,
+    /// How many leading messages the closest known conversation agreed
+    /// with, whether or not it agreed far enough to match. On a match
+    /// this is that conversation's whole stored history; on a miss it is
+    /// where the two histories diverged, which is the only thing that
+    /// explains why the match failed.
+    pub matched_prefix: usize,
+    /// Known conversations for this agent when the decision was made.
+    /// Zero with a miss means nothing was there to match; nonzero means
+    /// something was, and did not fit.
+    pub candidates: usize,
 }
 
 /// What the tracker needs to know about a finished response.
@@ -130,6 +144,17 @@ impl ConversationTracker {
         let hashes: Vec<u64> = messages.iter().map(hash_message).collect();
         let convs = self.conversations.entry(agent.to_string()).or_default();
 
+        // Measured before the match rather than derived from it, because
+        // the interesting number is the one on the failing path: a miss
+        // tells you nothing, a miss at message 4 of 5 tells you exactly
+        // which message the client rewrote.
+        let candidates = convs.len();
+        let matched_prefix = convs
+            .iter()
+            .map(|c| common_prefix(&c.message_hashes, &hashes))
+            .max()
+            .unwrap_or(0);
+
         // Longest stored prefix wins, so a conversation that happens to
         // extend another one's history matches its own record.
         let best = convs
@@ -144,7 +169,7 @@ impl ConversationTracker {
         match best {
             Some(conv) => {
                 conv.last_seen = Instant::now();
-                conv.message_hashes = hashes;
+                conv.message_hashes.clone_from(&hashes);
                 let (turn, tools) = match conv.turn.take() {
                     // Turn still open: this request continues it (the
                     // client is answering tool calls).
@@ -172,11 +197,28 @@ impl ConversationTracker {
                     tools,
                     message_count: messages.len(),
                     new_conversation: false,
+                    message_hashes: hashes,
+                    matched_prefix,
+                    candidates,
                 };
                 conv.turn = Some(turn);
                 placement
             }
             None => {
+                // Every known conversation disagreed with this history
+                // before it ended. Zero agreement is a genuinely new
+                // conversation; partial agreement is the failure mode
+                // that matters, because it means the client resent a
+                // history Reeve had already recorded and no longer
+                // recognises.
+                tracing::debug!(
+                    agent,
+                    candidates,
+                    matched_prefix,
+                    incoming = hashes.len(),
+                    known = ?convs.iter().map(|c| c.message_hashes.len()).collect::<Vec<_>>(),
+                    "no conversation matched, starting a new one"
+                );
                 let turn = Turn {
                     trace_id: new_id(16),
                     root_span_id: new_id(8),
@@ -191,6 +233,9 @@ impl ConversationTracker {
                     tools: Vec::new(),
                     message_count: messages.len(),
                     new_conversation: true,
+                    message_hashes: hashes.clone(),
+                    matched_prefix,
+                    candidates,
                 };
                 convs.push(Conversation {
                     message_hashes: hashes,
@@ -254,6 +299,11 @@ impl ConversationTracker {
         }
         self.conversations.retain(|_, v| !v.is_empty());
     }
+}
+
+/// How many leading messages two histories agree on.
+fn common_prefix(a: &[u64], b: &[u64]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
 /// Matches this request's tool_result blocks against the turn's pending

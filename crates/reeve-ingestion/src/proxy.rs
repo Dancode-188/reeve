@@ -59,6 +59,10 @@ struct ProxyState {
     /// history re-sends every secret on every round trip; each one
     /// speaks in ALERTS once.
     seen_secrets: std::sync::Mutex<HashMap<reeve_model::ids::AgentId, HashSet<u64>>>,
+    /// Where round trips are stored under privacy tier 2. `None` at
+    /// tier 1, and its absence is what keeps the parsed request body
+    /// from being retained at all.
+    capture: Option<Arc<crate::capture::Capture>>,
 }
 
 fn trace_key(trace_id: &[u8]) -> reeve_model::ids::TraceId {
@@ -110,39 +114,26 @@ fn mark_stream(state: &ProxyState, trace_id: &[u8], delta: i64) {
     }
 }
 
-pub async fn run(
-    addr: SocketAddr,
-    pipeline_tx: mpsc::Sender<PipelineSpan>,
-    signal_tx: broadcast::Sender<IngestionEvent>,
-    interventions: ProxyInterventions,
-    active_streams: crate::assemble::ActiveStreams,
-    open_turns: crate::assemble::OpenTurns,
-    secrets_block: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let upstream =
-        std::env::var("REEVE_PROXY_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string());
-    run_with(
-        addr,
-        ProxyConfig {
-            upstream,
-            agent_name_override: std::env::var("REEVE_PROXY_AGENT_NAME").ok(),
-            stream_chunk_timeout: std::time::Duration::from_millis(DEFAULT_STREAM_CHUNK_TIMEOUT_MS),
-            pipeline_tx,
-            signal_tx,
-            interventions: Some(interventions),
-            active_streams: Some(active_streams),
-            open_turns: Some(open_turns),
-            secrets_block,
-        },
-    )
-    .await
+/// Where the proxy forwards to, overridable so verification runs can
+/// point it at a mock and never touch the real API.
+pub fn upstream_from_env() -> String {
+    std::env::var("REEVE_PROXY_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string())
 }
+
+/// Overrides User-Agent derivation when set.
+pub fn agent_name_override_from_env() -> Option<String> {
+    std::env::var("REEVE_PROXY_AGENT_NAME").ok()
+}
+
+/// A stream that goes silent for this long is dead.
+pub const DEFAULT_STREAM_CHUNK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(DEFAULT_STREAM_CHUNK_TIMEOUT_MS);
 
 /// Everything the proxy is handed from outside: where to forward, how it
 /// is wired into the pipeline, and the shared state it coordinates
 /// through. `ProxyState` adds the three pieces it builds for itself.
 ///
-/// A struct rather than nine arguments because the tail of those nine
+/// A struct rather than ten arguments because the tail of those ten
 /// read `None, None, false` at every call site, and nothing there said
 /// which `None` was which.
 pub struct ProxyConfig {
@@ -156,6 +147,10 @@ pub struct ProxyConfig {
     pub active_streams: Option<crate::assemble::ActiveStreams>,
     pub open_turns: Option<crate::assemble::OpenTurns>,
     pub secrets_block: bool,
+    /// Where round trips are stored. `Some` only at privacy tier 2, and
+    /// the proxy reads it as the single switch for whether a request
+    /// body is retained past the moment it is threaded.
+    pub capture: Option<Arc<crate::capture::Capture>>,
 }
 
 pub async fn run_with(
@@ -175,6 +170,7 @@ pub async fn run_with(
         open_turns: config.open_turns,
         secrets_block: config.secrets_block,
         seen_secrets: std::sync::Mutex::new(HashMap::new()),
+        capture: config.capture,
     });
 
     // The secret patterns compile here, not inside the first request's
@@ -286,21 +282,38 @@ async fn forward(
             }
         }
     }
-    let placement = if method == Method::POST && uri.path().ends_with("/v1/messages") {
-        serde_json::from_slice::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|req_json| {
-                let messages = req_json.get("messages")?.as_array()?.clone();
-                Some(
-                    state
-                        .tracker
-                        .lock()
-                        .expect("tracker mutex poisoned")
-                        .place_request(&agent_name, &messages, arrived, random_bytes),
-                )
-            })
-    } else {
-        None
+    // Parsed once and held: threading reads `messages`, the attributes
+    // below read the model, tools and cache breakpoints, and capture
+    // stores the body whole.
+    let is_messages = method == Method::POST && uri.path().ends_with("/v1/messages");
+    let req_json = is_messages
+        .then(|| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .flatten();
+    let placement = req_json.as_ref().and_then(|json| {
+        let messages = json.get("messages")?.as_array()?;
+        Some(
+            state
+                .tracker
+                .lock()
+                .expect("tracker mutex poisoned")
+                .place_request(&agent_name, messages, arrived, random_bytes),
+        )
+    });
+    // Shape of the request, not its content: which model was asked for,
+    // how many tools were offered, where the cache breakpoints sit. These
+    // are stamped at every privacy tier, because none of them is anything
+    // the developer wrote.
+    let request_attrs = req_json
+        .as_ref()
+        .map(request_attributes)
+        .unwrap_or_default();
+    // The body itself survives only under capture. At tier 1 the parsed
+    // tree is dropped right here rather than held for the lifetime of a
+    // stream that may run for minutes, and that drop is the whole of the
+    // tier's enforcement.
+    let captured_request = match state.capture {
+        Some(_) => req_json,
+        None => None,
     };
     if let Some(ref placement) = placement {
         // The turn is open and its conversation just spoke: hold the
@@ -343,10 +356,24 @@ async fn forward(
         .map(|d| d.as_secs_f64() * 1e3)
         .unwrap_or(0.0);
 
+    // Assembled before the forward rather than after it, so the two
+    // failure paths below have something to speak through.
+    let mut span_ctx = SpanContext {
+        state: state.clone(),
+        agent_name,
+        placement,
+        arrived,
+        overhead_ms,
+        secret_kinds,
+        request_attrs,
+        request: captured_request,
+        ratelimit: Vec::new(),
+    };
+
     // From here until the span is synthesized, the turn's trace must not
     // be called idle no matter how long the model takes: the assembler's
     // timeout once flushed mid-turn and dropped a session's spans (#182).
-    if let Some(ref p) = placement {
+    if let Some(ref p) = span_ctx.placement {
         mark_stream(&state, &p.trace_id, 1);
     }
 
@@ -354,8 +381,12 @@ async fn forward(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "proxy could not reach upstream");
-            if let Some(ref p) = placement {
-                mark_stream(&state, &p.trace_id, -1);
+            let trace_id = span_ctx.placement.as_ref().map(|p| p.trace_id.clone());
+            if is_messages {
+                synthesize_fault_span(span_ctx, "upstream_unreachable", &e.to_string()).await;
+            }
+            if let Some(tid) = trace_id {
+                mark_stream(&state, &tid, -1);
             }
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -373,14 +404,10 @@ async fn forward(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("text/event-stream"));
 
-    let span_ctx = SpanContext {
-        state: state.clone(),
-        agent_name,
-        placement,
-        arrived,
-        overhead_ms,
-        secret_kinds,
-    };
+    // Rate-limit headers say how close this agent is to its ceiling and
+    // when the window resets. They exist only on the response, which is
+    // why they are filled in here and not at construction.
+    span_ctx.ratelimit = response_header_attributes(&resp_headers);
 
     if streaming {
         let body = stream_and_accumulate(span_ctx, upstream_resp);
@@ -391,8 +418,12 @@ async fn forward(
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "proxy failed reading upstream response");
-            if let Some(ref p) = span_ctx.placement {
-                mark_stream(&state, &p.trace_id, -1);
+            let trace_id = span_ctx.placement.as_ref().map(|p| p.trace_id.clone());
+            if is_messages {
+                synthesize_fault_span(span_ctx, "response_read_failed", &e.to_string()).await;
+            }
+            if let Some(tid) = trace_id {
+                mark_stream(&state, &tid, -1);
             }
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -404,8 +435,8 @@ async fn forward(
     // Unmark only after the span has entered the pipeline: the trace
     // stays exempt from the idle timeout until its evidence is in.
     let placement_trace_id = span_ctx.placement.as_ref().map(|p| p.trace_id.clone());
-    if method == Method::POST && uri.path().ends_with("/v1/messages") {
-        synthesize_span(&span_ctx, &resp_body, status.as_u16()).await;
+    if is_messages {
+        synthesize_span(span_ctx, &resp_body, status.as_u16()).await;
     }
     if let Some(tid) = placement_trace_id {
         mark_stream(&state, &tid, -1);
@@ -462,11 +493,8 @@ impl StreamOutcome {
 /// What every span this proxy emits needs to know about the request that
 /// produced it.
 ///
-/// These six values travelled together as separate arguments through each
-/// function that emits a span, which is how three of them ended up over
-/// clippy's argument limit. Owned rather than borrowed because the
-/// streaming path moves the whole thing into a spawned task that outlives
-/// the request handler.
+/// Owned rather than borrowed because the streaming path moves the whole
+/// thing into a spawned task that outlives the request handler.
 struct SpanContext {
     state: Arc<ProxyState>,
     agent_name: String,
@@ -474,6 +502,15 @@ struct SpanContext {
     arrived: SystemTime,
     overhead_ms: f64,
     secret_kinds: Vec<&'static str>,
+    /// What the request asked for, as span attributes. Metadata only, so
+    /// this is filled at every privacy tier.
+    request_attrs: Vec<KeyValue>,
+    /// The parsed request body, retained for capture and `None` at any
+    /// tier below 2. Taken by the finalizers rather than cloned: a real
+    /// one is over a megabyte.
+    request: Option<serde_json::Value>,
+    /// Rate-limit state read off the response headers.
+    ratelimit: Vec<KeyValue>,
 }
 
 /// The identity a streamed span will carry, generated when the stream
@@ -506,8 +543,8 @@ fn stream_and_accumulate(ctx: SpanContext, upstream_resp: reqwest::Response) -> 
             parent_span_id,
             span_id: random_bytes(8),
         };
-        let span_id_hex: String = ids.span_id.iter().map(|b| format!("{:02x}", b)).collect();
-        let trace_id_hex: String = ids.trace_id.iter().map(|b| format!("{:02x}", b)).collect();
+        let span_id_hex = hex(&ids.span_id);
+        let trace_id_hex = hex(&ids.trace_id);
         let mut first_chunk_at: Option<SystemTime> = None;
         let mut outcome = StreamOutcome::Completed;
 
@@ -576,11 +613,15 @@ fn stream_and_accumulate(ctx: SpanContext, upstream_resp: reqwest::Response) -> 
                 .map(|d| d.as_secs_f64() * 1e3)
         });
         // The idle exemption holds through every stream outcome; drop it
-        // only once the finalized span has entered the pipeline.
+        // only once the finalized span has entered the pipeline. Both the
+        // trace id and the handle to state are taken before the context
+        // moves into the finalizer, which consumes it so that a stored
+        // request body is moved out rather than copied.
         let placement_trace_id = ctx.placement.as_ref().map(|p| p.trace_id.clone());
-        finalize_stream_span(&ctx, &ids, acc, outcome, ttft_ms).await;
+        let state = ctx.state.clone();
+        finalize_stream_span(ctx, &ids, acc, outcome, ttft_ms).await;
         if let Some(tid) = placement_trace_id {
-            mark_stream(&ctx.state, &tid, -1);
+            mark_stream(&state, &tid, -1);
         }
     });
 
@@ -590,7 +631,7 @@ fn stream_and_accumulate(ctx: SpanContext, upstream_resp: reqwest::Response) -> 
 /// The streaming counterpart of synthesize_span: same shape of span,
 /// built from the accumulator, plus the outcome and time-to-first-token.
 async fn finalize_stream_span(
-    ctx: &SpanContext,
+    mut ctx: SpanContext,
     ids: &SpanIds,
     acc: SseAccumulator,
     outcome: StreamOutcome,
@@ -614,10 +655,14 @@ async fn finalize_stream_span(
         attributes.push(kv_double("reeve.proxy.ttft_ms", ttft));
     }
     if let Some(ref p) = ctx.placement {
-        attributes.push(kv_int(
-            "reeve.proxy.context_messages",
-            p.message_count as i64,
-        ));
+        attributes.extend(threading_attributes(p));
+    }
+    // Moved rather than cloned: nothing downstream of here reads the
+    // context's own copies again.
+    attributes.append(&mut ctx.request_attrs);
+    attributes.append(&mut ctx.ratelimit);
+    if let Some(ref reason) = acc.stop_reason {
+        attributes.push(kv_str("gen_ai.response.finish_reason", reason));
     }
     if acc.thinking_tokens > 0 {
         attributes.push(kv_int(
@@ -669,6 +714,43 @@ async fn finalize_stream_span(
     };
 
     let ended = SystemTime::now();
+
+    // Tier 2 only: the round trip goes to the sidecar corpus under the
+    // same ids the span carries, which is the whole of the join between
+    // them. A stream has no single response body, so one is rebuilt from
+    // the accumulator, reasoning kept apart from the answer because it is
+    // a different thing to read.
+    if let (Some(capture), Some(request)) = (ctx.state.capture.clone(), ctx.request.take()) {
+        capture.record(crate::capture::Round {
+            span_id: hex(&ids.span_id),
+            trace_id: hex(&ids.trace_id),
+            agent: ctx.agent_name.clone(),
+            started_at_ms: to_millis(ctx.arrived),
+            ended_at_ms: to_millis(ended),
+            request,
+            message_hashes: ctx
+                .placement
+                .as_ref()
+                .map(|p| p.message_hashes.clone())
+                .unwrap_or_default(),
+            response: serde_json::json!({
+                "model": &model,
+                "content": &acc.content,
+                "thinking": &acc.thinking,
+                "stop_reason": &acc.stop_reason,
+                "tool_uses": &acc.tool_uses,
+                "stream_outcome": outcome.label(),
+                "usage": {
+                    "input_tokens": acc.input_tokens,
+                    "output_tokens": acc.output_tokens,
+                    "cache_read_input_tokens": acc.cache_read_tokens,
+                    "cache_creation_input_tokens": acc.cache_creation_tokens,
+                    "thinking_tokens": acc.thinking_tokens,
+                },
+            }),
+        });
+    }
+
     let span = OtlpSpan {
         trace_id: ids.trace_id.clone(),
         span_id: ids.span_id.clone(),
@@ -685,33 +767,99 @@ async fn finalize_stream_span(
     };
     emit_pipeline_span(&ctx.state, &ctx.agent_name, span, ctx.arrived).await;
 
-    if let Some(ref p) = ctx.placement {
-        // A dead stream still ends its turn: whatever the outcome, the
-        // assistant is not going to request more tools on this round trip,
-        // so an outcome other than tool_use closes the turn honestly.
-        let stop_reason = match outcome {
-            StreamOutcome::Completed => acc.stop_reason,
-            _ => Some(format!("proxy:{}", outcome.label())),
-        };
-        let root = ctx
-            .state
-            .tracker
-            .lock()
-            .expect("tracker mutex poisoned")
-            .record_response(
-                &ctx.agent_name,
-                &p.trace_id,
-                ResponseInfo {
-                    chat_span_id: ids.span_id.clone(),
-                    tool_uses: acc.tool_uses,
-                    stop_reason,
-                    ended_at: ended,
-                },
-            );
-        if let Some(root) = root {
-            emit_turn_root(&ctx.state, &ctx.agent_name, root).await;
-        }
+    // A dead stream still ends its turn: whatever the outcome, the
+    // assistant is not going to request more tools on this round trip, so
+    // an outcome other than tool_use closes the turn honestly.
+    let stop_reason = match outcome {
+        StreamOutcome::Completed => acc.stop_reason,
+        _ => Some(format!("proxy:{}", outcome.label())),
+    };
+    close_turn(&ctx, ids.span_id.clone(), acc.tool_uses, stop_reason, ended).await;
+}
+
+/// Hands the turn tracker the response that ended this round trip, and
+/// emits the turn root if that closed the turn.
+///
+/// Every path that finishes a span ends here, the two fault paths
+/// included. A turn left open holds its trace exempt from the idle
+/// timeout, so a failure that skipped this step used to leave the trace
+/// hanging until the assembler pruned it half an hour later.
+async fn close_turn(
+    ctx: &SpanContext,
+    chat_span_id: Vec<u8>,
+    tool_uses: Vec<(String, String)>,
+    stop_reason: Option<String>,
+    ended: SystemTime,
+) {
+    let Some(ref p) = ctx.placement else { return };
+    let root = ctx
+        .state
+        .tracker
+        .lock()
+        .expect("tracker mutex poisoned")
+        .record_response(
+            &ctx.agent_name,
+            &p.trace_id,
+            ResponseInfo {
+                chat_span_id,
+                tool_uses,
+                stop_reason,
+                ended_at: ended,
+            },
+        );
+    if let Some(root) = root {
+        emit_turn_root(&ctx.state, &ctx.agent_name, root).await;
     }
+}
+
+/// A round trip that never produced a response still produced a fact.
+///
+/// Both callers are 502 paths: the upstream was unreachable, or its body
+/// could not be read. The span carries what is known, which is the shape
+/// of the request, how long the attempt took, and why it ended.
+async fn synthesize_fault_span(mut ctx: SpanContext, fault: &str, message: &str) {
+    let ended = SystemTime::now();
+    let mut attributes = vec![
+        kv_str("gen_ai.provider.name", "anthropic"),
+        kv_str("gen_ai.operation.name", "chat"),
+        kv_str("reeve.proxy.fault", fault),
+        kv_double("reeve.proxy.overhead_ms", ctx.overhead_ms),
+    ];
+    if let Some(ref p) = ctx.placement {
+        attributes.extend(threading_attributes(p));
+    }
+    attributes.append(&mut ctx.request_attrs);
+    attributes.append(&mut ctx.ratelimit);
+    stamp_secret_findings(&ctx.secret_kinds, &mut attributes);
+
+    let chat_span_id = random_bytes(8);
+    let (trace_id, parent_span_id) = match &ctx.placement {
+        Some(p) => (p.trace_id.clone(), p.root_span_id.clone()),
+        None => (random_bytes(16), Vec::new()),
+    };
+    let span = OtlpSpan {
+        trace_id,
+        span_id: chat_span_id.clone(),
+        parent_span_id,
+        name: "gen_ai.chat".to_string(),
+        start_time_unix_nano: to_nanos(ctx.arrived),
+        end_time_unix_nano: to_nanos(ended),
+        attributes,
+        status: Some(OtlpStatus {
+            code: 2,
+            message: message.to_string(),
+        }),
+        ..Default::default()
+    };
+    emit_pipeline_span(&ctx.state, &ctx.agent_name, span, ctx.arrived).await;
+    close_turn(
+        &ctx,
+        chat_span_id,
+        Vec::new(),
+        Some(format!("proxy:{fault}")),
+        ended,
+    )
+    .await;
 }
 
 /// Drains this agent's queued interventions into the outgoing request
@@ -885,7 +1033,7 @@ async fn emit_turn_root(state: &ProxyState, agent_name: &str, root: TurnRoot) {
 /// model, token usage, and estimated cost, threaded into its turn's trace
 /// as a child of the turn root. Upstream failures (429s, 5xx) synthesize
 /// failed spans so retry storms render visibly.
-async fn synthesize_span(ctx: &SpanContext, resp_body: &[u8], http_status: u16) {
+async fn synthesize_span(mut ctx: SpanContext, resp_body: &[u8], http_status: u16) {
     let ended = SystemTime::now();
 
     let parsed: serde_json::Value = serde_json::from_slice(resp_body).unwrap_or_default();
@@ -945,10 +1093,12 @@ async fn synthesize_span(ctx: &SpanContext, resp_body: &[u8], http_status: u16) 
         kv_double("reeve.proxy.overhead_ms", ctx.overhead_ms),
     ];
     if let Some(ref p) = ctx.placement {
-        attributes.push(kv_int(
-            "reeve.proxy.context_messages",
-            p.message_count as i64,
-        ));
+        attributes.extend(threading_attributes(p));
+    }
+    attributes.append(&mut ctx.request_attrs);
+    attributes.append(&mut ctx.ratelimit);
+    if let Some(ref reason) = stop_reason {
+        attributes.push(kv_str("gen_ai.response.finish_reason", reason));
     }
     if thinking_tokens > 0 {
         attributes.push(kv_int(
@@ -1007,6 +1157,25 @@ async fn synthesize_span(ctx: &SpanContext, resp_body: &[u8], http_status: u16) 
         None => (random_bytes(16), Vec::new()),
     };
 
+    // Tier 2 only, and here the response really is one body, so it is
+    // stored as it arrived rather than reassembled.
+    if let (Some(capture), Some(request)) = (ctx.state.capture.clone(), ctx.request.take()) {
+        capture.record(crate::capture::Round {
+            span_id: hex(&chat_span_id),
+            trace_id: hex(&trace_id),
+            agent: ctx.agent_name.clone(),
+            started_at_ms: to_millis(ctx.arrived),
+            ended_at_ms: to_millis(ended),
+            request,
+            message_hashes: ctx
+                .placement
+                .as_ref()
+                .map(|p| p.message_hashes.clone())
+                .unwrap_or_default(),
+            response: parsed,
+        });
+    }
+
     let span = OtlpSpan {
         trace_id,
         span_id: chat_span_id.clone(),
@@ -1022,27 +1191,7 @@ async fn synthesize_span(ctx: &SpanContext, resp_body: &[u8], http_status: u16) 
         ..Default::default()
     };
     emit_pipeline_span(&ctx.state, &ctx.agent_name, span, ctx.arrived).await;
-
-    if let Some(ref p) = ctx.placement {
-        let root = ctx
-            .state
-            .tracker
-            .lock()
-            .expect("tracker mutex poisoned")
-            .record_response(
-                &ctx.agent_name,
-                &p.trace_id,
-                ResponseInfo {
-                    chat_span_id,
-                    tool_uses,
-                    stop_reason,
-                    ended_at: ended,
-                },
-            );
-        if let Some(root) = root {
-            emit_turn_root(&ctx.state, &ctx.agent_name, root).await;
-        }
-    }
+    close_turn(&ctx, chat_span_id, tool_uses, stop_reason, ended).await;
 }
 
 /// The proxy path has no service.name; the client's User-Agent product
@@ -1132,6 +1281,200 @@ fn kv_double(key: &str, value: f64) -> KeyValue {
         }),
         ..Default::default()
     }
+}
+
+fn kv_bool(key: &str, value: bool) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::BoolValue(value)),
+        }),
+        ..Default::default()
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What the request asked for, as span attributes.
+///
+/// Every one of these is a property of the ask, not of the answer, and
+/// none of them is text the developer wrote, which is why they are
+/// stamped at every privacy tier. `gen_ai.request.model` is deliberately
+/// not among them: despite the name that key carries the model that
+/// *responded*, it is what pricing and the renderer read, and the two
+/// differ exactly when the question of routing is interesting. The model
+/// asked for goes under `reeve.request.model` and the difference between
+/// them is the measurement.
+fn request_attributes(json: &serde_json::Value) -> Vec<KeyValue> {
+    let mut attrs = Vec::new();
+    if let Some(model) = json.get("model").and_then(|v| v.as_str()) {
+        attrs.push(kv_str("reeve.request.model", model));
+    }
+    if let Some(max) = json.get("max_tokens").and_then(|v| v.as_i64()) {
+        attrs.push(kv_int("reeve.request.max_tokens", max));
+    }
+    attrs.push(kv_bool(
+        "reeve.request.stream",
+        json.get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    ));
+    // How large the offered toolset is, and how much of the prompt is
+    // preamble: the two inputs a client controls that decide how much of
+    // every request is fixed cost.
+    if let Some(tools) = json.get("tools").and_then(|v| v.as_array()) {
+        attrs.push(kv_int("reeve.request.tools", tools.len() as i64));
+    }
+    match json.get("system") {
+        Some(serde_json::Value::Array(blocks)) => {
+            attrs.push(kv_int("reeve.request.system_blocks", blocks.len() as i64));
+        }
+        Some(serde_json::Value::String(_)) => {
+            attrs.push(kv_int("reeve.request.system_blocks", 1));
+        }
+        _ => {}
+    }
+    // Cache breakpoints are the client's cache strategy, stated. Reading
+    // them beside the cache hit and miss counts on the response is how a
+    // strategy gets judged rather than assumed.
+    attrs.push(kv_int(
+        "reeve.request.cache_breakpoints",
+        count_cache_control(json),
+    ));
+    if let Some(budget) = json
+        .get("thinking")
+        .and_then(|t| t.get("budget_tokens"))
+        .and_then(|v| v.as_i64())
+    {
+        attrs.push(kv_int("reeve.request.thinking_budget", budget));
+    }
+    attrs.extend(turn_shape_attributes(json));
+    attrs
+}
+
+/// Whether a human started this round trip or the agent's own tool loop
+/// did.
+///
+/// Both arrive as a `user` message, which is why a naive count of user
+/// messages says nothing: an agentic client sends one per tool result, so
+/// a single typed sentence and forty tool returns look identical. The
+/// difference is in the content blocks, where a tool return is a
+/// `tool_result` block and a person's message is not, and it is the
+/// difference everything downstream wants. Cost per human turn is worth
+/// knowing; cost per request is an artifact of how the client loops. It
+/// is also what makes an operator correction detectable at all, since a
+/// correction is by definition a human message that follows one.
+///
+/// Only the last message is examined: it is the one this request is
+/// asking about, and walking the rest would cost more than the proxy's
+/// entire overhead.
+fn turn_shape_attributes(json: &serde_json::Value) -> Vec<KeyValue> {
+    let Some(last) = json
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .and_then(|m| m.last())
+    else {
+        return Vec::new();
+    };
+    let role = last.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    let tool_results = last
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                .count()
+        })
+        .unwrap_or(0);
+    let kind = match (role, tool_results) {
+        ("user", 0) => "human",
+        ("user", _) => "tool_loop",
+        _ => "unknown",
+    };
+    vec![
+        kv_str("reeve.request.turn_kind", kind),
+        kv_str("reeve.request.last_role", role),
+        kv_int("reeve.request.tool_results", tool_results as i64),
+    ]
+}
+
+/// Counts `cache_control` markers in the places the API accepts them:
+/// system blocks, tool definitions, and each message's top-level content
+/// blocks.
+///
+/// Deliberately shallow. A real request is 1.3 MB of parsed JSON at the
+/// top of a long session, and a recursive walk of it would cost several
+/// milliseconds, which is more than the proxy's entire measured overhead
+/// and would therefore corrupt the number it is being measured by.
+fn count_cache_control(json: &serde_json::Value) -> i64 {
+    fn marked(v: &serde_json::Value) -> i64 {
+        i64::from(v.get("cache_control").is_some())
+    }
+    fn in_array(json: &serde_json::Value, key: &str) -> i64 {
+        json.get(key)
+            .and_then(|v| v.as_array())
+            .map(|items| items.iter().map(marked).sum())
+            .unwrap_or(0)
+    }
+
+    let messages: i64 = json
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .map(|msgs| {
+            msgs.iter()
+                .map(|m| marked(m) + in_array(m, "content"))
+                .sum()
+        })
+        .unwrap_or(0);
+    in_array(json, "system") + in_array(json, "tools") + messages
+}
+
+/// Rate-limit state and the upstream request id, read off the response
+/// headers.
+///
+/// The rate-limit keys are copied generically rather than by name because
+/// they differ by account type: an API key is metered per model class,
+/// while a subscription reports one unified window. Naming the ones seen
+/// on one machine would have quietly recorded nothing on the other.
+fn response_header_attributes(headers: &HeaderMap) -> Vec<KeyValue> {
+    const PREFIX: &str = "anthropic-ratelimit-";
+    let mut attrs = Vec::new();
+    for (name, value) in headers.iter() {
+        let Ok(value) = value.to_str() else { continue };
+        let name = name.as_str();
+        if let Some(rest) = name.strip_prefix(PREFIX) {
+            attrs.push(kv_str(
+                &format!("reeve.ratelimit.{}", rest.replace('-', "_")),
+                value,
+            ));
+        } else if name == "retry-after" {
+            attrs.push(kv_str("reeve.ratelimit.retry_after", value));
+        } else if name == "request-id" || name == "anthropic-request-id" {
+            // The upstream's own handle for this round trip: the only
+            // identifier a support conversation about a specific request
+            // can be conducted in.
+            attrs.push(kv_str("reeve.proxy.request_id", value));
+        }
+    }
+    attrs
+}
+
+/// What threading decided, and on what evidence.
+///
+/// The last three exist because prefix matching against real Claude Code
+/// traffic misses far more often than it should, and a miss on its own
+/// says nothing about why. Recorded per request, they turn the question
+/// into arithmetic over stored spans instead of a live debugging session.
+fn threading_attributes(p: &TurnPlacement) -> Vec<KeyValue> {
+    vec![
+        kv_int("reeve.proxy.context_messages", p.message_count as i64),
+        kv_bool("reeve.threading.new_conversation", p.new_conversation),
+        kv_int("reeve.threading.matched_prefix", p.matched_prefix as i64),
+        kv_int("reeve.threading.candidates", p.candidates as i64),
+    ]
 }
 
 fn to_millis(t: SystemTime) -> i64 {
@@ -1231,6 +1574,7 @@ mod tests {
                 active_streams: None,
                 open_turns: None,
                 secrets_block: false,
+                capture: None,
             },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1343,6 +1687,7 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
                 active_streams: None,
                 open_turns: None,
                 secrets_block: false,
+                capture: None,
             },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1414,6 +1759,7 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
                 active_streams: None,
                 open_turns: None,
                 secrets_block: block,
+                capture: None,
             },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1601,6 +1947,7 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
                 active_streams: None,
                 open_turns: None,
                 secrets_block: false,
+                capture: None,
             },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1672,6 +2019,7 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
                 active_streams: None,
                 open_turns: Some(open_turns.clone()),
                 secrets_block: false,
+                capture: None,
             },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2229,5 +2577,119 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
         for _ in 0..10_000 {
             assert!(seen.insert(random_bytes(8)), "span ids must never collide");
         }
+    }
+
+    fn kv_of<'a>(attrs: &'a [KeyValue], key: &str) -> Option<&'a any_value::Value> {
+        attrs
+            .iter()
+            .find(|kv| kv.key == key)?
+            .value
+            .as_ref()?
+            .value
+            .as_ref()
+    }
+
+    fn as_int(attrs: &[KeyValue], key: &str) -> Option<i64> {
+        match kv_of(attrs, key)? {
+            any_value::Value::IntValue(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    fn as_str<'a>(attrs: &'a [KeyValue], key: &str) -> Option<&'a str> {
+        match kv_of(attrs, key)? {
+            any_value::Value::StringValue(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_requested_model_is_recorded_apart_from_the_responding_one() {
+        let json = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 4096,
+            "stream": true,
+            "messages": [],
+        });
+        let attrs = request_attributes(&json);
+        assert_eq!(
+            as_str(&attrs, "reeve.request.model"),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(as_int(&attrs, "reeve.request.max_tokens"), Some(4096));
+        assert!(
+            kv_of(&attrs, "gen_ai.request.model").is_none(),
+            "gen_ai.request.model belongs to the response and is what pricing reads; \
+             the request must never claim it"
+        );
+    }
+
+    #[test]
+    fn cache_breakpoints_are_counted_where_the_api_accepts_them() {
+        let json = serde_json::json!({
+            "system": [
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}},
+            ],
+            "tools": [
+                {"name": "read"},
+                {"name": "write", "cache_control": {"type": "ephemeral"}},
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+            ],
+        });
+        assert_eq!(count_cache_control(&json), 3);
+        let attrs = request_attributes(&json);
+        assert_eq!(as_int(&attrs, "reeve.request.cache_breakpoints"), Some(3));
+        assert_eq!(as_int(&attrs, "reeve.request.system_blocks"), Some(2));
+        assert_eq!(as_int(&attrs, "reeve.request.tools"), Some(2));
+    }
+
+    #[test]
+    fn a_typed_message_and_a_tool_return_are_told_apart() {
+        let human = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "no, undo that"}]}],
+        });
+        let attrs = request_attributes(&human);
+        assert_eq!(as_str(&attrs, "reeve.request.turn_kind"), Some("human"));
+        assert_eq!(as_int(&attrs, "reeve.request.tool_results"), Some(0));
+
+        let loop_step = serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "ok"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "ok"},
+            ]}],
+        });
+        let attrs = request_attributes(&loop_step);
+        assert_eq!(as_str(&attrs, "reeve.request.turn_kind"), Some("tool_loop"));
+        assert_eq!(as_int(&attrs, "reeve.request.tool_results"), Some(2));
+    }
+
+    #[test]
+    fn rate_limit_headers_are_copied_without_being_named() {
+        let mut headers = HeaderMap::new();
+        // Deliberately a header this code has never seen: an API key and a
+        // subscription report different windows, and naming the ones on
+        // one machine would silently record nothing on the other.
+        headers.insert(
+            "anthropic-ratelimit-unified-reset",
+            "2026-08-15T12".parse().unwrap(),
+        );
+        headers.insert("retry-after", "42".parse().unwrap());
+        headers.insert("request-id", "req_abc".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let attrs = response_header_attributes(&headers);
+        assert_eq!(
+            as_str(&attrs, "reeve.ratelimit.unified_reset"),
+            Some("2026-08-15T12")
+        );
+        assert_eq!(as_str(&attrs, "reeve.ratelimit.retry_after"), Some("42"));
+        assert_eq!(as_str(&attrs, "reeve.proxy.request_id"), Some("req_abc"));
+        assert_eq!(attrs.len(), 3, "unrelated headers must not be copied");
     }
 }
