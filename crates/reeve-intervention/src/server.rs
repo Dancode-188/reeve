@@ -291,7 +291,7 @@ pub async fn run(
 /// The same server on a caller-chosen address, which is what makes the
 /// dispatch-to-ack path reachable from a test: the port above is fixed,
 /// and a test that needs it cannot run beside a live Reeve or beside
-/// itself. Same split as `proxy::run` and `proxy::run_with`.
+/// itself.
 pub async fn run_on(
     addr: SocketAddr,
     engine_tx: broadcast::Sender<EngineEvent>,
