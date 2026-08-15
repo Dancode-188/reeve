@@ -139,6 +139,7 @@ async fn replay(scenario: &str) -> Vec<PipelineSpan> {
             active_streams: None,
             open_turns: None,
             secrets_block: false,
+            capture: None,
         },
     ));
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

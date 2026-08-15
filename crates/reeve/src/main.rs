@@ -136,6 +136,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let proxy_interventions: reeve_model::entity::ProxyInterventions =
         std::sync::Arc::new(std::sync::Mutex::new(Default::default()));
+    // Tier 2 on the proxy path: round trips are stored beside the
+    // database, where the OTLP path stores the same content as span
+    // events. Opened here, before anything is spawned, so an unusable
+    // directory stops startup instead of quietly collecting nothing.
+    let capture = if privacy_tier >= 2 {
+        let dir = db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("capture");
+        tracing::info!(path = %dir.display(), "capturing proxy round trips");
+        Some(std::sync::Arc::new(
+            reeve_ingestion::capture::Capture::open(dir)?,
+        ))
+    } else {
+        None
+    };
     tokio::spawn(reeve_ingestion::serve(reeve_ingestion::IngestionConfig {
         addr,
         proxy_addr,
@@ -147,6 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         proxy_interventions: proxy_interventions.clone(),
         capture_content: privacy_tier >= 2,
         secrets_block: config.secrets_block,
+        capture,
     }));
     // Retention: completed traces older than the configured age are
     // pruned on startup and then hourly, through the same atomic delete

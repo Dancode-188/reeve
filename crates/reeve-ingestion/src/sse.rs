@@ -31,6 +31,12 @@ pub struct SseAccumulator {
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     pub content: String,
+    /// Reasoning text, accumulated separately from the answer. Every
+    /// `thinking_delta` used to fall through the filter below, so the
+    /// count of reasoning tokens was recorded while the reasoning itself
+    /// was discarded. Stored only under content capture, and only ever
+    /// to be read by a human during analysis.
+    pub thinking: String,
     pub stop_reason: Option<String>,
     /// tool_use blocks the assistant opened: (id, name).
     pub tool_uses: Vec<(String, String)>,
@@ -101,14 +107,28 @@ impl SseAccumulator {
                 }
             }
             Some("content_block_delta") => {
-                if let Some(text) = data
-                    .get("delta")
-                    .filter(|d| d.get("type").and_then(|t| t.as_str()) == Some("text_delta"))
-                    .and_then(|d| d.get("text"))
-                    .and_then(|v| v.as_str())
-                {
-                    self.content.push_str(text);
-                    update.content_changed = true;
+                let delta = data.get("delta");
+                match delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()) {
+                    Some("text_delta") => {
+                        if let Some(text) =
+                            delta.and_then(|d| d.get("text")).and_then(|v| v.as_str())
+                        {
+                            self.content.push_str(text);
+                            update.content_changed = true;
+                        }
+                    }
+                    // Reasoning stays out of `content_changed`: that flag
+                    // drives the live stream panel, and a thinking block
+                    // rendered there would bury the answer it precedes.
+                    Some("thinking_delta") => {
+                        if let Some(text) = delta
+                            .and_then(|d| d.get("thinking"))
+                            .and_then(|v| v.as_str())
+                        {
+                            self.thinking.push_str(text);
+                        }
+                    }
+                    _ => {}
                 }
             }
             Some("message_delta") => {
@@ -198,6 +218,19 @@ mod tests {
         }
         assert!(changed);
         assert_eq!(acc.content, "split");
+    }
+
+    #[test]
+    fn reasoning_accumulates_apart_from_the_answer() {
+        let mut acc = SseAccumulator::default();
+        let update = acc.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"let me check\"}}\n\n");
+        acc.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n");
+
+        assert_eq!(acc.thinking, "let me check");
+        // The answer must not carry the reasoning, and the reasoning must
+        // not wake the stream panel.
+        assert_eq!(acc.content, "done");
+        assert!(!update.content_changed);
     }
 
     #[test]
