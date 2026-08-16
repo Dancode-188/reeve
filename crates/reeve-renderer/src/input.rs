@@ -1,5 +1,21 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// How long one blocking step waits for a key before giving up and letting
+/// the task end.
+///
+/// The step has to end on its own or the process cannot exit. Tokio cannot
+/// cancel a `spawn_blocking` task, and dropping the runtime waits for the
+/// outstanding ones, so a step parked in `event::read` holds shutdown open
+/// until somebody types a key that nobody has a reason to type. Polling
+/// bounds the wait by this interval instead.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// One blocking wait for terminal input: an event, or nothing if the wait
+/// expired first. Taken as a parameter by [`run_with`] so the shutdown
+/// behaviour can be tested without a terminal.
+type EventStep = fn() -> std::io::Result<Option<Event>>;
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -34,16 +50,31 @@ pub enum Action {
 /// happens on the receiving side via [`map_event`], because it depends on
 /// whether a text input is active and only the app knows that.
 pub async fn run(tx: mpsc::Sender<Event>) {
+    run_with(tx, poll_terminal).await
+}
+
+async fn run_with(tx: mpsc::Sender<Event>, step: EventStep) {
     loop {
-        let result = tokio::task::spawn_blocking(crossterm::event::read).await;
-        match result {
-            Ok(Ok(event)) => {
+        match tokio::task::spawn_blocking(step).await {
+            Ok(Ok(Some(event))) => {
                 if tx.send(event).await.is_err() {
                     return;
                 }
             }
+            // The wait expired with nothing to report. Going round again
+            // gives the runtime a moment where no blocking task is parked,
+            // which is the moment a shutdown needs.
+            Ok(Ok(None)) => {}
             _ => return,
         }
+    }
+}
+
+fn poll_terminal() -> std::io::Result<Option<Event>> {
+    if crossterm::event::poll(POLL_INTERVAL)? {
+        crossterm::event::read().map(Some)
+    } else {
+        Ok(None)
     }
 }
 
@@ -193,5 +224,36 @@ mod tests {
             ),
             Some(Action::NextPanel)
         ));
+    }
+
+    #[test]
+    fn dropping_the_runtime_does_not_wait_on_the_input_task() {
+        // The bug this guards: a step that parks until a key arrives holds
+        // the blocking pool open, and the pool is what the runtime waits on
+        // when it is dropped, so quitting hung until somebody typed. The
+        // step here reports nothing and returns, standing in for a poll that
+        // expired. Reintroduce a step that blocks and this test stops
+        // failing on an assertion and starts hanging, which is the symptom.
+        fn expires() -> std::io::Result<Option<Event>> {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(None)
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (tx, _rx) = mpsc::channel(1);
+        rt.spawn(run_with(tx, expires));
+        // Let the task get a step running, so the drop below has one to wait
+        // on rather than racing to shut down before anything started.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let start = std::time::Instant::now();
+        drop(rt);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "runtime drop took {elapsed:?}, which means the input task is \
+             still holding shutdown open"
+        );
     }
 }
