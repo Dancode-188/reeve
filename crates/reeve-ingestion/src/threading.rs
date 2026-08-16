@@ -378,28 +378,75 @@ fn tool_input_hash(messages: &[serde_json::Value], tool_use_id: &str) -> Option<
 /// Per-message fingerprint. DefaultHasher is deterministic within a
 /// process, which is the only scope this state lives in.
 ///
-/// `cache_control` is stripped before hashing: prompt-caching clients
-/// move the breakpoint marker forward to newer messages on every
-/// request, so a resent message is byte-identical except for the marker
-/// appearing or vanishing. The fingerprint covers what was said, not
-/// how the API was told to cache it. Real Claude Code broke on this.
+/// The message is put in a canonical form first, because the raw JSON a
+/// client sends encodes choices that carry no meaning, and a fingerprint
+/// that sees them is a fingerprint of the serializer rather than of what
+/// was said. See `canonical_message` for the two that bite.
 fn hash_message(msg: &serde_json::Value) -> u64 {
     let mut hasher = DefaultHasher::new();
-    match msg.get("content").and_then(|c| c.as_array()) {
-        Some(blocks) if blocks.iter().any(|b| b.get("cache_control").is_some()) => {
-            let mut clean = msg.clone();
-            if let Some(arr) = clean.get_mut("content").and_then(|c| c.as_array_mut()) {
-                for block in arr.iter_mut() {
-                    if let Some(obj) = block.as_object_mut() {
-                        obj.remove("cache_control");
-                    }
-                }
-            }
-            clean.to_string().hash(&mut hasher);
-        }
-        _ => msg.to_string().hash(&mut hasher),
+    match canonical_message(msg) {
+        Some(canonical) => canonical.to_string().hash(&mut hasher),
+        None => msg.to_string().hash(&mut hasher),
     }
     hasher.finish()
+}
+
+/// Rewrites a message into the form every encoding of it shares, or None
+/// when it already is that form and can be hashed as it stands.
+///
+/// Two rewrites, both found in real Claude Code traffic:
+///
+/// `cache_control` is dropped, because prompt-caching clients move the
+/// breakpoint marker forward to newer messages on every request, so a
+/// resent message is byte-identical except for the marker appearing or
+/// vanishing (#178).
+///
+/// A lone text block collapses to the bare string that says the same
+/// thing, because a client may send one message either way and switch
+/// between them mid-conversation. Claude Code's own token-budget system
+/// message arrives as `[{"type":"text","text":"..."}]` at the tail of the
+/// request that introduces it and as `"..."` when the next request
+/// replays it, which diverged the prefix one message from its end on
+/// every single turn and started a new conversation each time (#308).
+fn canonical_message(msg: &serde_json::Value) -> Option<serde_json::Value> {
+    let blocks = msg.get("content")?.as_array()?;
+
+    if let Some(text) = lone_text(blocks) {
+        let mut canonical = msg.clone();
+        canonical["content"] = serde_json::Value::String(text.to_owned());
+        return Some(canonical);
+    }
+
+    if !blocks.iter().any(|b| b.get("cache_control").is_some()) {
+        return None;
+    }
+    let mut canonical = msg.clone();
+    for block in canonical["content"].as_array_mut()?.iter_mut() {
+        if let Some(obj) = block.as_object_mut() {
+            obj.remove("cache_control");
+        }
+    }
+    Some(canonical)
+}
+
+/// The text of a content array that says exactly what the bare-string
+/// form of the same message says: a single text block carrying nothing
+/// but its text. A `cache_control` marker does not disqualify it, since
+/// the fingerprint drops that anyway. Any other key does, because the
+/// string form could not have carried it.
+fn lone_text(blocks: &[serde_json::Value]) -> Option<&str> {
+    let [only] = blocks else { return None };
+    let obj = only.as_object()?;
+    if obj.get("type")?.as_str()? != "text" {
+        return None;
+    }
+    if obj
+        .keys()
+        .any(|k| !matches!(k.as_str(), "type" | "text" | "cache_control"))
+    {
+        return None;
+    }
+    obj.get("text")?.as_str()
 }
 
 #[cfg(test)]
@@ -564,6 +611,89 @@ mod tests {
         );
         assert_eq!(p2.trace_id, p1.trace_id, "same turn, same trace");
         assert_eq!(p2.tools.len(), 1, "the tool span survives the marker move");
+    }
+
+    #[test]
+    fn a_re_encoded_tail_message_does_not_split_the_conversation() {
+        // The shape real Claude Code sends (#308): its token-budget
+        // system message is the tail of the request that introduces it,
+        // carried as a one-element content array, and comes back as a
+        // bare string once the next request replays it mid-history. Same
+        // text, two encodings, one message. Hashing the raw JSON made
+        // the histories diverge one message from the end of every single
+        // turn, which is the narrowest possible miss and started a fresh
+        // conversation each time.
+        let mut t = ConversationTracker::default();
+        let now = SystemTime::now();
+
+        let budget = "<total_tokens>1000000 tokens left</total_tokens>";
+        let as_blocks = serde_json::json!({
+            "role": "system",
+            "content": [{"type": "text", "text": budget}]
+        });
+
+        let m1 = vec![msg("user", "list the files"), as_blocks];
+        let p1 = t.place_request("claude-cli", &m1, now, ids);
+        assert!(p1.new_conversation, "nothing to thread into yet");
+        t.record_response(
+            "claude-cli",
+            &p1.trace_id,
+            ResponseInfo {
+                chat_span_id: vec![1; 8],
+                tool_uses: vec![("toolu_1".into(), "bash".into())],
+                stop_reason: Some("tool_use".into()),
+                ended_at: now,
+            },
+        );
+
+        let m2 = vec![
+            msg("user", "list the files"),
+            msg("system", budget),
+            msg("assistant", "running bash"),
+            tool_result("toolu_1", false),
+        ];
+        let p2 = t.place_request("claude-cli", &m2, now, ids);
+        assert_eq!(
+            p2.matched_prefix, 2,
+            "the re-encoded message must agree, not just the one before it"
+        );
+        assert!(
+            !p2.new_conversation,
+            "a re-encoded tail message must not read as a new conversation"
+        );
+        assert_eq!(p2.trace_id, p1.trace_id, "same turn, same trace");
+        assert_eq!(p2.tools.len(), 1, "the tool span survives the re-encoding");
+    }
+
+    #[test]
+    fn only_a_bare_text_block_collapses_to_its_string() {
+        let text = "the same words";
+        let as_string = msg("user", text);
+        let as_blocks = serde_json::json!({
+            "role": "user", "content": [{"type": "text", "text": text}]
+        });
+        let marked = serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}
+        ]});
+        assert_eq!(hash_message(&as_string), hash_message(&as_blocks));
+        assert_eq!(hash_message(&as_string), hash_message(&marked));
+
+        // Only the content is canonicalized, so who said it still counts.
+        assert_ne!(hash_message(&as_blocks), hash_message(&msg("system", text)));
+
+        // A block carrying more than its text says something the string
+        // form cannot, so it keeps a fingerprint of its own.
+        let cited = serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": text, "citations": ["doc-1"]}
+        ]});
+        assert_ne!(hash_message(&as_string), hash_message(&cited));
+
+        // And two blocks are not one, however they read concatenated.
+        let split = serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": "the same "},
+            {"type": "text", "text": "words"}
+        ]});
+        assert_ne!(hash_message(&as_string), hash_message(&split));
     }
 
     #[test]
