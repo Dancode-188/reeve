@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-18
+
+The proxy path was losing things quietly. It threaded conversations by
+an encoding detail rather than by content, so every continuation looked
+like the start of a new one. It parsed each request body and dropped
+it, so privacy tier 2 stored nothing on that path. And when it failed
+it emitted no span at all. Quitting the cockpit also left the process
+running.
+
+### Added
+
+- The proxy stores round trips at privacy tier 2, in a `capture/`
+  directory beside the database. A conversation resends its whole
+  history every turn, so each message is filed under the fingerprint
+  threading already holds for it, and the history two turns share sits
+  on disk once rather than twice. The write happens after the response
+  has gone back, on a pool of its own, so no turn waits on it. Tier 1
+  stores nothing, as before.
+- A proxy fault produces a span. Both 502 paths returned an error
+  having emitted nothing and left their turn open, which made an
+  upstream failure look the same as an agent that had gone quiet.
+- Threading counters report how close the closest conversation came,
+  which is the one thing a bare miss cannot tell you.
+
+### Removed
+
+- `reeve_ingestion::proxy::run`. Callers build a `ProxyConfig` and call
+  `run_with`. The crate is published so `cargo install reeve-cockpit`
+  can resolve it, and its crate doc now states plainly what
+  ARCHITECTURE.md has said about the internal crates since 1.0: the
+  library API is not supported.
+
+### Fixed
+
+- A conversation is threaded by what a message says, not by how it was
+  encoded. The fingerprint was taken over the serialized form, so a
+  message that arrived as a one-element content array and came back as
+  a bare string produced two different values and the history stopped
+  matching at its last entry. Live traffic hit this on every
+  continuation, because the message doing it is the token-budget line
+  the client itself appends.
+- Quitting exits. The input loop handed a blocking read to the thread
+  pool, and that call sits until a key arrives, so shutdown came to
+  rest on input that was never going to arrive: the cockpit tore down
+  and the process stayed. The read now polls with a timeout, and a quit
+  costs at most one interval.
+- The configuration guide no longer says proxied content is never
+  stored, which stopped being true with capture.
+
+### Security
+
+- `h2` moves to 0.4.16 past RUSTSEC-2026-0258, which lets a peer
+  exhaust memory over an HTTP/2 connection. Nothing here depends on it
+  directly; `hyper` and `tonic` pull it in. The advisory landed the day
+  this release was prepared, which is what a required `cargo audit`
+  job is for.
+
 ## [1.1.0] - 2026-08-13
 
 Installing from the registry no longer needs a protobuf compiler, which
@@ -512,6 +569,7 @@ spends; this release acts on that.
 - GitHub Actions CI: fmt check, clippy with `-D warnings`, tests, release build.
 - Issue templates, PR template, CONTRIBUTING.md, ROADMAP.md.
 
+[1.2.0]: https://github.com/Dancode-188/reeve/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Dancode-188/reeve/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Dancode-188/reeve/releases/tag/v1.0.0
 [0.6.0]: https://github.com/Dancode-188/reeve/releases/tag/v0.6.0

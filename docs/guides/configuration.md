@@ -19,11 +19,19 @@ fails closed. Turning on tier 2 writes a consent line to `consent.log`
 next to the database, so the moment content capture was enabled is
 auditable later.
 
-This applies to the SDK path. Proxied traffic is a different story:
-the proxy shows the streaming response live but never writes its
-content to storage, at any tier, so a proxied trace has no captured
-content to replay. The metadata (tokens, cost, timings, tool calls) is
-always there; the words are not.
+The two paths store it in different places. The SDK path writes
+content into the database as span events. The proxy writes whole round
+trips to a `capture/` directory beside the database, addressed by the
+per-message fingerprints it already computes for conversation
+threading, so a conversation that resends its history every turn is
+stored once rather than once per turn. Writing happens off the request
+path and cannot slow a live turn.
+
+At tier 1 neither path stores content at all. The metadata (tokens,
+cost, timings, tool calls) is always there; the words are not. Note
+that the cockpit does not read `capture/` back, so replay still works
+from span events only: the captured files are for reading directly,
+and deleting them costs no cockpit function.
 
 ## Policy rules
 
