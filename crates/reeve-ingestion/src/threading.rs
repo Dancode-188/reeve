@@ -12,9 +12,10 @@
 //! child span covering the gap between the two.
 //!
 //! All state is in memory. A prefix mismatch (context compaction, an
-//! edited history, a restart) starts a fresh conversation, which is the
-//! proxy's pre-threading behavior: degradation is graceful by
-//! construction.
+//! edited history, a restart) starts a fresh conversation, and nothing
+//! in the request tells that apart from a conversation genuinely
+//! beginning, so every placement also records how far the nearest
+//! candidate agreed and how many candidates there were. ADR-0047.
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
