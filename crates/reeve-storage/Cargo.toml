@@ -12,7 +12,7 @@ readme = "README.md"
 workspace = true
 
 [dependencies]
-reeve-model = { path = "../reeve-model", version = "1.1.0" }
+reeve-model = { path = "../reeve-model", version = "1.2.0" }
 rusqlite = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
