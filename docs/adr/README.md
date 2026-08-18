@@ -55,6 +55,7 @@ the reasoning as it stood survives next to what replaced it.
 | [0044](./0044-committed-proto-bindings.md) | Committed Proto Bindings | Accepted | 2026-07-28 |
 | [0045](./0045-a-policy-alert-is-not-a-command.md) | A Policy Alert Is Not a Command | Accepted | 2026-08-03 |
 | [0046](./0046-proxy-content-capture-is-content-addressed.md) | Proxy Content Capture Is a Content-Addressed Store on Disk | Accepted | 2026-08-18 |
+| [0047](./0047-message-identity-is-semantic.md) | Message Identity Is Semantic, and Threading Counts Its Own Misses | Accepted | 2026-08-18 |
 
 ## Format
 
