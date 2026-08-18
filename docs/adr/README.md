@@ -54,6 +54,7 @@ the reasoning as it stood survives next to what replaced it.
 | [0043](./0043-outbound-secret-scanning.md) | Outbound Secret Scanning Warns First, Blocks by Consent | Accepted | 2026-07-13 |
 | [0044](./0044-committed-proto-bindings.md) | Committed Proto Bindings | Accepted | 2026-07-28 |
 | [0045](./0045-a-policy-alert-is-not-a-command.md) | A Policy Alert Is Not a Command | Accepted | 2026-08-03 |
+| [0046](./0046-proxy-content-capture-is-content-addressed.md) | Proxy Content Capture Is a Content-Addressed Store on Disk | Accepted | 2026-08-18 |
 
 ## Format
 
