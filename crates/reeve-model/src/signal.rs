@@ -1,5 +1,6 @@
 use crate::entity::agent::{Agent, AgentStatus};
 use crate::ids::{AgentId, SpanId, TraceId};
+use serde::{Deserialize, Serialize};
 
 /// Produced by the ingestion pipeline. Consumers: renderer, evaluation engine.
 #[derive(Clone, Debug)]
@@ -52,7 +53,8 @@ pub enum IngestionEvent {
 
 /// Confidence in an LLM judge result, derived from self-consistency scoring.
 /// Tier 1 evaluators are deterministic and carry no confidence value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EvaluationConfidence {
     /// Two rubric phrasings agreed within 0.10.
     High,

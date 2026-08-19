@@ -149,7 +149,7 @@ impl EngineLoop {
 
             if let Err(e) = self
                 .warm
-                .update_trace_health_score(&trace_id, hs.value)
+                .update_trace_health_score(&trace_id, hs.value, hs.weight_coverage)
                 .await
             {
                 tracing::warn!(
@@ -933,6 +933,7 @@ async fn run_tier2(
             evaluated_at: now,
             judge_model_version: model_version.clone(),
             cot_json: cot_json.clone(),
+            confidence: Some(*confidence),
         };
         if let Err(e) = warm.save_evaluation_result(eval).await {
             tracing::warn!(error = %e, metric, "failed to persist tier2 evaluation");
@@ -960,7 +961,10 @@ async fn run_tier2(
             weight_coverage: hs.weight_coverage,
         };
         let _ = engine_tx.send(event);
-        if let Err(e) = warm.update_trace_health_score(&trace_id, hs.value).await {
+        if let Err(e) = warm
+            .update_trace_health_score(&trace_id, hs.value, hs.weight_coverage)
+            .await
+        {
             tracing::warn!(
                 trace_id = %trace_id,
                 error = %e,
