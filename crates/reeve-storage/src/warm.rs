@@ -5,6 +5,7 @@ use reeve_model::entity::{
     SpanStatus, TargetType, Trace, TraceStatus,
 };
 use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, SpanId, TraceId};
+use reeve_model::signal::EvaluationConfidence;
 use rusqlite::{Connection, Row, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -57,6 +58,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, include_str!("../migrations/0004_policy_cooldowns.sql")),
     (5, include_str!("../migrations/0005_resumable_traces.sql")),
     (6, include_str!("../migrations/0006_indices.sql")),
+    (7, include_str!("../migrations/0007_score_provenance.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -173,6 +175,11 @@ fn row_to_evaluation_result(row: &Row) -> rusqlite::Result<EvaluationResult> {
         evaluated_at: row.get("evaluated_at")?,
         judge_model_version: row.get("judge_model_version")?,
         cot_json: row.get("cot_json")?,
+        confidence: row
+            .get::<_, Option<String>>("confidence")?
+            .map(|c| text_to_enum::<EvaluationConfidence>(&c))
+            .transpose()
+            .map_err(rusqlite_serde_err)?,
     })
 }
 
@@ -447,16 +454,22 @@ impl WarmStore {
         .await
     }
 
+    /// `weight_coverage` is the fraction of the metric weight the score was
+    /// computed over. Stored beside the value because the two are only
+    /// meaningful together: 100 over 0.45 of the weight and 100 over all of
+    /// it are different claims.
     pub async fn update_trace_health_score(
         &self,
         trace_id: &TraceId,
         score: f64,
+        weight_coverage: f64,
     ) -> Result<(), StorageError> {
         let trace_id = trace_id.clone();
         self.with_conn(move |conn| {
             conn.execute(
-                "UPDATE traces SET final_health_score = ?1 WHERE id = ?2",
-                params![score, trace_id.as_str()],
+                "UPDATE traces SET final_health_score = ?1, weight_coverage = ?2
+                 WHERE id = ?3",
+                params![score, weight_coverage, trace_id.as_str()],
             )?;
             Ok(())
         })
@@ -779,11 +792,12 @@ impl WarmStore {
     ) -> Result<(), StorageError> {
         let target_type = enum_to_text(&result.target_type)?;
         let evaluator = enum_to_text(&result.evaluator)?;
+        let confidence = result.confidence.map(|c| enum_to_text(&c)).transpose()?;
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT INTO evaluation_results
-                    (id, target_id, target_type, metric, score, evaluator, judge_model_version, evaluated_at, cot_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    (id, target_id, target_type, metric, score, evaluator, judge_model_version, evaluated_at, cot_json, confidence)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     result.id.as_str(),
                     result.target_id,
@@ -794,6 +808,7 @@ impl WarmStore {
                     result.judge_model_version,
                     result.evaluated_at,
                     result.cot_json,
+                    confidence,
                 ],
             )?;
             Ok(())
@@ -1995,6 +2010,7 @@ mod tests {
             evaluated_at: 10,
             judge_model_version: Some("phi4-mini".to_string()),
             cot_json: Some(cot.to_string()),
+            confidence: Some(EvaluationConfidence::High),
         };
         store.save_evaluation_result(result).await.unwrap();
 
@@ -2007,6 +2023,38 @@ mod tests {
         assert_eq!(loaded.evaluator, ET::LlmJudge);
         assert_eq!(loaded.score, 0.9);
         assert_eq!(loaded.cot_json.as_deref(), Some(cot));
+        assert_eq!(loaded.confidence, Some(EvaluationConfidence::High));
+    }
+
+    #[tokio::test]
+    async fn health_score_stores_the_coverage_it_was_computed_over() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t1")).await.unwrap();
+
+        store
+            .update_trace_health_score(&TraceId::from("t1"), 44.4444, 0.45)
+            .await
+            .unwrap();
+
+        let coverage: Option<f64> = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT weight_coverage FROM traces WHERE id = 't1'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(coverage, Some(0.45));
+
+        let loaded = store
+            .get_trace(&TraceId::from("t1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.final_health_score, Some(44.4444));
     }
 
     #[tokio::test]

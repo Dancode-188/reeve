@@ -278,6 +278,7 @@ mod tests {
             evaluated_at: at,
             judge_model_version: None,
             cot_json: None,
+            confidence: None,
         }
     }
 

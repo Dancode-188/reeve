@@ -1,4 +1,5 @@
 use crate::ids::{EvalId, Timestamp};
+use crate::signal::EvaluationConfidence;
 use serde::{Deserialize, Serialize};
 
 /// The category that produced a score, not the specific check. The
@@ -35,4 +36,9 @@ pub struct EvaluationResult {
     /// Chain-of-thought breakdown for faithfulness and hallucination_detection.
     /// JSON blob with keys: claims, supported, unsupported.
     pub cot_json: Option<String>,
+    /// What the judge's self-consistency check said about this result.
+    /// `None` for tier 1 evaluators, which are deterministic. A `Low`
+    /// result is saved but excluded from the health score, so without
+    /// this the row does not say whether it counted.
+    pub confidence: Option<EvaluationConfidence>,
 }
