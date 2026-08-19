@@ -13,6 +13,7 @@ jobs:
   check:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       # One platform failing should not hide the other's result.
       fail-fast: false
@@ -39,6 +40,7 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
@@ -52,10 +54,16 @@ jobs:
   proto:
     name: generated proto is current
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler
+      # apt waits forever on a stalled mirror unless told not to, which once
+      # held this job for 1h42m on a run whose other jobs finished in two
+      # minutes. Retry a few times, give up on a dead connection.
+      - run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -y
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y protobuf-compiler
       - run: REEVE_REGENERATE_PROTO=1 cargo build -p reeve-intervention -p reeve-sdk
       - name: Fail if the committed bindings are stale
         run: |
