@@ -617,6 +617,39 @@ pub async fn run(
         engine.policy_engine.load_cooldowns(&cooldowns, startup_ms);
     }
 
+    {
+        let samples = warm
+            .recent_fingerprint_samples(evaluation::fingerprint::REPLAY_WINDOW)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to load agent history from database");
+                vec![]
+            });
+        // Replayed in arrival order, not averaged flat: the baseline is a
+        // moving average, so order decides the weights, and a flat mean
+        // would hand back a different number than the one the process had
+        // a moment before it stopped.
+        let restored = samples.len();
+        for sample in samples {
+            let duration_secs = match (sample.min_start, sample.max_end) {
+                (Some(s), Some(e)) => e.saturating_sub(s).max(0) as f64 / 1e9,
+                _ => 0.0,
+            };
+            engine
+                .fingerprints
+                .entry(sample.agent_id)
+                .or_default()
+                .update(sample.span_count, sample.cost, duration_secs);
+        }
+        if restored > 0 {
+            tracing::info!(
+                traces = restored,
+                agents = engine.fingerprints.len(),
+                "restored agent baselines"
+            );
+        }
+    }
+
     // SIGUSR1 triggers a policy rule reload. SIGHUP deliberately keeps its
     // default disposition (terminate): for a terminal app, hangup means the
     // terminal went away. An earlier SIGHUP-based reload made Reeve swallow

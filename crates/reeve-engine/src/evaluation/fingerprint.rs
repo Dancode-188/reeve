@@ -1,5 +1,11 @@
 use std::collections::HashMap;
 
+/// Traces replayed per agent to rebuild a baseline at startup. The
+/// average discounts a sample to `(1 - 1/100)^n` once `n` more arrive,
+/// so at 500 the traces falling outside the replay hold well under a
+/// percent of it and the restart leaves no visible step.
+pub const REPLAY_WINDOW: usize = 500;
+
 pub struct AgentFingerprint {
     pub avg_spans_per_trace: f64,
     pub avg_cost_per_trace: f64,
@@ -70,6 +76,29 @@ mod tests {
             fp.update(10, 0.01, 1.0);
         }
         assert!(fp.is_warmed());
+    }
+
+    #[test]
+    fn replay_window_outweighs_the_history_it_leaves_behind() {
+        // A baseline carrying history the replay cannot reach, against
+        // one that only ever saw the window. Whatever gap survives is
+        // the weight still resting on unreachable traces, and holding
+        // it under a percent is the whole claim REPLAY_WINDOW makes.
+        let (old, new) = (90.0, 1.0);
+        let mut carried = AgentFingerprint::new();
+        for _ in 0..2_000 {
+            carried.update(500, old, 400.0);
+        }
+        let mut fresh = AgentFingerprint::new();
+        for _ in 0..REPLAY_WINDOW {
+            carried.update(10, new, 2.0);
+            fresh.update(10, new, 2.0);
+        }
+        let residual = (carried.avg_cost_per_trace - fresh.avg_cost_per_trace).abs() / (old - new);
+        assert!(
+            residual < 0.01,
+            "unreachable history holds {residual} of the average"
+        );
     }
 
     #[test]

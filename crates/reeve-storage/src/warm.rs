@@ -14,6 +14,18 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// One past trace, shaped for rebuilding an agent baseline at startup.
+/// Span bounds stay raw so the engine derives duration exactly the way
+/// it does on the live path.
+#[derive(Debug, Clone)]
+pub struct FingerprintSample {
+    pub agent_id: AgentId,
+    pub span_count: usize,
+    pub cost: f64,
+    pub min_start: Option<i64>,
+    pub max_end: Option<i64>,
+}
+
 /// Spending analytics for the Cost view.
 #[derive(Debug, Clone, Default)]
 pub struct CostSummary {
@@ -892,6 +904,53 @@ impl WarmStore {
         .await
     }
 
+    /// One row per stored trace, newest `per_agent` per agent, returned
+    /// oldest first so the engine can replay them through the moving
+    /// average that built the agent baselines before the last shutdown
+    /// (#322). Ordered by `started_at` because interrupted traces never
+    /// get a `completed_at`, and they counted toward the baseline while
+    /// the process was up. Durations come back as raw span bounds: the
+    /// engine owns that arithmetic and the two paths have to agree.
+    pub async fn recent_fingerprint_samples(
+        &self,
+        per_agent: usize,
+    ) -> Result<Vec<FingerprintSample>, StorageError> {
+        self.with_conn(move |conn| {
+            conn.prepare(
+                "SELECT agent_id, span_count, cost, min_start, max_end
+                 FROM (
+                     SELECT t.agent_id AS agent_id,
+                            t.started_at AS started_at,
+                            COUNT(s.id) AS span_count,
+                            COALESCE(SUM(json_extract(s.attributes,
+                                '$.\"gen_ai.usage.cost\"')), 0.0) AS cost,
+                            MIN(s.start_time) AS min_start,
+                            MAX(s.end_time) AS max_end,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY t.agent_id
+                                ORDER BY t.started_at DESC
+                            ) AS rn
+                     FROM traces t
+                     JOIN spans s ON s.trace_id = t.id
+                     GROUP BY t.id
+                 )
+                 WHERE rn <= ?1
+                 ORDER BY started_at ASC",
+            )?
+            .query_map(params![per_agent as i64], |row| {
+                Ok(FingerprintSample {
+                    agent_id: AgentId::from(row.get::<_, String>(0)?),
+                    span_count: row.get::<_, i64>(1)?.max(0) as usize,
+                    cost: row.get::<_, f64>(2)?,
+                    min_start: row.get::<_, Option<i64>>(3)?,
+                    max_end: row.get::<_, Option<i64>>(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()
+        })
+        .await
+    }
+
     /// Spending totals for the Cost view: overall total with trace count,
     /// cost grouped by agent, and cost grouped by model, in one pass over
     /// span attributes. Spans without a model attribute group under
@@ -1692,6 +1751,60 @@ mod tests {
         // belongs to the NEXT window, so tiles cannot double-count.
         let none = store.agent_spend_between(5_000, 10_000).await.unwrap();
         assert!(none.is_empty(), "upper bound is exclusive");
+    }
+
+    #[tokio::test]
+    async fn fingerprint_samples_replay_oldest_first_within_a_per_agent_window() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        insert_test_agent(&store, "agent-2").await;
+
+        // agent-1 saved out of order, so ordering cannot come for free.
+        for (id, start) in [("t-c", 30), ("t-a", 10), ("t-b", 20)] {
+            let mut tr = trace(id);
+            tr.start_time = start;
+            tr.end_time = Some(start + 5);
+            store.save_trace(tr).await.unwrap();
+            let mut sp = span(id, id);
+            sp.start_time = start;
+            sp.end_time = Some(start + 5);
+            sp.attributes = serde_json::json!({"gen_ai.usage.cost": 0.25});
+            store.save_span(sp).await.unwrap();
+        }
+        // A second span on the newest trace, outlasting the first:
+        // cost sums, count is two, and the bounds cover both.
+        let mut extra = span("t-c-2", "t-c");
+        extra.start_time = 32;
+        extra.end_time = Some(40);
+        extra.attributes = serde_json::json!({"gen_ai.usage.cost": 0.25});
+        store.save_span(extra).await.unwrap();
+
+        // An interrupted trace never gets a completion time, but it
+        // moved the baseline while the process was up, so it counts.
+        let mut other = trace("t-other");
+        other.agent_id = "agent-2".into();
+        other.start_time = 15;
+        store.save_trace(other).await.unwrap();
+        store.save_span(span("s-other", "t-other")).await.unwrap();
+
+        let samples = store.recent_fingerprint_samples(2).await.unwrap();
+        let mine: Vec<_> = samples
+            .iter()
+            .filter(|s| s.agent_id.as_str() == "agent-1")
+            .collect();
+        assert_eq!(mine.len(), 2, "window drops the oldest trace");
+        assert_eq!(mine[0].min_start, Some(20), "oldest kept sample first");
+        assert_eq!(mine[1].min_start, Some(30));
+        assert_eq!(mine[1].max_end, Some(40), "bounds cover every span");
+        assert_eq!(mine[1].span_count, 2);
+        assert!((mine[1].cost - 0.50).abs() < 1e-9, "cost sums per trace");
+
+        let theirs: Vec<_> = samples
+            .iter()
+            .filter(|s| s.agent_id.as_str() == "agent-2")
+            .collect();
+        assert_eq!(theirs.len(), 1, "the window is per agent, not overall");
+        assert_eq!(theirs[0].max_end, Some(5));
     }
 
     #[tokio::test]
