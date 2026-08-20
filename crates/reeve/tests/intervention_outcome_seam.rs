@@ -117,15 +117,16 @@ async fn a_command_the_dispatcher_applies_becomes_an_outcome_the_engine_stores()
     )
     .unwrap();
 
-    tokio::spawn(reeve_engine::run(
+    tokio::spawn(reeve_engine::run(reeve_engine::EngineConfig {
         ingestion_rx,
         engine_tx,
-        warm.clone(),
-        None,
-        Some(applied_feed.clone()),
-        None,
-        None,
-    ));
+        warm: warm.clone(),
+        dispatch_tx: None,
+        applied_commands: Some(applied_feed.clone()),
+        reprobe_requested: None,
+        live_capabilities: None,
+        capture_root: None,
+    }));
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
     let complete_trace = |n: usize| {

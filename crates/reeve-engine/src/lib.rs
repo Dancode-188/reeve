@@ -61,6 +61,9 @@ struct EngineLoop {
     budgets: policy::config::Budgets,
 
     judge: Arc<LlmJudge>,
+    /// Held only so a re-probe can hand the rebuilt judge the same
+    /// reader. `None` whenever the operator has not consented to tier 2.
+    capture_root: Option<PathBuf>,
 
     fingerprints: HashMap<AgentId, AgentFingerprint>,
     score_histories: HashMap<AgentId, VecDeque<f64>>,
@@ -535,15 +538,36 @@ impl EngineLoop {
     }
 }
 
-pub async fn run(
-    mut ingestion_rx: broadcast::Receiver<IngestionEvent>,
-    engine_tx: broadcast::Sender<EngineEvent>,
-    warm: Arc<WarmStore>,
-    dispatch_tx: Option<DispatchSender>,
-    applied_commands: Option<AppliedCommands>,
-    reprobe_requested: Option<ReprobeRequested>,
-    live_capabilities: Option<LiveCapabilities>,
-) {
+/// Everything the engine loop is wired to. A struct rather than a
+/// parameter list because the list had already reached the point where
+/// call sites read as a row of `None`s, which is how `IngestionConfig`
+/// came about on the other side of the seam.
+pub struct EngineConfig {
+    pub ingestion_rx: broadcast::Receiver<IngestionEvent>,
+    pub engine_tx: broadcast::Sender<EngineEvent>,
+    pub warm: Arc<WarmStore>,
+    pub dispatch_tx: Option<DispatchSender>,
+    pub applied_commands: Option<AppliedCommands>,
+    pub reprobe_requested: Option<ReprobeRequested>,
+    pub live_capabilities: Option<LiveCapabilities>,
+    /// Where the proxy stores round trips, at privacy tier 2. The judge
+    /// reads a reply from here when the span does not carry one, which
+    /// on the proxy path is always. `None` at tier 1, where there is no
+    /// store to read.
+    pub capture_root: Option<PathBuf>,
+}
+
+pub async fn run(config: EngineConfig) {
+    let EngineConfig {
+        mut ingestion_rx,
+        engine_tx,
+        warm,
+        dispatch_tx,
+        applied_commands,
+        reprobe_requested,
+        live_capabilities,
+        capture_root,
+    } = config;
     let backend = llm_judge::probe().await;
     let (backend_name, backend_reason) = match &backend {
         llm_judge::JudgeBackend::Local { model, .. } => (format!("local ({})", model), None),
@@ -581,7 +605,8 @@ pub async fn run(
             Box::new(FingerprintDeviationEvaluator),
         ],
         budgets: budgets.clone(),
-        judge: Arc::new(LlmJudge::new(backend)),
+        judge: Arc::new(LlmJudge::new(backend, capture_root.clone())),
+        capture_root,
         fingerprints: HashMap::new(),
         score_histories: HashMap::new(),
         cost_accumulators: HashMap::new(),
@@ -744,7 +769,8 @@ pub async fn run(
                         reason: backend_reason,
                         privacy_tier: startup_privacy_tier,
                     });
-                    engine.judge = Arc::new(LlmJudge::new(backend));
+                    engine.judge =
+                        Arc::new(LlmJudge::new(backend, engine.capture_root.clone()));
                 }
                 continue;
             }

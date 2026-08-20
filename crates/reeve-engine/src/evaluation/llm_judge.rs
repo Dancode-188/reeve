@@ -1,19 +1,24 @@
 // Tier 2: LLM-as-judge via Ollama (phi4-mini local by default).
 //
-// Under privacy tier 1 (the default), span event content is null.
-// faithfulness and hallucination_detection require LLM response text
-// to evaluate and return None when content is absent.
-// tool_selection operates on span operation names and tool call
-// metadata which are always available regardless of privacy tier.
-// A default installation therefore contributes one Tier 2 metric
-// to the health score, not three. This is correct behaviour.
-// Enable content capture (privacy tier 2 or higher) to unlock
-// faithfulness and hallucination_detection.
+// faithfulness and hallucination_detection need the model's own words;
+// tool_selection needs only operation names and tool metadata, so it
+// scores at any privacy tier. Content arrives one of two ways. The SDK
+// path puts it on the span, under the `gen_ai.*` keys `extract_content`
+// looks for. The proxy path does not, and never did, which is why the
+// two content metrics had returned nothing since this file was written
+// no matter what tier the operator chose. ADR-0048 settled that by
+// letting the judge read the capture store, so under tier 2 the reply
+// comes off disk when the span does not carry one.
+//
+// Tier 1 still scores one metric of three, and now that is the tier
+// gate doing its job rather than a gap nobody had noticed.
 
 use reeve_model::entity::span::InternalSpan;
 use reeve_model::signal::EvaluationConfidence;
+use reeve_storage::capture::CaptureReader;
 use reqwest::Client;
 use serde::Deserialize;
+use std::path::PathBuf;
 use std::time::Duration;
 
 const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
@@ -21,6 +26,25 @@ const OLLAMA_MODEL: &str = "phi4-mini";
 const MAX_RETRIES: u32 = 3;
 const CONFIDENCE_HIGH_THRESHOLD: f64 = 0.10;
 const CONFIDENCE_MEDIUM_THRESHOLD: f64 = 0.30;
+/// How much of a captured round is allowed into a prompt.
+///
+/// The request below sets no `num_ctx`, so the model runs at whatever
+/// Ollama defaults to, which is 4096 tokens on current builds. Roughly
+/// four characters to a token, less the scaffolding and the room the
+/// answer needs, leaves about twelve thousand characters to spend. A
+/// captured round is far larger than that: the corpus puts the median
+/// at 19 messages per round and the 90th percentile at 75, against
+/// message files whose 90th percentile is 60 kB. Handing that over
+/// whole does not evaluate more of the conversation, it just lets the
+/// runtime decide silently which end to discard. Spending the budget
+/// deliberately is the difference between a bounded prompt and a
+/// truncated one.
+///
+/// Replies are measured at a median of 12 characters and a 90th
+/// percentile of 2,377, so the smaller share still fits nearly all of
+/// them intact.
+const CAPTURE_CONTEXT_BUDGET: usize = 8_000;
+const CAPTURE_REPLY_BUDGET: usize = 4_000;
 
 #[derive(Debug, Clone)]
 pub enum JudgeBackend {
@@ -31,6 +55,10 @@ pub enum JudgeBackend {
 pub struct LlmJudge {
     pub backend: JudgeBackend,
     client: Client,
+    /// The capture directory, when the operator consented to tier 2.
+    /// `None` leaves the judge exactly as it behaved before it had a
+    /// reader, which is also what a missing round degrades to.
+    capture_root: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -95,19 +123,66 @@ pub async fn probe() -> JudgeBackend {
 }
 
 impl LlmJudge {
-    pub fn new(backend: JudgeBackend) -> Self {
+    pub fn new(backend: JudgeBackend, capture_root: Option<PathBuf>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| Client::new());
-        Self { backend, client }
+        Self {
+            backend,
+            client,
+            capture_root,
+        }
+    }
+
+    /// The reply and its conversation, read off disk for the first span
+    /// that has a round stored.
+    ///
+    /// Spans are tried in order and the first hit wins, which matches
+    /// how `extract_content` already picks among them. A chat span off
+    /// the proxy addresses its own round directly, for the reason set
+    /// out in `reeve_storage::capture`; anything else finds no file and
+    /// this returns nothing.
+    ///
+    /// The reads go to a blocking thread. Resolving a conversation is
+    /// one small file plus up to a few dozen larger ones, which is more
+    /// than an async runtime should be asked to sit through even on a
+    /// detached task.
+    async fn content_from_capture(
+        &self,
+        spans: &[InternalSpan],
+    ) -> (Option<String>, Option<String>) {
+        let Some(root) = self.capture_root.clone() else {
+            return (None, None);
+        };
+        let keys: Vec<(i64, String)> = spans
+            .iter()
+            .map(|s| (s.start_time, s.id.to_string()))
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            let reader = CaptureReader::new(root);
+            for (started_at_ms, span_id) in keys {
+                let Some(round) = reader.round(started_at_ms, &span_id) else {
+                    continue;
+                };
+                let Some(reply) = round.reply() else {
+                    continue;
+                };
+                let context = reader.context(&round, CAPTURE_CONTEXT_BUDGET);
+                return (Some(truncate(&reply, CAPTURE_REPLY_BUDGET)), context);
+            }
+            (None, None)
+        })
+        .await
+        .unwrap_or((None, None))
     }
 
     /// Run all three Tier 2 evaluators against the completed trace spans.
     /// Returns `(metric_name, score, confidence, cot_json)` for each metric
-    /// that produced a result. Metrics requiring content return nothing under
-    /// privacy tier 1 because span content is null. `cot_json` is Some only
-    /// for faithfulness and hallucination_detection when the model returned
+    /// that produced a result. The two content metrics return nothing when
+    /// neither the spans nor the capture store hold the reply, which is
+    /// every trace under privacy tier 1. `cot_json` is Some only for
+    /// faithfulness and hallucination_detection when the model returned
     /// the structured CoT format.
     pub async fn evaluate_trace(
         &self,
@@ -147,8 +222,17 @@ impl LlmJudge {
             }
         }
 
-        if let Some(ref content) = extract_content(spans) {
-            let context = extract_context(spans).unwrap_or_default();
+        // Attributes first, capture second. The order matters: a span
+        // that carries its own content is the SDK path describing
+        // itself, and that beats reconstructing the same turn from a
+        // file written by a different code path.
+        let (content, context) = match extract_content(spans) {
+            Some(c) => (Some(c), extract_context(spans)),
+            None => self.content_from_capture(spans).await,
+        };
+
+        if let Some(ref content) = content {
+            let context = context.unwrap_or_default();
 
             let faith_a = format!(
                 "Does the following response use only information from the provided \
@@ -330,6 +414,16 @@ fn extract_tool_calls(spans: &[InternalSpan]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Cuts to a character budget on a char boundary, marking the cut so a
+/// judge scoring a half-sentence can see why it is one.
+fn truncate(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(budget).collect();
+    format!("{kept}\n[truncated]")
 }
 
 fn extract_content(spans: &[InternalSpan]) -> Option<String> {
@@ -542,6 +636,83 @@ mod tests {
         let span = make_span("gen_ai.chat", serde_json::Value::Null);
         let calls = extract_tool_calls(&[span]);
         assert!(calls.is_empty());
+    }
+
+    fn span_at(id: &str, start_time: i64) -> InternalSpan {
+        let mut span = make_span("gen_ai.chat", serde_json::json!({}));
+        span.id = id.into();
+        span.start_time = start_time;
+        span
+    }
+
+    fn disabled_judge(capture_root: Option<PathBuf>) -> LlmJudge {
+        LlmJudge::new(
+            JudgeBackend::Disabled {
+                reason: "test".into(),
+            },
+            capture_root,
+        )
+    }
+
+    fn store_round(root: &std::path::Path, start: i64, span: &str, round: serde_json::Value) {
+        let path = reeve_storage::capture::round_path(root, start, span);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, serde_json::to_vec(&round).expect("encode")).expect("write");
+    }
+
+    #[tokio::test]
+    async fn tier_one_has_no_capture_to_fall_back_on() {
+        let judge = disabled_judge(None);
+        assert_eq!(
+            judge.content_from_capture(&[span_at("abc", 1000)]).await,
+            (None, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_span_without_content_finds_its_round_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        store_round(
+            dir.path(),
+            1787225395662,
+            "609f06dfe14f78d4",
+            serde_json::json!({
+                "request": {"messages": [{"role": "user", "content": "why is CI red"}]},
+                "response": {"content": "a flaky mirror held the run open"},
+            }),
+        );
+        let judge = disabled_judge(Some(dir.path().to_path_buf()));
+        let spans = [
+            span_at("a-root-span", 1787225395000),
+            span_at("609f06dfe14f78d4", 1787225395662),
+        ];
+        let (content, context) = judge.content_from_capture(&spans).await;
+        assert_eq!(content.as_deref(), Some("a flaky mirror held the run open"));
+        assert_eq!(context.as_deref(), Some("user: why is CI red"));
+    }
+
+    #[tokio::test]
+    async fn a_span_off_the_proxy_path_finds_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let judge = disabled_judge(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            judge.content_from_capture(&[span_at("sdk-span", 42)]).await,
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn truncate_marks_where_it_cut() {
+        assert_eq!(truncate("short", 100), "short");
+        assert_eq!(truncate("abcdefgh", 3), "abc\n[truncated]");
+    }
+
+    #[test]
+    fn truncate_does_not_split_a_character() {
+        // Budgets are in bytes but the cut counts chars, so a multi-byte
+        // reply is shortened rather than made invalid.
+        let text = "\u{00e9}\u{00e9}\u{00e9}\u{00e9}";
+        assert_eq!(truncate(text, 3), "\u{00e9}\u{00e9}\u{00e9}\n[truncated]");
     }
 
     #[test]
