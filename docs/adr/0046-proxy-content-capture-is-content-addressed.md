@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-08-18
+**Amended by:** [0048](./0048-tier-2-is-one-permission.md)
 
 ## Context
 

@@ -5,7 +5,9 @@ record here: what was decided, why, and what alternatives were considered and re
 
 Records are numbered in order and never renumbered or deleted. When a decision is later
 reversed, a new record supersedes it and the original is marked `Superseded by 00NN`, so
-the reasoning as it stood survives next to what replaced it.
+the reasoning as it stood survives next to what replaced it. When only part of a record is
+overturned and the rest still holds, the original keeps its status and is marked
+`Amended by 00NN` instead.
 
 | # | Title | Status | Date |
 |---|-------|--------|------|
@@ -56,6 +58,7 @@ the reasoning as it stood survives next to what replaced it.
 | [0045](./0045-a-policy-alert-is-not-a-command.md) | A Policy Alert Is Not a Command | Accepted | 2026-08-03 |
 | [0046](./0046-proxy-content-capture-is-content-addressed.md) | Proxy Content Capture Is a Content-Addressed Store on Disk | Accepted | 2026-08-18 |
 | [0047](./0047-message-identity-is-semantic.md) | Message Identity Is Semantic, and Threading Counts Its Own Misses | Accepted | 2026-08-18 |
+| [0048](./0048-tier-2-is-one-permission.md) | Tier 2 Is One Permission, Not Two Stores | Accepted | 2026-08-20 |
 
 ## Format
 
@@ -64,6 +67,7 @@ the reasoning as it stood survives next to what replaced it.
 
 **Status:** Accepted
 **Date:** YYYY-MM-DD
+**Amended by:** [00NN]   (optional, when a later record overturns part of this one)
 
 ## Context
 ## Decision
