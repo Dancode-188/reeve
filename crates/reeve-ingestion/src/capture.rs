@@ -14,12 +14,14 @@
 //! list of hashes it shares with the ninety-nine before it. Storage
 //! becomes linear in the conversation rather than in its turns.
 //!
-//! Captured content is read by a human during analysis. Nothing derived
-//! from it is ever computed into a feature or fed to a model.
+//! Where each file lands is decided in `reeve_storage::capture`, because
+//! the judge reads this store back and cannot reach into this crate.
+//! Everything about writing safely stays here.
 //!
 //! Writing happens on a blocking pool, detached from the request that
 //! produced it, because capture must never add latency to a live turn.
 
+use reeve_storage::capture::{message_name, message_path, round_path};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -114,10 +116,10 @@ impl Capture {
             "request": round.request,
             "response": round.response,
         });
-        // Millis first so the directory sorts chronologically; the span
-        // id keeps concurrent rounds from colliding.
-        let name = format!("{}-{}.json", round.started_at_ms, round.span_id);
-        write_atomic(&self.root.join("rounds").join(name), &record)
+        write_atomic(
+            &round_path(&self.root, round.started_at_ms, &round.span_id),
+            &record,
+        )
     }
 
     /// Writes one message under its fingerprint and returns the name to
@@ -125,7 +127,7 @@ impl Capture {
     /// hash is the identity, so a rewrite could only produce the same
     /// bytes.
     fn write_message(&self, hash: u64, msg: &serde_json::Value) -> std::io::Result<String> {
-        let name = format!("{hash:016x}");
+        let name = message_name(hash);
         if self
             .written
             .lock()
@@ -134,13 +136,12 @@ impl Capture {
         {
             return Ok(name);
         }
-        // Sharded by the first byte: a long-running corpus accumulates
-        // tens of thousands of these, and one flat directory of them is
-        // slow to list and unpleasant to browse by hand.
-        let dir = self.root.join("messages").join(&name[..2]);
-        let path = dir.join(format!("{name}.json"));
+        let path =
+            message_path(&self.root, &name).expect("message_name always produces a shardable name");
         if !path.exists() {
-            std::fs::create_dir_all(&dir)?;
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
             write_atomic(&path, msg)?;
         }
         self.written
@@ -213,6 +214,37 @@ mod tests {
         let stored: Vec<_> = walkdir(&dir.path().join("messages"));
         assert_eq!(stored.len(), 2, "one file per distinct message");
         assert_eq!(walkdir(&dir.path().join("rounds")).len(), 2);
+    }
+
+    /// The reader lives in another crate and the judge depends on the
+    /// two agreeing about where files land. ADR-0048 named that
+    /// coupling as the cost of giving this store a reader, so it gets a
+    /// test rather than a comment.
+    #[test]
+    fn what_is_written_here_is_what_the_judge_reads_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let capture = Capture::open(dir.path().to_path_buf()).expect("open");
+        capture
+            .write(round(
+                "609f06dfe14f78d4",
+                vec![
+                    serde_json::json!({ "role": "user", "content": "why is CI red" }),
+                    serde_json::json!({ "role": "assistant", "content": "checking" }),
+                ],
+                vec![0x11, 0x22],
+            ))
+            .expect("round");
+
+        let reader = reeve_storage::capture::CaptureReader::new(dir.path().to_path_buf());
+        let stored = reader
+            .round(1000, "609f06dfe14f78d4")
+            .expect("the reader addresses the file the writer chose");
+        assert_eq!(stored.reply(), Some("hi".to_string()));
+        assert_eq!(
+            reader.context(&stored, 8_000),
+            Some("user: why is CI red\n\nassistant: checking".to_string()),
+            "hashed message names resolve back to their content"
+        );
     }
 
     #[test]

@@ -140,17 +140,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // database, where the OTLP path stores the same content as span
     // events. Opened here, before anything is spawned, so an unusable
     // directory stops startup instead of quietly collecting nothing.
-    let capture = if privacy_tier >= 2 {
-        let dir = db_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("capture");
-        tracing::info!(path = %dir.display(), "capturing proxy round trips");
-        Some(std::sync::Arc::new(
-            reeve_ingestion::capture::Capture::open(dir)?,
-        ))
+    let capture_root = if privacy_tier >= 2 {
+        Some(
+            db_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("capture"),
+        )
     } else {
         None
+    };
+    let capture = match capture_root.clone() {
+        Some(dir) => {
+            tracing::info!(path = %dir.display(), "capturing proxy round trips");
+            Some(std::sync::Arc::new(
+                reeve_ingestion::capture::Capture::open(dir)?,
+            ))
+        }
+        None => None,
     };
     tokio::spawn(reeve_ingestion::serve(reeve_ingestion::IngestionConfig {
         addr,
@@ -195,15 +202,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // when it decides whether a fired rule has an action to offer. ADR-0045.
     let live_capabilities: reeve_model::entity::intervention::LiveCapabilities =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    tokio::spawn(reeve_engine::run(
-        engine_ingestion_rx,
-        engine_event_tx.clone(),
-        warm.clone(),
-        Some(dispatch_tx),
-        Some(applied_commands.clone()),
-        Some(reprobe_requested.clone()),
-        Some(live_capabilities.clone()),
-    ));
+    tokio::spawn(reeve_engine::run(reeve_engine::EngineConfig {
+        ingestion_rx: engine_ingestion_rx,
+        engine_tx: engine_event_tx.clone(),
+        warm: warm.clone(),
+        dispatch_tx: Some(dispatch_tx),
+        applied_commands: Some(applied_commands.clone()),
+        reprobe_requested: Some(reprobe_requested.clone()),
+        live_capabilities: Some(live_capabilities.clone()),
+        capture_root,
+    }));
     let control_server = reeve_intervention::server::run(
         engine_event_tx.clone(),
         ntp_offsets,

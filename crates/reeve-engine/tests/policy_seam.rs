@@ -87,15 +87,16 @@ async fn harness_with(
     let (dispatch_tx, dispatched) = mpsc::channel(16);
     let live_capabilities: LiveCapabilities = Arc::new(Mutex::new(live));
 
-    tokio::spawn(reeve_engine::run(
+    tokio::spawn(reeve_engine::run(reeve_engine::EngineConfig {
         ingestion_rx,
         engine_tx,
         warm,
-        Some(dispatch_tx),
-        None,
-        None,
-        Some(live_capabilities),
-    ));
+        dispatch_tx: Some(dispatch_tx),
+        applied_commands: None,
+        reprobe_requested: None,
+        live_capabilities: Some(live_capabilities),
+        capture_root: None,
+    }));
     // The engine probes its evaluation backend and loads rules before it
     // reads the first event; publishing into that gap loses the event.
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
