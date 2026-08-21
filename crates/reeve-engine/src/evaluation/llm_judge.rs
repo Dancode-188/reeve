@@ -70,8 +70,8 @@ struct OllamaGenerateResponse {
 pub struct JudgeResult {
     pub score: f64,
     pub confidence: EvaluationConfidence,
-    /// Populated for faithfulness and hallucination_detection when the model
-    /// returned the structured CoT format. Keys: claims, supported, unsupported.
+    /// Both sides of the consistency pair, under keys `a` and `b`. Either
+    /// may be null when that call fell through to a bare score.
     pub cot_json: Option<String>,
 }
 
@@ -181,9 +181,8 @@ impl LlmJudge {
     /// Returns `(metric_name, score, confidence, cot_json)` for each metric
     /// that produced a result. The two content metrics return nothing when
     /// neither the spans nor the capture store hold the reply, which is
-    /// every trace under privacy tier 1. `cot_json` is Some only for
-    /// faithfulness and hallucination_detection when the model returned
-    /// the structured CoT format.
+    /// every trace under privacy tier 1. `cot_json` is Some whenever either
+    /// half of the consistency pair came back with a justification.
     pub async fn evaluate_trace(
         &self,
         spans: &[InternalSpan],
@@ -298,7 +297,15 @@ impl LlmJudge {
         } else {
             EvaluationConfidence::Low
         };
-        let cot_json = cot_a.or(cot_b);
+        // Both sides are kept. The prompts are two phrasings of one
+        // question, so the pair of justifications carries something the
+        // averaged score cannot: matching reasoning under different wording
+        // means the model answered the shape of the request, not the turn.
+        let cot_json = if cot_a.is_none() && cot_b.is_none() {
+            None
+        } else {
+            Some(serde_json::json!({ "a": embed(cot_a), "b": embed(cot_b) }).to_string())
+        };
         Some(JudgeResult {
             score,
             confidence,
@@ -358,16 +365,30 @@ impl LlmJudge {
     }
 }
 
+/// Re-parses a stored fragment so a pair embeds as JSON rather than as two
+/// escaped strings.
+fn embed(cot: Option<String>) -> serde_json::Value {
+    cot.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
 fn parse_cot(text: &str) -> Option<(f64, String)> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let score = v.get("score")?.as_f64()?.clamp(0.0, 1.0);
+    let reason = v.get("reason").cloned().unwrap_or(serde_json::Value::Null);
     if v.get("claims").is_none() && v.get("supported").is_none() && v.get("unsupported").is_none() {
-        return None;
+        // The tool_selection prompts ask for score and reason only, so a
+        // response with no claim arrays is well formed rather than broken.
+        if reason.is_null() {
+            return None;
+        }
+        return Some((score, serde_json::json!({ "reason": reason }).to_string()));
     }
     let cot = serde_json::json!({
         "claims": v.get("claims").cloned().unwrap_or(serde_json::json!([])),
         "supported": v.get("supported").cloned().unwrap_or(serde_json::json!([])),
         "unsupported": v.get("unsupported").cloned().unwrap_or(serde_json::json!([])),
+        "reason": reason,
     });
     Some((score, cot.to_string()))
 }
@@ -498,8 +519,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_cot_returns_none_for_flat_format() {
+    fn parse_cot_keeps_reason_from_flat_format() {
         let json = r#"{"score": 0.8, "reason": "looks fine"}"#;
+        let (score, cot) = parse_cot(json).unwrap();
+        assert!((score - 0.8).abs() < 0.001);
+        let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
+        assert_eq!(v["reason"], "looks fine");
+    }
+
+    #[test]
+    fn parse_cot_returns_none_when_nothing_to_keep() {
+        let json = r#"{"score": 0.8}"#;
         assert!(parse_cot(json).is_none());
     }
 
@@ -516,7 +546,15 @@ mod tests {
         let (_, cot) = parse_cot(json).unwrap();
         let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
         assert!(v.get("extra").is_none());
-        assert!(v.get("reason").is_none());
+        assert_eq!(v["reason"], "r");
+    }
+
+    #[test]
+    fn embed_pairs_both_sides() {
+        let a = Some(r#"{"reason":"first"}"#.to_string());
+        let paired = serde_json::json!({ "a": embed(a), "b": embed(None) });
+        assert_eq!(paired["a"]["reason"], "first");
+        assert!(paired["b"].is_null());
     }
 
     #[test]
