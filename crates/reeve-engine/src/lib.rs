@@ -41,6 +41,11 @@ pub type AppliedCommands = Arc<std::sync::Mutex<Vec<AppliedCommand>>>;
 /// Same shared-state pattern as the NTP offset map and the paused set.
 pub type ReprobeRequested = Arc<std::sync::atomic::AtomicBool>;
 
+/// How many recent Tier 2 sampling scores are kept per agent. Five is
+/// enough for `is_score_stable` to see a trend without an old bad run
+/// holding the sampling rate up long after the agent recovered.
+const SCORE_HISTORY_WINDOW: usize = 5;
+
 /// Everything the run loop carries between events.
 ///
 /// It exists so the event arms can be methods. They touch sixteen values
@@ -304,7 +309,7 @@ impl EngineLoop {
         let history = self.score_histories.entry(agent_id.clone()).or_default();
         if let Some(score) = tier1_health {
             history.push_back(score);
-            if history.len() > 5 {
+            if history.len() > SCORE_HISTORY_WINDOW {
                 history.pop_front();
             }
         }
@@ -671,6 +676,36 @@ pub async fn run(config: EngineConfig) {
                 traces = restored,
                 agents = engine.fingerprints.len(),
                 "restored agent baselines"
+            );
+        }
+    }
+
+    {
+        let scores = warm
+            .recent_health_scores(SCORE_HISTORY_WINDOW)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to load score history from database");
+                vec![]
+            });
+        // A judged trace has its final_health_score blended across both
+        // tiers, so the replayed value is not exactly the Tier 1 number
+        // the live path pushed. The judge reaches a few percent of traces
+        // and this window holds five, so the difference is bounded, and
+        // cheaper than storing the Tier 1 score in its own column.
+        let restored = scores.len();
+        for (agent_id, score) in scores {
+            engine
+                .score_histories
+                .entry(agent_id)
+                .or_default()
+                .push_back(score);
+        }
+        if restored > 0 {
+            tracing::info!(
+                traces = restored,
+                agents = engine.score_histories.len(),
+                "restored tier 2 sampling history"
             );
         }
     }

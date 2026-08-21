@@ -951,6 +951,42 @@ impl WarmStore {
         .await
     }
 
+    /// The most recent `per_agent` health scores for every agent, oldest
+    /// first, for rebuilding the Tier 2 sampling window at boot. Traces
+    /// that were never scored are skipped rather than counted as zero,
+    /// which would read as a failing agent.
+    pub async fn recent_health_scores(
+        &self,
+        per_agent: usize,
+    ) -> Result<Vec<(AgentId, f64)>, StorageError> {
+        self.with_conn(move |conn| {
+            conn.prepare(
+                "SELECT agent_id, final_health_score
+                 FROM (
+                     SELECT agent_id,
+                            started_at,
+                            final_health_score,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY agent_id
+                                ORDER BY started_at DESC
+                            ) AS rn
+                     FROM traces
+                     WHERE final_health_score IS NOT NULL
+                 )
+                 WHERE rn <= ?1
+                 ORDER BY started_at ASC",
+            )?
+            .query_map(params![per_agent as i64], |row| {
+                Ok((
+                    AgentId::from(row.get::<_, String>(0)?),
+                    row.get::<_, f64>(1)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()
+        })
+        .await
+    }
+
     /// Spending totals for the Cost view: overall total with trace count,
     /// cost grouped by agent, and cost grouped by model, in one pass over
     /// span attributes. Spans without a model attribute group under
@@ -1805,6 +1841,54 @@ mod tests {
             .collect();
         assert_eq!(theirs.len(), 1, "the window is per agent, not overall");
         assert_eq!(theirs[0].max_end, Some(5));
+    }
+
+    #[tokio::test]
+    async fn health_scores_replay_oldest_first_and_skip_unscored_traces() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        insert_test_agent(&store, "agent-2").await;
+
+        // Saved out of arrival order, since the sampling rate reads the
+        // last entry as the current score.
+        for (id, start, score) in [("t-c", 30, 91.0), ("t-a", 10, 40.0), ("t-b", 20, 55.0)] {
+            let mut tr = trace(id);
+            tr.start_time = start;
+            store.save_trace(tr).await.unwrap();
+            store
+                .update_trace_health_score(&id.into(), score, 0.45)
+                .await
+                .unwrap();
+        }
+
+        // Never scored, so it is absent rather than a zero.
+        let mut unscored = trace("t-unscored");
+        unscored.start_time = 40;
+        store.save_trace(unscored).await.unwrap();
+
+        let mut other = trace("t-other");
+        other.agent_id = "agent-2".into();
+        other.start_time = 15;
+        store.save_trace(other).await.unwrap();
+        store
+            .update_trace_health_score(&"t-other".into(), 77.0, 0.45)
+            .await
+            .unwrap();
+
+        let scores = store.recent_health_scores(2).await.unwrap();
+        let mine: Vec<f64> = scores
+            .iter()
+            .filter(|(a, _)| a.as_str() == "agent-1")
+            .map(|(_, s)| *s)
+            .collect();
+        assert_eq!(mine, vec![55.0, 91.0], "window drops the oldest trace");
+
+        let theirs: Vec<f64> = scores
+            .iter()
+            .filter(|(a, _)| a.as_str() == "agent-2")
+            .map(|(_, s)| *s)
+            .collect();
+        assert_eq!(theirs, vec![77.0], "the window is per agent, not overall");
     }
 
     #[tokio::test]
