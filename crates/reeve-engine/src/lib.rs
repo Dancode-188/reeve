@@ -46,6 +46,31 @@ pub type ReprobeRequested = Arc<std::sync::atomic::AtomicBool>;
 /// holding the sampling rate up long after the agent recovered.
 const SCORE_HISTORY_WINDOW: usize = 5;
 
+/// How long a disabled evaluation backend waits before the first
+/// automatic re-probe, and the floor it returns to once one succeeds.
+/// One tick of the reprobe timer: the failure this is here for is a
+/// startup race lost by seconds.
+const AUTO_PROBE_MIN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The ceiling the automatic re-probe backs off to. A minute is short
+/// enough that starting Ollama mid-session feels like it just works,
+/// and long enough that a machine which will never have it is not
+/// making a request every two seconds for the life of the process.
+const AUTO_PROBE_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Doubling backoff for the automatic re-probe, reset by any success.
+/// Split out from the loop because the loop it lives in cannot be
+/// driven from a test.
+fn next_auto_probe_backoff(
+    current: std::time::Duration,
+    still_disabled: bool,
+) -> std::time::Duration {
+    if !still_disabled {
+        return AUTO_PROBE_MIN_BACKOFF;
+    }
+    (current * 2).min(AUTO_PROBE_MAX_BACKOFF)
+}
+
 /// Everything the run loop carries between events.
 ///
 /// It exists so the event arms can be methods. They touch sixteen values
@@ -723,6 +748,17 @@ pub async fn run(config: EngineConfig) {
     // developer is most likely to be starting Ollama.
     let mut reprobe_tick = tokio::time::interval(std::time::Duration::from_secs(2));
 
+    // A disabled backend also re-probes itself on that timer. The flag
+    // had exactly one writer, a keypress on the degraded banner, so an
+    // unattended cockpit stayed degraded for the life of the process
+    // even when the cause was Ollama losing a startup race by seconds
+    // (#331). The first automatic attempt is one tick away, which is
+    // the case worth catching quickly; from there the wait doubles to a
+    // minute so a machine that will never have Ollama costs one request
+    // a minute forever.
+    let mut auto_probe_backoff = AUTO_PROBE_MIN_BACKOFF;
+    let mut auto_probe_due = tokio::time::Instant::now() + auto_probe_backoff;
+
     // Budget resync: the tracker's ledger is fed by broadcast events,
     // and a lagged receiver drops them, so under load it silently
     // undercounts (#247). Every 30 seconds the settled figure is
@@ -788,7 +824,16 @@ pub async fn run(config: EngineConfig) {
                 let requested = reprobe_requested
                     .as_ref()
                     .is_some_and(|f| f.swap(false, std::sync::atomic::Ordering::Relaxed));
-                if requested {
+                // Disabled carries its reason, and the reason can change
+                // without the state doing so: a missing Ollama and a
+                // missing model are both disabled and want different
+                // words on the banner.
+                let previous = match &engine.judge.backend {
+                    llm_judge::JudgeBackend::Local { model, .. } => (false, model.clone()),
+                    llm_judge::JudgeBackend::Disabled { reason } => (true, reason.clone()),
+                };
+                let auto_due = previous.0 && tokio::time::Instant::now() >= auto_probe_due;
+                if requested || auto_due {
                     let backend = llm_judge::probe().await;
                     let (backend_name, backend_reason) = match &backend {
                         llm_judge::JudgeBackend::Local { model, .. } => {
@@ -798,14 +843,30 @@ pub async fn run(config: EngineConfig) {
                             ("disabled".to_string(), Some(reason.clone()))
                         }
                     };
-                    tracing::info!(backend = %backend_name, "evaluation backend re-probed");
-                    let _ = engine_tx.send(EngineEvent::EvaluationBackendReady {
-                        backend: backend_name,
-                        reason: backend_reason,
-                        privacy_tier: startup_privacy_tier,
-                    });
-                    engine.judge =
-                        Arc::new(LlmJudge::new(backend, engine.capture_root.clone()));
+                    let current = match &backend {
+                        llm_judge::JudgeBackend::Local { model, .. } => (false, model.clone()),
+                        llm_judge::JudgeBackend::Disabled { reason } => (true, reason.clone()),
+                    };
+                    auto_probe_backoff = next_auto_probe_backoff(auto_probe_backoff, current.0);
+                    auto_probe_due = tokio::time::Instant::now() + auto_probe_backoff;
+                    // A silent failed retry is the point. The renderer
+                    // writes an info line for every disabled event it is
+                    // handed, into a log that is never rotated, so an
+                    // unchanged answer stays here. A keypress is always
+                    // answered: the banner it raised is waiting for this
+                    // event and clears on nothing else.
+                    if current != previous || requested {
+                        tracing::info!(backend = %backend_name, "evaluation backend re-probed");
+                        let _ = engine_tx.send(EngineEvent::EvaluationBackendReady {
+                            backend: backend_name,
+                            reason: backend_reason,
+                            privacy_tier: startup_privacy_tier,
+                        });
+                    }
+                    if current != previous {
+                        engine.judge =
+                            Arc::new(LlmJudge::new(backend, engine.capture_root.clone()));
+                    }
                 }
                 continue;
             }
@@ -1071,9 +1132,47 @@ async fn run_tier2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn history(scores: &[f64]) -> VecDeque<f64> {
         scores.iter().copied().collect()
+    }
+
+    #[test]
+    fn auto_probe_backoff_doubles_to_a_ceiling() {
+        let mut wait = AUTO_PROBE_MIN_BACKOFF;
+        let mut seen = vec![wait];
+        for _ in 0..8 {
+            wait = next_auto_probe_backoff(wait, true);
+            seen.push(wait);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(32),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_probe_backoff_resets_on_success() {
+        // A backend that comes back after a long outage and drops out
+        // again should be retried promptly, not at the ceiling it had
+        // climbed to before.
+        let settled = next_auto_probe_backoff(AUTO_PROBE_MAX_BACKOFF, true);
+        assert_eq!(settled, AUTO_PROBE_MAX_BACKOFF);
+        assert_eq!(
+            next_auto_probe_backoff(settled, false),
+            AUTO_PROBE_MIN_BACKOFF
+        );
     }
 
     #[test]
