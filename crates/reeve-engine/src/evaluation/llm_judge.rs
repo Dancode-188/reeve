@@ -122,6 +122,22 @@ pub async fn probe() -> JudgeBackend {
     }
 }
 
+/// `reqwest::Error` renders the same string whether the request was
+/// refused, reset, or ran past the client timeout: the kind that
+/// separates them lives in `source()`, which `Display` never reaches.
+/// A judge dispatch that gives up is only worth logging if the line
+/// says which of those happened, so walk the chain.
+fn describe(e: reqwest::Error) -> String {
+    let mut out = e.to_string();
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+    while let Some(inner) = src {
+        out.push_str(": ");
+        out.push_str(&inner.to_string());
+        src = inner.source();
+    }
+    out
+}
+
 impl LlmJudge {
     pub fn new(backend: JudgeBackend, capture_root: Option<PathBuf>) -> Self {
         let client = Client::builder()
@@ -214,7 +230,7 @@ impl LlmJudge {
                 list
             );
             if let Some(r) = self
-                .run_with_consistency(endpoint, model, &prompt_a, &prompt_b)
+                .run_with_consistency(endpoint, model, "tool_selection", &prompt_a, &prompt_b)
                 .await
             {
                 results.push(("tool_selection", r.score, r.confidence, r.cot_json));
@@ -248,7 +264,7 @@ impl LlmJudge {
                 context, content, cot_schema
             );
             if let Some(r) = self
-                .run_with_consistency(endpoint, model, &faith_a, &faith_b)
+                .run_with_consistency(endpoint, model, "faithfulness", &faith_a, &faith_b)
                 .await
             {
                 results.push(("faithfulness", r.score, r.confidence, r.cot_json));
@@ -269,7 +285,7 @@ impl LlmJudge {
                 context, content, cot_schema
             );
             if let Some(r) = self
-                .run_with_consistency(endpoint, model, &hall_a, &hall_b)
+                .run_with_consistency(endpoint, model, "hallucination_detection", &hall_a, &hall_b)
                 .await
             {
                 results.push(("hallucination_detection", r.score, r.confidence, r.cot_json));
@@ -283,11 +299,16 @@ impl LlmJudge {
         &self,
         endpoint: &str,
         model: &str,
+        metric: &'static str,
         prompt_a: &str,
         prompt_b: &str,
     ) -> Option<JudgeResult> {
-        let (score_a, cot_a) = self.run_single(endpoint, model, prompt_a).await?;
-        let (score_b, cot_b) = self.run_single(endpoint, model, prompt_b).await?;
+        let (score_a, cot_a) = self
+            .run_single(endpoint, model, metric, "a", prompt_a)
+            .await?;
+        let (score_b, cot_b) = self
+            .run_single(endpoint, model, metric, "b", prompt_b)
+            .await?;
         let score = (score_a + score_b) / 2.0;
         let divergence = (score_a - score_b).abs();
         let confidence = if divergence < CONFIDENCE_HIGH_THRESHOLD {
@@ -317,8 +338,11 @@ impl LlmJudge {
         &self,
         endpoint: &str,
         model: &str,
+        metric: &'static str,
+        phrasing: &'static str,
         prompt: &str,
     ) -> Option<(f64, Option<String>)> {
+        let mut last_error = String::new();
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(2u64.pow(attempt - 1))).await;
@@ -326,13 +350,21 @@ impl LlmJudge {
             match self.call_ollama(endpoint, model, prompt).await {
                 Ok(result) => return Some(result),
                 Err(e) => {
-                    tracing::debug!(attempt, error = %e, "ollama call failed");
+                    tracing::debug!(attempt, metric, phrasing, error = %e, "ollama call failed");
+                    last_error = e;
                 }
             }
         }
+        // `phrasing` says whether the pair got halfway before giving
+        // up, and `prompt_chars` tells a backend that is down from one
+        // that is only too slow for a prompt this size.
         tracing::warn!(
-            "ollama eval exhausted {} retries, skipping metric",
-            MAX_RETRIES
+            metric,
+            phrasing,
+            attempts = MAX_RETRIES,
+            prompt_chars = prompt.len(),
+            error = %last_error,
+            "ollama eval exhausted retries, metric dropped"
         );
         None
     }
@@ -355,8 +387,8 @@ impl LlmJudge {
             .json(&body)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
-        let ollama_resp: OllamaGenerateResponse = resp.json().await.map_err(|e| e.to_string())?;
+            .map_err(describe)?;
+        let ollama_resp: OllamaGenerateResponse = resp.json().await.map_err(describe)?;
         let text = &ollama_resp.response;
         if let Some((score, cot)) = parse_cot(text) {
             return Ok((score, Some(cot)));
