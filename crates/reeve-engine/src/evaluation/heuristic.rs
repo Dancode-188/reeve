@@ -363,10 +363,18 @@ mod tests {
         // avg_duration_secs = 2.0; fast trace = 0.4s, average trace = 2s
         let fp = warmed_fp(1.0, 10.0, 2.0);
         let fast = LatencyNormalityEvaluator
-            .evaluate(&ctx(&[make_span("llm.call", 0, 400_000_000_i64)], 0.01, Some(&fp)))
+            .evaluate(&ctx(
+                &[make_span("llm.call", 0, 400_000_000_i64)],
+                0.01,
+                Some(&fp),
+            ))
             .unwrap();
         let average = LatencyNormalityEvaluator
-            .evaluate(&ctx(&[make_span("llm.call", 0, 2_000_000_000_i64)], 0.01, Some(&fp)))
+            .evaluate(&ctx(
+                &[make_span("llm.call", 0, 2_000_000_000_i64)],
+                0.01,
+                Some(&fp),
+            ))
             .unwrap();
         assert!(fast > average, "fast {fast} average {average}");
     }
