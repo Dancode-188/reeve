@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 // The composite health score uses five metrics. Three other evaluators
 // (fingerprint_deviation, intent_action_divergence, hallucination_detection)
-// produce EvaluationComplete events used by the policy engine and renderer
-// but do not factor into this score. They signal anomalies rather than
-// quality degradation, which the health score is designed to measure.
+// produce EvaluationComplete events the renderer displays but do not
+// factor into this score. They signal anomalies rather than quality
+// degradation, which the health score is designed to measure.
 // See ADR-0007, ADR-0020, and ADR-0021.
 const WEIGHTS: &[(&str, f64)] = &[
     ("faithfulness", 0.30),
