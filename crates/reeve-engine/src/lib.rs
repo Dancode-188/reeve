@@ -1030,15 +1030,23 @@ struct CostAccumulator {
     samples: VecDeque<(f64, i64)>,
 }
 
+/// A trace sitting exactly on both baselines scores 75.9, not 100, since the
+/// cost and latency gauges stopped scoring the average a perfect 1.0. These
+/// two thresholds are the old 60% and 80% of typical carried onto that scale,
+/// so the dispatch rate lands where it did before. The display bands have not
+/// moved; those are a separate call.
+const SAMPLE_ALL_BELOW: f64 = 45.5;
+const SAMPLE_LESS_ABOVE: f64 = 60.7;
+
 fn tier2_sample_rate(history: &VecDeque<f64>) -> f64 {
     let latest = match history.back() {
         Some(&s) => s,
         None => return 0.20,
     };
-    if latest < 60.0 {
+    if latest < SAMPLE_ALL_BELOW {
         return 1.0;
     }
-    if latest > 80.0 && is_score_stable(history) {
+    if latest > SAMPLE_LESS_ABOVE && is_score_stable(history) {
         return 0.10;
     }
     0.20
@@ -1190,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn rate_is_full_when_score_below_60() {
+    fn rate_is_full_when_score_below_the_floor() {
         let h = history(&[45.0]);
         assert!((tier2_sample_rate(&h) - 1.0).abs() < 0.001);
     }
@@ -1202,13 +1210,13 @@ mod tests {
     }
 
     #[test]
-    fn rate_is_low_when_stable_above_80() {
+    fn rate_is_low_when_stable_above_the_ceiling() {
         let h = history(&[82.0, 83.0, 84.0, 85.0, 86.0]);
         assert!((tier2_sample_rate(&h) - 0.10).abs() < 0.001);
     }
 
     #[test]
-    fn rate_is_default_when_above_80_but_unstable() {
+    fn rate_is_default_when_above_the_ceiling_but_unstable() {
         // Drop from 90 to 84 is a delta of 6 — unstable.
         let h = history(&[82.0, 90.0, 84.0, 85.0, 86.0]);
         assert!((tier2_sample_rate(&h) - 0.20).abs() < 0.001);
@@ -1216,7 +1224,7 @@ mod tests {
 
     #[test]
     fn rate_is_default_for_mid_range_stable_scores() {
-        let h = history(&[70.0, 71.0, 72.0]);
+        let h = history(&[50.0, 51.0, 52.0]);
         assert!((tier2_sample_rate(&h) - 0.20).abs() < 0.001);
     }
 

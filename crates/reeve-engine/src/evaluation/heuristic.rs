@@ -83,8 +83,11 @@ impl Evaluator for CostEfficiencyEvaluator {
             return None;
         }
         let ratio = ctx.cost / fp.avg_cost_per_trace;
-        // Score 1.0 at or below the average, 0.0 at double the average.
-        Some((2.0 - ratio).clamp(0.0, 1.0))
+        // Fraction of the tolerance budget left: 1.0 at zero cost, 0.5 at the
+        // average, 0.0 at double it. Scoring the average 1.0 put most traces
+        // on the ceiling, because cost is right skewed and most of them sit
+        // below the mean.
+        Some((1.0 - ratio / 2.0).clamp(0.0, 1.0))
     }
 }
 
@@ -105,8 +108,11 @@ impl Evaluator for LatencyNormalityEvaluator {
         // OTel timestamps are nanoseconds.
         let duration_secs = max_end.saturating_sub(min_start).max(0) as f64 / 1e9;
         let ratio = duration_secs / fp.avg_duration_secs;
-        // Score 1.0 at or below average, 0.0 at 3× average.
-        Some((1.0 - (ratio - 1.0).max(0.0) / 2.0).clamp(0.0, 1.0))
+        // Same tolerance budget as cost, with a wider tolerance: 1.0 at zero
+        // duration, two thirds at the average, 0.0 at three times it. The
+        // `.max(0.0)` this replaces discarded the whole below-average half
+        // before the clamp ever saw it.
+        Some((1.0 - ratio / 3.0).clamp(0.0, 1.0))
     }
 }
 
@@ -312,12 +318,24 @@ mod tests {
     }
 
     #[test]
-    fn cost_efficiency_at_baseline_scores_one() {
+    fn cost_efficiency_at_baseline_scores_half() {
         let fp = warmed_fp(1.0, 10.0, 2.0);
         let score = CostEfficiencyEvaluator
             .evaluate(&ctx(&[], 1.0, Some(&fp)))
             .unwrap();
-        assert!((score - 1.0).abs() < 0.01);
+        assert!((score - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn cost_efficiency_separates_cheap_from_average() {
+        let fp = warmed_fp(1.0, 10.0, 2.0);
+        let cheap = CostEfficiencyEvaluator
+            .evaluate(&ctx(&[], 0.2, Some(&fp)))
+            .unwrap();
+        let average = CostEfficiencyEvaluator
+            .evaluate(&ctx(&[], 1.0, Some(&fp)))
+            .unwrap();
+        assert!(cheap > average, "cheap {cheap} average {average}");
     }
 
     #[test]
@@ -330,14 +348,27 @@ mod tests {
     }
 
     #[test]
-    fn latency_normality_within_baseline_scores_one() {
+    fn latency_normality_at_baseline_scores_two_thirds() {
         // avg_duration_secs = 2.0; trace duration = 2s = 2_000_000_000 ns
         let fp = warmed_fp(1.0, 10.0, 2.0);
         let spans = vec![make_span("llm.call", 0, 2_000_000_000_i64)];
         let score = LatencyNormalityEvaluator
             .evaluate(&ctx(&spans, 0.01, Some(&fp)))
             .unwrap();
-        assert!((score - 1.0).abs() < 0.01);
+        assert!((score - 2.0 / 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn latency_normality_separates_fast_from_average() {
+        // avg_duration_secs = 2.0; fast trace = 0.4s, average trace = 2s
+        let fp = warmed_fp(1.0, 10.0, 2.0);
+        let fast = LatencyNormalityEvaluator
+            .evaluate(&ctx(&[make_span("llm.call", 0, 400_000_000_i64)], 0.01, Some(&fp)))
+            .unwrap();
+        let average = LatencyNormalityEvaluator
+            .evaluate(&ctx(&[make_span("llm.call", 0, 2_000_000_000_i64)], 0.01, Some(&fp)))
+            .unwrap();
+        assert!(fast > average, "fast {fast} average {average}");
     }
 
     #[test]
