@@ -141,6 +141,12 @@ impl EngineLoop {
 
         let fp = self.fingerprints.get(&agent_id);
 
+        // Whether any of this was the agent working. Client helper calls
+        // still settle their cost below, because they are real money and
+        // real latency; what they must not do is move a health score, an
+        // agent baseline, or the Tier 2 sample rate. Issue #340.
+        let agent_work = is_agent_work(&spans);
+
         let ctx = TraceContext {
             trace_id: trace_id.clone(),
             agent_id: agent_id.clone(),
@@ -152,16 +158,18 @@ impl EngineLoop {
 
         let mut metric_scores: HashMap<&str, f64> = HashMap::new();
 
-        for evaluator in &self.evaluators {
-            if let Some(score) = evaluator.evaluate(&ctx) {
-                let _ = self.engine_tx.send(EngineEvent::EvaluationComplete {
-                    trace_id: trace_id.clone(),
-                    span_id: None,
-                    metric: evaluator.name().to_string(),
-                    score,
-                    confidence: None,
-                });
-                metric_scores.insert(evaluator.name(), score);
+        if agent_work {
+            for evaluator in &self.evaluators {
+                if let Some(score) = evaluator.evaluate(&ctx) {
+                    let _ = self.engine_tx.send(EngineEvent::EvaluationComplete {
+                        trace_id: trace_id.clone(),
+                        span_id: None,
+                        metric: evaluator.name().to_string(),
+                        score,
+                        confidence: None,
+                    });
+                    metric_scores.insert(evaluator.name(), score);
+                }
             }
         }
 
@@ -215,14 +223,17 @@ impl EngineLoop {
                 .await;
         }
 
-        self.fingerprints
-            .entry(agent_id.clone())
-            .or_default()
-            .update(span_count, cost, duration_secs);
+        let rate = if agent_work {
+            self.fingerprints
+                .entry(agent_id.clone())
+                .or_default()
+                .update(span_count, cost, duration_secs);
 
-        let rate = self
-            .record_outcomes(&agent_id, tier1_health, span_count)
-            .await;
+            self.record_outcomes(&agent_id, tier1_health, span_count)
+                .await
+        } else {
+            0.0
+        };
 
         // Tier 2 runs asynchronously after Tier 1 completes. Tier 1
         // always runs; only the Tier 2 spawn is gated by the sample rate.
@@ -230,7 +241,7 @@ impl EngineLoop {
             .iter()
             .map(|(k, v)| (k.to_string(), *v))
             .collect();
-        if rand::random::<f64>() < rate {
+        if agent_work && rand::random::<f64>() < rate {
             tokio::spawn(run_tier2(
                 trace_id.clone(),
                 agent_id.clone(),
@@ -1030,6 +1041,59 @@ struct CostAccumulator {
     samples: VecDeque<(f64, i64)>,
 }
 
+/// Output cap, in tokens, at or below which a request cannot plausibly be
+/// an agent working. Real turns ask for 8192 or 64000 and the client's own
+/// helper calls ask for 64 or fewer, so the line sits in a gap two orders
+/// of magnitude wide and nothing observed lands near it.
+const HELPER_MAX_OUTPUT_TOKENS: i64 = 256;
+
+/// Whether a trace is the agent doing work, as opposed to the client
+/// talking to the model on its own account.
+///
+/// Clients multiplex their own calls onto the same proxy. Claude Code
+/// runs a severity classifier and warms connections with a one token
+/// request, and both arrive here as ordinary traces that score close to
+/// 100 because there is nothing in them to go wrong.
+///
+/// Only the spans that actually record a request get a say. A trace also
+/// carries a synthesized turn span with no attributes on it, and reading
+/// that as evidence of anything is what the first cut of this got wrong.
+/// A trace where nothing recorded a request is agent work by default,
+/// which covers spans arriving off the proxy and the case where the
+/// spans failed to load at all: absent evidence must never set a trace
+/// aside.
+fn is_agent_work(spans: &[InternalSpan]) -> bool {
+    let mut saw_a_request = false;
+    for helper in spans.iter().filter_map(request_is_helper) {
+        saw_a_request = true;
+        if !helper {
+            return true;
+        }
+    }
+    !saw_a_request
+}
+
+/// `None` when the span records no request, otherwise whether that
+/// request was a client helper call.
+///
+/// The test is a conjunction on purpose. Offering no tools is on its own
+/// too weak, since a compaction summary offers none either and is real
+/// work; capping the output alone would be too weak for the same reason
+/// in reverse. It takes both signals agreeing before a trace is set
+/// aside.
+fn request_is_helper(span: &InternalSpan) -> Option<bool> {
+    let max_tokens = span
+        .raw_attributes
+        .get("reeve.request.max_tokens")
+        .and_then(serde_json::Value::as_i64)?;
+    let tools = span
+        .raw_attributes
+        .get("reeve.request.tools")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    Some(max_tokens <= HELPER_MAX_OUTPUT_TOKENS && tools == 0)
+}
+
 /// A trace sitting exactly on both baselines scores 75.9, not 100, since the
 /// cost and latency gauges stopped scoring the average a perfect 1.0. These
 /// two thresholds are the old 60% and 80% of typical carried onto that scale,
@@ -1144,6 +1208,82 @@ mod tests {
 
     fn history(scores: &[f64]) -> VecDeque<f64> {
         scores.iter().copied().collect()
+    }
+
+    /// A span the proxy synthesizes to close the turn. It records no
+    /// request, which is the shape that broke the first cut of this.
+    fn turn_span() -> InternalSpan {
+        span_asking(None, None)
+    }
+
+    fn span_asking(max_tokens: Option<i64>, tools: Option<i64>) -> InternalSpan {
+        let mut raw: HashMap<String, serde_json::Value> = HashMap::new();
+        if let Some(m) = max_tokens {
+            raw.insert("reeve.request.max_tokens".into(), m.into());
+        }
+        if let Some(t) = tools {
+            raw.insert("reeve.request.tools".into(), t.into());
+        }
+        InternalSpan {
+            id: "s1".into(),
+            trace_id: "t1".into(),
+            parent_id: None,
+            operation: "chat".to_string(),
+            status: reeve_model::entity::span::SpanStatus::Completed,
+            start_time: 0,
+            end_time: Some(1000),
+            arrived_at: 0,
+            attributes: serde_json::Value::Null,
+            raw_attributes: raw,
+        }
+    }
+
+    #[test]
+    fn a_capped_toolless_request_is_not_the_agent() {
+        // The client's severity classifier: 64 output tokens, no tools,
+        // beside the turn span every trace carries.
+        let spans = vec![span_asking(Some(64), None), turn_span()];
+        assert!(!is_agent_work(&spans));
+        // And the one token connection warmup.
+        assert!(!is_agent_work(&[
+            span_asking(Some(1), Some(0)),
+            turn_span()
+        ]));
+    }
+
+    #[test]
+    fn a_span_recording_no_request_is_not_evidence() {
+        // The turn span must not vote. Alone it leaves the trace counted,
+        // and beside a helper call it must not rescue it.
+        assert!(is_agent_work(&[turn_span()]));
+        assert!(!is_agent_work(&[turn_span(), span_asking(Some(64), None)]));
+    }
+
+    #[test]
+    fn one_real_round_makes_the_whole_trace_agent_work() {
+        let spans = vec![
+            span_asking(Some(64), None),
+            span_asking(Some(64000), Some(105)),
+            span_asking(Some(64), None),
+            turn_span(),
+        ];
+        assert!(is_agent_work(&spans));
+    }
+
+    #[test]
+    fn either_signal_alone_leaves_a_trace_counted() {
+        // A compaction summary offers no tools but asks for real output.
+        assert!(is_agent_work(&[span_asking(Some(8192), None)]));
+        // A tool-bearing request stays agent work whatever its cap.
+        assert!(is_agent_work(&[span_asking(Some(64), Some(105))]));
+    }
+
+    #[test]
+    fn absent_evidence_never_sets_a_trace_aside() {
+        // Spans that did not come through the proxy carry neither key.
+        assert!(is_agent_work(&[span_asking(None, Some(0))]));
+        // Nor does a trace whose spans failed to load.
+        assert!(is_agent_work(&[]));
     }
 
     #[test]
