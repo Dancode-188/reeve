@@ -59,6 +59,7 @@ overturned and the rest still holds, the original keeps its status and is marked
 | [0046](./0046-proxy-content-capture-is-content-addressed.md) | Proxy Content Capture Is a Content-Addressed Store on Disk | Accepted | 2026-08-18 |
 | [0047](./0047-message-identity-is-semantic.md) | Message Identity Is Semantic, and Threading Counts Its Own Misses | Accepted | 2026-08-18 |
 | [0048](./0048-tier-2-is-one-permission.md) | Tier 2 Is One Permission, Not Two Stores | Accepted | 2026-08-20 |
+| [0049](./0049-a-timed-out-judge-call-is-not-retried.md) | A Judge Call That Ran Out of Time Is Not Retried | Accepted | 2026-08-25 |
 
 ## Format
 

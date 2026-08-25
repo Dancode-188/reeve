@@ -24,6 +24,21 @@ use std::time::Duration;
 const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 const OLLAMA_MODEL: &str = "phi4-mini";
 const MAX_RETRIES: u32 = 3;
+/// How long one evaluation call is given before the client hangs up.
+///
+/// Fifteen minutes. The old thirty seconds cut faithfulness and
+/// hallucination detection off before either could answer; ADR-0049
+/// holds the measurements behind it. Two things this number is not: a
+/// limit on how much judging happens, which the Tier 2 sample rate
+/// decides, and a liveness check, which `probe` runs on its own three
+/// second deadline against `/api/tags`.
+const EVAL_TIMEOUT: Duration = Duration::from_secs(900);
+/// How long the backend should hold the model between calls.
+///
+/// One dispatch is six calls and traces arrive in bursts, so on the
+/// default idle unload the first call of every burst pays for a reload
+/// before it answers anything.
+const MODEL_KEEP_ALIVE: &str = "10m";
 const CONFIDENCE_HIGH_THRESHOLD: f64 = 0.10;
 const CONFIDENCE_MEDIUM_THRESHOLD: f64 = 0.30;
 /// How much of a captured round is allowed into a prompt.
@@ -127,7 +142,8 @@ pub async fn probe() -> JudgeBackend {
 /// separates them lives in `source()`, which `Display` never reaches.
 /// A judge dispatch that gives up is only worth logging if the line
 /// says which of those happened, so walk the chain.
-fn describe(e: reqwest::Error) -> String {
+fn describe(e: reqwest::Error) -> CallError {
+    let timed_out = e.is_timeout();
     let mut out = e.to_string();
     let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
     while let Some(inner) = src {
@@ -135,13 +151,27 @@ fn describe(e: reqwest::Error) -> String {
         out.push_str(&inner.to_string());
         src = inner.source();
     }
-    out
+    CallError {
+        detail: out,
+        timed_out,
+    }
+}
+
+/// Why one call failed, and whether asking again could change the
+/// answer.
+struct CallError {
+    detail: String,
+    /// The client gave up on work the backend had not finished.
+    /// Sending the same prompt again buys nothing: whatever made it
+    /// slow is still in the prompt, and a second ask pays for it
+    /// twice.
+    timed_out: bool,
 }
 
 impl LlmJudge {
     pub fn new(backend: JudgeBackend, capture_root: Option<PathBuf>) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(EVAL_TIMEOUT)
             .build()
             .unwrap_or_else(|_| Client::new());
         Self {
@@ -208,7 +238,12 @@ impl LlmJudge {
             JudgeBackend::Disabled { .. } => return vec![],
         };
 
-        let cot_schema = r#"{"claims": ["<each factual claim in the response>"], "supported": ["<claims grounded in context>"], "unsupported": ["<claims not grounded in context>"], "score": <0.0-1.0>, "reason": "<explanation>"}"#;
+        // The claims are written out once and then pointed at by
+        // position. Asking for them three times over made the model
+        // copy every claim twice more, which is generation this
+        // backend charges for by the token and which went wrong more
+        // often than the indices do.
+        let cot_schema = r#"{"claims": ["<each factual claim in the response>"], "supported": [<indices of grounded claims>], "unsupported": [<indices of ungrounded claims>], "score": <0.0-1.0>, "reason": "<explanation>"}"#;
 
         let mut results = Vec::new();
 
@@ -343,15 +378,30 @@ impl LlmJudge {
         prompt: &str,
     ) -> Option<(f64, Option<String>)> {
         let mut last_error = String::new();
+        let mut attempts = 0;
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(2u64.pow(attempt - 1))).await;
             }
+            attempts = attempt + 1;
             match self.call_ollama(endpoint, model, prompt).await {
                 Ok(result) => return Some(result),
                 Err(e) => {
-                    tracing::debug!(attempt, metric, phrasing, error = %e, "ollama call failed");
-                    last_error = e;
+                    tracing::debug!(
+                        attempt,
+                        metric,
+                        phrasing,
+                        timed_out = e.timed_out,
+                        error = %e.detail,
+                        "ollama call failed"
+                    );
+                    last_error = e.detail;
+                    // A prompt that ran past the ceiling will run past
+                    // it again. The retries are there for a backend
+                    // that flaked, not for one that is thinking.
+                    if e.timed_out {
+                        break;
+                    }
                 }
             }
         }
@@ -361,10 +411,10 @@ impl LlmJudge {
         tracing::warn!(
             metric,
             phrasing,
-            attempts = MAX_RETRIES,
+            attempts,
             prompt_chars = prompt.len(),
             error = %last_error,
-            "ollama eval exhausted retries, metric dropped"
+            "ollama eval gave up, metric dropped"
         );
         None
     }
@@ -374,12 +424,13 @@ impl LlmJudge {
         endpoint: &str,
         model: &str,
         prompt: &str,
-    ) -> Result<(f64, Option<String>), String> {
+    ) -> Result<(f64, Option<String>), CallError> {
         let body = serde_json::json!({
             "model": model,
             "prompt": prompt,
             "stream": false,
-            "format": "json"
+            "format": "json",
+            "keep_alive": MODEL_KEEP_ALIVE
         });
         let resp = self
             .client
@@ -393,7 +444,12 @@ impl LlmJudge {
         if let Some((score, cot)) = parse_cot(text) {
             return Ok((score, Some(cot)));
         }
-        parse_score(text).map(|s| (s, None))
+        parse_score(text)
+            .map(|s| (s, None))
+            .map_err(|detail| CallError {
+                detail,
+                timed_out: false,
+            })
     }
 }
 
@@ -404,9 +460,45 @@ fn embed(cot: Option<String>) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
+/// A number, however the model chose to spell it.
+///
+/// Asked for a bare number a small model will sometimes answer with
+/// the string form of one, and a metric is too expensive here to drop
+/// over the quotes around it.
+fn lenient_f64(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str()?.trim().parse().ok())
+}
+
+/// Turn a list of positions into the claims they point at.
+///
+/// The stored shape still carries the claim text on both sides, so
+/// nothing downstream needs to know the wire form changed. A model that
+/// answered with the text rather than the position has still answered
+/// the question and keeps its entry; a position that lands nowhere is
+/// dropped, because a claim Reeve cannot name is not evidence.
+fn resolve(idx: Option<&serde_json::Value>, claims: &[serde_json::Value]) -> serde_json::Value {
+    let Some(arr) = idx.and_then(|v| v.as_array()) else {
+        return serde_json::json!([]);
+    };
+    let picked: Vec<serde_json::Value> = arr
+        .iter()
+        .filter_map(|i| {
+            if let Some(n) = lenient_f64(i) {
+                if n >= 0.0 {
+                    if let Some(claim) = claims.get(n as usize) {
+                        return Some(claim.clone());
+                    }
+                }
+            }
+            i.as_str().map(|_| i.clone())
+        })
+        .collect();
+    serde_json::Value::Array(picked)
+}
+
 fn parse_cot(text: &str) -> Option<(f64, String)> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    let score = v.get("score")?.as_f64()?.clamp(0.0, 1.0);
+    let score = lenient_f64(v.get("score")?)?.clamp(0.0, 1.0);
     let reason = v.get("reason").cloned().unwrap_or(serde_json::Value::Null);
     if v.get("claims").is_none() && v.get("supported").is_none() && v.get("unsupported").is_none() {
         // The tool_selection prompts ask for score and reason only, so a
@@ -416,10 +508,15 @@ fn parse_cot(text: &str) -> Option<(f64, String)> {
         }
         return Some((score, serde_json::json!({ "reason": reason }).to_string()));
     }
+    let claims: Vec<serde_json::Value> = v
+        .get("claims")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
     let cot = serde_json::json!({
-        "claims": v.get("claims").cloned().unwrap_or(serde_json::json!([])),
-        "supported": v.get("supported").cloned().unwrap_or(serde_json::json!([])),
-        "unsupported": v.get("unsupported").cloned().unwrap_or(serde_json::json!([])),
+        "claims": claims,
+        "supported": resolve(v.get("supported"), &claims),
+        "unsupported": resolve(v.get("unsupported"), &claims),
         "reason": reason,
     });
     Some((score, cot.to_string()))
@@ -427,7 +524,7 @@ fn parse_cot(text: &str) -> Option<(f64, String)> {
 
 fn parse_score(text: &str) -> Result<f64, String> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
-        if let Some(score) = v.get("score").and_then(|s| s.as_f64()) {
+        if let Some(score) = v.get("score").and_then(lenient_f64) {
             return Ok(score.clamp(0.0, 1.0));
         }
     }
@@ -587,6 +684,49 @@ mod tests {
         let paired = serde_json::json!({ "a": embed(a), "b": embed(None) });
         assert_eq!(paired["a"]["reason"], "first");
         assert!(paired["b"].is_null());
+    }
+
+    #[test]
+    fn parse_cot_resolves_indices_to_claim_text() {
+        // The schema asks for positions now. What gets stored is still
+        // the claim itself, so nothing downstream sees the change.
+        let json = r#"{"claims":["sky is blue","grass is purple"],"supported":[0],"unsupported":[1],"score":0.5,"reason":"half"}"#;
+        let (score, cot) = parse_cot(json).unwrap();
+        assert!((score - 0.5).abs() < 0.001);
+        let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
+        assert_eq!(v["supported"], serde_json::json!(["sky is blue"]));
+        assert_eq!(v["unsupported"], serde_json::json!(["grass is purple"]));
+    }
+
+    #[test]
+    fn parse_cot_takes_a_number_spelled_as_a_string() {
+        let json = r#"{"claims":["a","b"],"supported":["1"],"unsupported":[],"score":"0.75","reason":"r"}"#;
+        let (score, cot) = parse_cot(json).unwrap();
+        assert!((score - 0.75).abs() < 0.001);
+        let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
+        assert_eq!(v["supported"], serde_json::json!(["b"]));
+    }
+
+    #[test]
+    fn parse_cot_keeps_a_claim_answered_as_text() {
+        // The old shape, and what the model still does sometimes.
+        let json = r#"{"claims":["sky is blue"],"supported":["sky is blue"],"unsupported":[],"score":1.0,"reason":"r"}"#;
+        let (_, cot) = parse_cot(json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
+        assert_eq!(v["supported"], serde_json::json!(["sky is blue"]));
+    }
+
+    #[test]
+    fn parse_cot_drops_an_index_that_lands_nowhere() {
+        let json = r#"{"claims":["only one"],"supported":[0,7],"unsupported":[],"score":1.0,"reason":"r"}"#;
+        let (_, cot) = parse_cot(json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
+        assert_eq!(v["supported"], serde_json::json!(["only one"]));
+    }
+
+    #[test]
+    fn parse_score_takes_a_number_spelled_as_a_string() {
+        assert_eq!(parse_score(r#"{"score":"0.4"}"#).unwrap(), 0.4);
     }
 
     #[test]

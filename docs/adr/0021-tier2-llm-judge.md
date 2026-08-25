@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-06-30
+**Amended by:** [0049](./0049-a-timed-out-judge-call-is-not-retried.md)
 
 ## Context
 
