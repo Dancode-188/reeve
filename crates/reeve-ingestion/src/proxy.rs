@@ -1367,20 +1367,33 @@ fn request_attributes(json: &serde_json::Value) -> Vec<KeyValue> {
 /// is also what makes an operator correction detectable at all, since a
 /// correction is by definition a human message that follows one.
 ///
-/// Only the last message is examined: it is the one this request is
-/// asking about, and walking the rest would cost more than the proxy's
-/// entire overhead.
+/// The message carrying that difference is not always the last one. The
+/// client can append its own after the tool results, and a trailing
+/// `system` message is the shape that arrives in practice, so reading
+/// only the last message sends a third of real turns to `unknown`. The
+/// search runs backwards to the nearest `user` message instead, bounded
+/// so the cost stays flat rather than growing with the conversation.
+/// `reeve.request.last_role` still reports the true final role, which is
+/// what makes an appended message visible at all.
 fn turn_shape_attributes(json: &serde_json::Value) -> Vec<KeyValue> {
-    let Some(last) = json
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .and_then(|m| m.last())
-    else {
+    /// Well clear of the single step every appended message has needed
+    /// so far, and short enough that the walk is a constant.
+    const LOOKBACK: usize = 4;
+
+    let Some(messages) = json.get("messages").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
-    let role = last.get("role").and_then(|v| v.as_str()).unwrap_or("");
-    let tool_results = last
-        .get("content")
+    let Some(last) = messages.last() else {
+        return Vec::new();
+    };
+    let last_role = last.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    let subject = messages
+        .iter()
+        .rev()
+        .take(LOOKBACK)
+        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"));
+    let tool_results = subject
+        .and_then(|m| m.get("content"))
         .and_then(|c| c.as_array())
         .map(|blocks| {
             blocks
@@ -1389,14 +1402,14 @@ fn turn_shape_attributes(json: &serde_json::Value) -> Vec<KeyValue> {
                 .count()
         })
         .unwrap_or(0);
-    let kind = match (role, tool_results) {
-        ("user", 0) => "human",
-        ("user", _) => "tool_loop",
-        _ => "unknown",
+    let kind = match (subject, tool_results) {
+        (None, _) => "unknown",
+        (Some(_), 0) => "human",
+        (Some(_), _) => "tool_loop",
     };
     vec![
         kv_str("reeve.request.turn_kind", kind),
-        kv_str("reeve.request.last_role", role),
+        kv_str("reeve.request.last_role", last_role),
         kv_int("reeve.request.tool_results", tool_results as i64),
     ]
 }
@@ -2667,6 +2680,41 @@ data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"more"}}
         let attrs = request_attributes(&loop_step);
         assert_eq!(as_str(&attrs, "reeve.request.turn_kind"), Some("tool_loop"));
         assert_eq!(as_int(&attrs, "reeve.request.tool_results"), Some(2));
+    }
+
+    #[test]
+    fn a_message_appended_after_the_tool_returns_does_not_hide_them() {
+        let json = serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": [{"type": "text", "text": "checking"}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "a", "content": "ok"},
+                ]},
+                {"role": "system", "content": "keep going"},
+            ],
+        });
+        let attrs = request_attributes(&json);
+        assert_eq!(as_str(&attrs, "reeve.request.turn_kind"), Some("tool_loop"));
+        assert_eq!(as_int(&attrs, "reeve.request.tool_results"), Some(1));
+        // The appended message is still reported, since it is the only
+        // way to notice the client has started doing this.
+        assert_eq!(as_str(&attrs, "reeve.request.last_role"), Some("system"));
+    }
+
+    #[test]
+    fn a_turn_with_no_user_message_within_reach_stays_unknown() {
+        let json = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "go"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "a"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "b"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "c"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "d"}]},
+            ],
+        });
+        let attrs = request_attributes(&json);
+        assert_eq!(as_str(&attrs, "reeve.request.turn_kind"), Some("unknown"));
+        assert_eq!(as_int(&attrs, "reeve.request.tool_results"), Some(0));
     }
 
     #[test]
