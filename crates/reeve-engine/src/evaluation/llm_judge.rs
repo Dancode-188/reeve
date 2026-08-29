@@ -762,10 +762,53 @@ fn parse_score(text: &str) -> Result<f64, String> {
             return Ok(v.clamp(0.0, 1.0));
         }
     }
-    Err(format!(
-        "could not parse score: {}",
-        text.chars().take(120).collect::<String>()
-    ))
+    Err(describe_shape(text))
+}
+
+/// Why a response could not be read as a score, in its shape rather
+/// than its words.
+///
+/// The excerpt this replaces was 120 characters of whatever the backend
+/// returned, and on the content metrics that is a claim list extracted
+/// from a captured conversation. It reached `reeve.log`, which nothing
+/// rotates and which is not the store every rule about captured content
+/// is written about, and since judge attempts began being recorded it
+/// reaches a table as well.
+///
+/// Dropping it costs nothing that was being used. Every parse failure
+/// this judge has produced was a degenerate response rather than a long
+/// one: an empty object, a single brace, a payload cut off mid key, or
+/// the right JSON under the wrong schema. The shape names all four, and
+/// the excerpt named none of them any better. The only names emitted
+/// here are the ones this crate asks for, so a model that invents a key
+/// is counted and not quoted.
+fn describe_shape(text: &str) -> String {
+    let len = text.len();
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(v) => {
+            let keys = v.as_object().map(|o| o.len()).unwrap_or(0);
+            let mut known: Vec<&str> = Vec::new();
+            for name in ["score", "reason", "claims", "supported", "unsupported"] {
+                if v.get(name).is_some() {
+                    known.push(name);
+                }
+            }
+            let known = if known.is_empty() {
+                "none of the asked-for fields".to_string()
+            } else {
+                format!("carrying {}", known.join(", "))
+            };
+            let plural = if keys == 1 { "key" } else { "keys" };
+            format!(
+                "no score in a {len} char response: valid JSON, {keys} top level {plural}, {known}"
+            )
+        }
+        Err(e) => format!(
+            "no score in a {len} char response: not JSON, parse stopped at line {} column {}",
+            e.line(),
+            e.column()
+        ),
+    }
 }
 
 fn extract_tool_calls(spans: &[InternalSpan]) -> Vec<String> {
@@ -994,6 +1037,40 @@ mod tests {
     fn parse_score_no_score_returns_err() {
         let r = parse_score("I cannot evaluate this trace.");
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn a_failed_parse_says_nothing_the_model_said() {
+        // The response is built out of words that would be obvious in a
+        // log line if any of them survived.
+        let secret = r#"{"finding": "the deployment key lives in vault at prod/api"}"#;
+        let msg = parse_score(secret).expect_err("no score here");
+        for word in ["deployment", "vault", "prod", "finding"] {
+            assert!(!msg.contains(word), "{word} survived into {msg}");
+        }
+        assert!(msg.contains("valid JSON"));
+        assert!(msg.contains("1 top level key,"));
+        assert!(msg.contains("none of the asked-for fields"));
+    }
+
+    #[test]
+    fn a_truncated_response_says_where_it_stopped() {
+        // Every parse failure in the log so far has been a payload cut
+        // off partway, and where it stopped is the whole diagnosis. The
+        // cut lands before the score, which is why there is nothing for
+        // the prose fallback to rescue.
+        let msg = parse_score(r#"{"reason": "the tools were"#).expect_err("truncated");
+        assert!(msg.contains("not JSON"), "{msg}");
+        assert!(msg.contains("line 1"), "{msg}");
+    }
+
+    #[test]
+    fn the_shape_names_the_fields_this_crate_asked_for() {
+        // A response that used the right schema and still had no score
+        // is a different failure from one that used a schema of its own,
+        // and the counts alone cannot tell them apart.
+        let msg = parse_score(r#"{"reason": "unsure", "claims": []}"#).expect_err("no score");
+        assert!(msg.contains("carrying reason, claims"), "{msg}");
     }
 
     #[test]
