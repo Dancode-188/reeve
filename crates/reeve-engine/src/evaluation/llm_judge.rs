@@ -282,6 +282,12 @@ impl LlmJudge {
             JudgeBackend::Disabled { .. } => return vec![],
         };
 
+        // Every judge call carries the trace it is grading. Without it a
+        // dropped metric is readable only in aggregate: the give-up line
+        // says which metric died and how big its prompt was, but not
+        // which turn lost a score, so the two cannot be joined.
+        let trace_id = spans.first().map(|s| s.trace_id.as_str()).unwrap_or("");
+
         // The claims are written out once and then pointed at by
         // position. Asking for them three times over made the model
         // copy every claim twice more, which is generation this
@@ -391,7 +397,14 @@ impl LlmJudge {
                 ),
             };
             if let Some(r) = self
-                .run_with_consistency(endpoint, model, "tool_selection", &prompt_a, &prompt_b)
+                .run_with_consistency(
+                    endpoint,
+                    model,
+                    trace_id,
+                    "tool_selection",
+                    &prompt_a,
+                    &prompt_b,
+                )
                 .await
             {
                 results.push(("tool_selection", r.score, r.confidence, r.cot_json));
@@ -416,7 +429,14 @@ impl LlmJudge {
                 context, content, cot_schema
             );
             if let Some(r) = self
-                .run_with_consistency(endpoint, model, "faithfulness", &faith_a, &faith_b)
+                .run_with_consistency(
+                    endpoint,
+                    model,
+                    trace_id,
+                    "faithfulness",
+                    &faith_a,
+                    &faith_b,
+                )
                 .await
             {
                 results.push(("faithfulness", r.score, r.confidence, r.cot_json));
@@ -437,7 +457,14 @@ impl LlmJudge {
                 context, content, cot_schema
             );
             if let Some(r) = self
-                .run_with_consistency(endpoint, model, "hallucination_detection", &hall_a, &hall_b)
+                .run_with_consistency(
+                    endpoint,
+                    model,
+                    trace_id,
+                    "hallucination_detection",
+                    &hall_a,
+                    &hall_b,
+                )
                 .await
             {
                 results.push(("hallucination_detection", r.score, r.confidence, r.cot_json));
@@ -451,15 +478,16 @@ impl LlmJudge {
         &self,
         endpoint: &str,
         model: &str,
+        trace_id: &str,
         metric: &'static str,
         prompt_a: &str,
         prompt_b: &str,
     ) -> Option<JudgeResult> {
         let (score_a, cot_a) = self
-            .run_single(endpoint, model, metric, "a", prompt_a)
+            .run_single(endpoint, model, trace_id, metric, "a", prompt_a)
             .await?;
         let (score_b, cot_b) = self
-            .run_single(endpoint, model, metric, "b", prompt_b)
+            .run_single(endpoint, model, trace_id, metric, "b", prompt_b)
             .await?;
         let score = (score_a + score_b) / 2.0;
         let divergence = (score_a - score_b).abs();
@@ -490,19 +518,37 @@ impl LlmJudge {
         &self,
         endpoint: &str,
         model: &str,
+        trace_id: &str,
         metric: &'static str,
         phrasing: &'static str,
         prompt: &str,
     ) -> Option<(f64, Option<String>)> {
         let mut last_error = String::new();
         let mut attempts = 0;
+        let started = std::time::Instant::now();
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(2u64.pow(attempt - 1))).await;
             }
             attempts = attempt + 1;
             match self.call_ollama(endpoint, model, prompt).await {
-                Ok(result) => return Some(result),
+                Ok(result) => {
+                    // Logged on the way out of every call that returned,
+                    // not only the ones that failed. A give-up rate on its
+                    // own cannot say whether a backend is slow for every
+                    // prompt or only for large ones, because the calls that
+                    // succeeded are exactly the evidence missing from it.
+                    tracing::info!(
+                        trace_id,
+                        metric,
+                        phrasing,
+                        attempts,
+                        prompt_chars = prompt.len(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "ollama eval completed"
+                    );
+                    return Some(result);
+                }
                 Err(e) => {
                     tracing::debug!(
                         attempt,
@@ -526,10 +572,12 @@ impl LlmJudge {
         // up, and `prompt_chars` tells a backend that is down from one
         // that is only too slow for a prompt this size.
         tracing::warn!(
+            trace_id,
             metric,
             phrasing,
             attempts,
             prompt_chars = prompt.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
             error = %last_error,
             "ollama eval gave up, metric dropped"
         );
