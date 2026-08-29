@@ -90,20 +90,8 @@ impl CaptureReader {
             // drops the head once the budget is spent, so a hole is the
             // same kind of loss as the cut, and a partial context still
             // grounds the reply better than none.
-            let resolved = match entry.as_str() {
-                Some(name) => {
-                    let Some(path) = message_path(&self.root, name) else {
-                        continue;
-                    };
-                    match std::fs::read(path)
-                        .ok()
-                        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                    {
-                        Some(v) => v,
-                        None => continue,
-                    }
-                }
-                None => entry.clone(),
+            let Some(resolved) = self.resolve(entry) else {
+                continue;
             };
             let Some(text) = render_message(&resolved) else {
                 continue;
@@ -126,6 +114,62 @@ impl CaptureReader {
         }
         kept.reverse();
         Some(kept.join("\n\n"))
+    }
+
+    /// What the agent was last actually asked to do, or `None` when the
+    /// turn holds nothing but tool traffic and the client talking to
+    /// itself.
+    ///
+    /// This is the newest user message that is not tool output, with
+    /// the client's injected blocks taken out, and the walk keeps going
+    /// back when a message strips to nothing. It is returned whole:
+    /// one message is not a budgeted walk, and cutting it to fit a
+    /// prompt is the caller's business along with the marker that cut
+    /// leaves behind.
+    ///
+    /// It exists because the end of a conversation is the wrong place
+    /// to look for the goal. Across 400 tool calling rounds in a real
+    /// corpus the last 1,500 characters held the standing instruction
+    /// half the time; when they missed it, it sat a median of twelve
+    /// messages further back, under the tool output that displaced it.
+    pub fn instruction(&self, round: &CapturedRound) -> Option<String> {
+        let messages = round.value.get("request")?.get("messages")?.as_array()?;
+        for entry in messages.iter().rev() {
+            let Some(resolved) = self.resolve(entry) else {
+                continue;
+            };
+            if resolved.get("role").and_then(|r| r.as_str()) != Some("user") {
+                continue;
+            }
+            let Some(content) = resolved.get("content") else {
+                continue;
+            };
+            if holds_tool_result(content) {
+                continue;
+            }
+            let Some(text) = block_text(content) else {
+                continue;
+            };
+            let stripped = strip_injections(&text);
+            let stripped = stripped.trim();
+            if !stripped.is_empty() {
+                return Some(stripped.to_string());
+            }
+        }
+        None
+    }
+
+    /// One entry from a round's message list, which is either a name
+    /// pointing into the store or the message written inline.
+    fn resolve(&self, entry: &serde_json::Value) -> Option<serde_json::Value> {
+        match entry.as_str() {
+            Some(name) => {
+                let path = message_path(&self.root, name)?;
+                let bytes = std::fs::read(path).ok()?;
+                serde_json::from_slice(&bytes).ok()
+            }
+            None => Some(entry.clone()),
+        }
     }
 }
 
@@ -156,6 +200,52 @@ fn block_text(content: &serde_json::Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Whether a message is the client handing tool output back. Decided
+/// on block type and not on role, because the API carries these in the
+/// user turn and none of it is the user speaking.
+fn holds_tool_result(content: &serde_json::Value) -> bool {
+    content.as_array().is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+    })
+}
+
+/// Takes the client's own blocks back out of a user message.
+///
+/// Claude Code writes context reminders and a running token banner into
+/// the user turn. They are the client addressing the model, not the
+/// operator addressing the agent, and in a sample of tool calling
+/// rounds they were the entire newest user message about one time in
+/// twenty. Left in, they are what tool choice gets judged against.
+fn strip_injections(text: &str) -> String {
+    let mut out = text.to_string();
+    for (open, close) in [
+        ("<system-reminder>", "</system-reminder>"),
+        ("<total_tokens>", "</total_tokens>"),
+    ] {
+        out = strip_spans(&out, open, close);
+    }
+    out
+}
+
+/// Drops every `open`..`close` span. An opener with no closer keeps
+/// what follows it, because throwing away the rest of a message over
+/// one malformed tag loses far more than it removes.
+fn strip_spans(text: &str, open: &str, close: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(open) {
+        let Some(end) = rest[start + open.len()..].find(close) else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        rest = &rest[start + open.len() + end + close.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn render_message(msg: &serde_json::Value) -> Option<String> {
@@ -306,6 +396,95 @@ mod tests {
         let reader = CaptureReader::new(dir.path().to_path_buf());
         let round = reader.round(1000, "abc").expect("round");
         assert_eq!(reader.context(&round, 10), Some("user: a to".to_string()));
+    }
+
+    #[test]
+    fn the_instruction_is_the_newest_thing_the_operator_said() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &round_path(dir.path(), 1000, "abc"),
+            serde_json::json!({"request": {"messages": [
+                {"role": "user", "content": "find the leak"},
+                {"role": "assistant", "content": "on it"},
+                {"role": "user", "content": "actually start with the tests"},
+                {"role": "assistant", "content": "running them"},
+                {"role": "user", "content": [{"type": "tool_result", "content": "42 passed"}]},
+            ]}}),
+        );
+        let reader = CaptureReader::new(dir.path().to_path_buf());
+        let round = reader.round(1000, "abc").expect("round");
+        assert_eq!(
+            reader.instruction(&round),
+            Some("actually start with the tests".to_string())
+        );
+    }
+
+    #[test]
+    fn the_instruction_walks_past_a_message_that_is_all_client_chatter() {
+        // The turn the metric cares about often ends with the client
+        // topping up its own context, and that is not an instruction
+        // even though it arrives in the user role.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &round_path(dir.path(), 1000, "abc"),
+            serde_json::json!({"request": {"messages": [
+                {"role": "user", "content": "ship the release"},
+                {"role": "assistant", "content": "starting"},
+                {"role": "user", "content": "<system-reminder>be careful</system-reminder>"},
+            ]}}),
+        );
+        let reader = CaptureReader::new(dir.path().to_path_buf());
+        let round = reader.round(1000, "abc").expect("round");
+        assert_eq!(
+            reader.instruction(&round),
+            Some("ship the release".to_string())
+        );
+    }
+
+    #[test]
+    fn injections_come_out_of_an_instruction_that_also_says_something() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &round_path(dir.path(), 1000, "abc"),
+            serde_json::json!({"request": {"messages": [{"role": "user", "content":
+                "<system-reminder>context</system-reminder>rerun it<total_tokens>900</total_tokens>"
+            }]}}),
+        );
+        let reader = CaptureReader::new(dir.path().to_path_buf());
+        let round = reader.round(1000, "abc").expect("round");
+        assert_eq!(reader.instruction(&round), Some("rerun it".to_string()));
+    }
+
+    #[test]
+    fn an_unclosed_injection_does_not_swallow_the_instruction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &round_path(dir.path(), 1000, "abc"),
+            serde_json::json!({"request": {"messages": [
+                {"role": "user", "content": "<system-reminder>truncated mid tag rerun it"},
+            ]}}),
+        );
+        let reader = CaptureReader::new(dir.path().to_path_buf());
+        let round = reader.round(1000, "abc").expect("round");
+        assert_eq!(
+            reader.instruction(&round),
+            Some("<system-reminder>truncated mid tag rerun it".to_string())
+        );
+    }
+
+    #[test]
+    fn a_turn_of_pure_tool_traffic_has_no_instruction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &round_path(dir.path(), 1000, "abc"),
+            serde_json::json!({"request": {"messages": [
+                {"role": "assistant", "content": "calling grep"},
+                {"role": "user", "content": [{"type": "tool_result", "content": "no matches"}]},
+            ]}}),
+        );
+        let reader = CaptureReader::new(dir.path().to_path_buf());
+        let round = reader.round(1000, "abc").expect("round");
+        assert_eq!(reader.instruction(&round), None);
     }
 
     #[test]
