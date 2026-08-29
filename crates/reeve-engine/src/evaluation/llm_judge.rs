@@ -1111,12 +1111,15 @@ mod tests {
             captured.instruction.as_deref(),
             Some("find out why CI is red")
         );
+        // The context ends on the tool result, which is the point: the
+        // instruction is four messages back, and the end of the
+        // conversation is the agent working rather than being asked.
         assert!(
             captured
                 .context
                 .as_deref()
                 .expect("context")
-                .ends_with("assistant: reading the run log")
+                .ends_with("user: [result: 504 lines]")
         );
     }
 

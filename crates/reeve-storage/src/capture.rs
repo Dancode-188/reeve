@@ -55,6 +55,26 @@ pub struct CapturedRound {
     value: serde_json::Value,
 }
 
+/// How tool traffic is rendered into a judge context.
+///
+/// `WithTools` is what ships. `TextOnly` is the rule that used to,
+/// kept because a replay needs to render the old context to have
+/// anything to compare the new one against, and `CappedTools` is a
+/// candidate that measurement has not justified: over the stored
+/// corpus it moved the budget share by under a point at the median and
+/// at both the tenth and twenty fifth percentile, so it buys nothing
+/// while the budget is the binding constraint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextMode {
+    /// Only `text` blocks. Superseded, and kept as a replay baseline.
+    TextOnly,
+    /// Tool calls with their arguments, and tool results whole.
+    WithTools,
+    /// Tool calls with their arguments, and each tool result cut to a
+    /// per block cap so one large result cannot spend the whole budget.
+    CappedTools(usize),
+}
+
 impl CaptureReader {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
@@ -80,7 +100,30 @@ impl CaptureReader {
     /// arbitrary slice of it. Which end to keep is a real choice and
     /// not a storage detail, so the budget belongs to the caller, who
     /// also documents why it is the size it is.
+    ///
+    /// Tool calls and their results are rendered. They were dropped
+    /// once, on the reasoning that a call is not prose, and that
+    /// removed most of the conversation: over the stored corpus the
+    /// text only rule deleted about two thirds of all messages, and
+    /// what it deleted was every action the agent took and every piece
+    /// of evidence it got back. A grader asked whether a reply was
+    /// grounded, or whether the right tool was chosen, was being shown
+    /// the talking and none of the doing. Replay confirms no budget
+    /// repairs this: a known tool result stayed absent from the
+    /// rendered context at four times the shipping budget and at
+    /// sixteen, because the filter runs before the budget is ever
+    /// consulted.
     pub fn context(&self, round: &CapturedRound, budget: usize) -> Option<String> {
+        self.context_with(round, budget, ContextMode::WithTools)
+    }
+
+    /// `context`, with the rendering rule named by the caller.
+    pub fn context_with(
+        &self,
+        round: &CapturedRound,
+        budget: usize,
+        mode: ContextMode,
+    ) -> Option<String> {
         let messages = round.value.get("request")?.get("messages")?.as_array()?;
         let mut kept: Vec<String> = Vec::new();
         let mut used = 0usize;
@@ -93,7 +136,7 @@ impl CaptureReader {
             let Some(resolved) = self.resolve(entry) else {
                 continue;
             };
-            let Some(text) = render_message(&resolved) else {
+            let Some(text) = render_message(&resolved, mode) else {
                 continue;
             };
             if used + text.len() > budget {
@@ -185,8 +228,11 @@ impl CapturedRound {
 }
 
 /// Anthropic content, which is a bare string on one path and a list of
-/// typed blocks on the other. Only `text` blocks are joined: a tool call
-/// is not prose and reads as noise inside a faithfulness prompt.
+/// typed blocks on the other. Only `text` blocks are joined.
+///
+/// This is the superseded rule. It is reachable only through
+/// `ContextMode::TextOnly`, which exists so a replay can render what
+/// the judge used to be shown and measure the difference.
 fn block_text(content: &serde_json::Value) -> Option<String> {
     match content {
         serde_json::Value::String(s) => Some(s.clone()),
@@ -248,13 +294,79 @@ fn strip_spans(text: &str, open: &str, close: &str) -> String {
     out
 }
 
-fn render_message(msg: &serde_json::Value) -> Option<String> {
+fn render_message(msg: &serde_json::Value, mode: ContextMode) -> Option<String> {
     let role = msg
         .get("role")
         .and_then(|r| r.as_str())
         .unwrap_or("unknown");
-    let text = block_text(msg.get("content")?)?;
+    let text = match mode {
+        ContextMode::TextOnly => block_text(msg.get("content")?)?,
+        ContextMode::WithTools => block_text_with_tools(msg.get("content")?, None)?,
+        ContextMode::CappedTools(cap) => block_text_with_tools(msg.get("content")?, Some(cap))?,
+    };
     (!text.trim().is_empty()).then(|| format!("{role}: {text}"))
+}
+
+/// `block_text`, plus the tool traffic it drops.
+///
+/// A call is rendered with its arguments because the arguments are
+/// what a tool choice is judged on, and a result is rendered because it
+/// is the evidence a reply is grounded in. `cap` cuts each result
+/// separately rather than cutting the conversation, so one large result
+/// costs one large result instead of every message older than it.
+fn block_text_with_tools(content: &serde_json::Value, cap: Option<usize>) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(blocks) => {
+            let mut parts: Vec<String> = Vec::new();
+            for b in blocks {
+                let kind = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match kind {
+                    "text" => {
+                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                            parts.push(t.to_string());
+                        }
+                    }
+                    "tool_use" => {
+                        let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                        let args = b
+                            .get("input")
+                            .map(|i| i.to_string())
+                            .unwrap_or_else(|| "{}".to_string());
+                        parts.push(format!("[calls {name} with {args}]"));
+                    }
+                    "tool_result" => {
+                        let body = b.get("content").map(nested_text).unwrap_or_default();
+                        parts.push(match cap {
+                            Some(n) if body.chars().count() > n => {
+                                let head: String = body.chars().take(n).collect();
+                                let total = body.chars().count();
+                                format!("[result, {total} chars, first {n}: {head}]")
+                            }
+                            _ => format!("[result: {body}]"),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Some(parts.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+/// The text inside a `tool_result`, which the API carries as a bare
+/// string on one path and as a block list on the other.
+fn nested_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +508,72 @@ mod tests {
         let reader = CaptureReader::new(dir.path().to_path_buf());
         let round = reader.round(1000, "abc").expect("round");
         assert_eq!(reader.context(&round, 10), Some("user: a to".to_string()));
+    }
+
+    #[test]
+    fn context_renders_the_calls_and_the_results_they_returned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &round_path(dir.path(), 1000, "abc"),
+            serde_json::json!({"request": {"messages": [
+                {"role": "user", "content": "who owns the retry budget"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "checking"},
+                    {"type": "tool_use", "name": "grep", "input": {"pattern": "retry"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "content": "llm_judge.rs:517 holds it"},
+                ]},
+            ]}}),
+        );
+        let reader = CaptureReader::new(dir.path().to_path_buf());
+        let round = reader.round(1000, "abc").expect("round");
+        let ctx = reader.context(&round, 8_000).expect("context");
+        assert!(ctx.contains("[calls grep with {\"pattern\":\"retry\"}]"));
+        assert!(ctx.contains("[result: llm_judge.rs:517 holds it]"));
+        assert!(ctx.contains("checking"));
+    }
+
+    #[test]
+    fn the_superseded_rule_still_renders_nothing_but_text() {
+        // The replay compares the shipping rule against the one it
+        // replaced, so the old rendering has to keep working to be
+        // worth comparing against. This pins it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &round_path(dir.path(), 1000, "abc"),
+            serde_json::json!({"request": {"messages": [
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "checking"},
+                    {"type": "tool_use", "name": "grep", "input": {"pattern": "retry"}},
+                ]},
+            ]}}),
+        );
+        let reader = CaptureReader::new(dir.path().to_path_buf());
+        let round = reader.round(1000, "abc").expect("round");
+        assert_eq!(
+            reader.context_with(&round, 8_000, ContextMode::TextOnly),
+            Some("assistant: checking".to_string())
+        );
+    }
+
+    #[test]
+    fn a_capped_result_says_how_much_it_is_not_showing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &round_path(dir.path(), 1000, "abc"),
+            serde_json::json!({"request": {"messages": [
+                {"role": "user", "content": [
+                    {"type": "tool_result", "content": "0123456789abcdef"},
+                ]},
+            ]}}),
+        );
+        let reader = CaptureReader::new(dir.path().to_path_buf());
+        let round = reader.round(1000, "abc").expect("round");
+        assert_eq!(
+            reader.context_with(&round, 8_000, ContextMode::CappedTools(4)),
+            Some("user: [result, 16 chars, first 4: 0123]".to_string())
+        );
     }
 
     #[test]
