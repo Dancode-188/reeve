@@ -1,8 +1,9 @@
 use reeve_model::entity::policy::{PolicyRule, RuleScope};
 use reeve_model::entity::{
-    Agent, AgentStatus, CommandStatus, CommandType, EvaluationResult, EvaluatorType, EventType,
-    IntegrationPath, InternalSpan, InterventionCommand, InterventionOutcome, SpanEvent, SpanNote,
-    SpanStatus, TargetType, Trace, TraceStatus,
+    Agent, AgentStatus, AttemptOutcome, CommandStatus, CommandType, EvaluationResult,
+    EvaluatorType, EventType, IntegrationPath, InternalSpan, InterventionCommand,
+    InterventionOutcome, JudgeAttempt, SpanEvent, SpanNote, SpanStatus, TargetType, Trace,
+    TraceStatus,
 };
 use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, SpanId, TraceId};
 use reeve_model::signal::EvaluationConfidence;
@@ -71,6 +72,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, include_str!("../migrations/0005_resumable_traces.sql")),
     (6, include_str!("../migrations/0006_indices.sql")),
     (7, include_str!("../migrations/0007_score_provenance.sql")),
+    (8, include_str!("../migrations/0008_judge_attempts.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -192,6 +194,19 @@ fn row_to_evaluation_result(row: &Row) -> rusqlite::Result<EvaluationResult> {
             .map(|c| text_to_enum::<EvaluationConfidence>(&c))
             .transpose()
             .map_err(rusqlite_serde_err)?,
+    })
+}
+
+fn row_to_judge_attempt(row: &Row) -> rusqlite::Result<JudgeAttempt> {
+    let outcome: String = row.get("outcome")?;
+    Ok(JudgeAttempt {
+        id: row.get::<_, String>("id")?.into(),
+        trace_id: row.get("trace_id")?,
+        metric: row.get("metric")?,
+        outcome: text_to_enum::<AttemptOutcome>(&outcome).map_err(rusqlite_serde_err)?,
+        reason: row.get("reason")?,
+        attempted_at: row.get("attempted_at")?,
+        judge_model_version: row.get("judge_model_version")?,
     })
 }
 
@@ -824,6 +839,55 @@ impl WarmStore {
                 ],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Records that a metric was dispatched, whatever came back.
+    ///
+    /// Written for every dispatched metric including the ones that
+    /// scored, because a drop rate needs the calls that worked to mean
+    /// anything. `INSERT OR REPLACE` because the id is derived from the
+    /// trace and the metric, so a re-grade of the same pair supersedes
+    /// its earlier attempt rather than accumulating beside it.
+    pub async fn save_judge_attempt(&self, attempt: JudgeAttempt) -> Result<(), StorageError> {
+        let outcome = enum_to_text(&attempt.outcome)?;
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO judge_attempts
+                    (id, trace_id, metric, outcome, reason, attempted_at, judge_model_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    attempt.id.as_str(),
+                    attempt.trace_id,
+                    attempt.metric,
+                    outcome,
+                    attempt.reason,
+                    attempt.attempted_at,
+                    attempt.judge_model_version,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Every metric dispatched for a trace, in the order it was tried.
+    /// Read against `list_evaluations_for_trace` this is what turns an
+    /// absent score into a stated reason.
+    pub async fn list_judge_attempts_for_trace(
+        &self,
+        trace_id: &TraceId,
+    ) -> Result<Vec<JudgeAttempt>, StorageError> {
+        let trace_id = trace_id.clone();
+        self.with_conn(move |conn| {
+            conn.prepare(
+                "SELECT * FROM judge_attempts
+                 WHERE trace_id = ?1
+                 ORDER BY attempted_at",
+            )?
+            .query_map(params![trace_id.as_str()], row_to_judge_attempt)?
+            .collect()
         })
         .await
     }
@@ -2221,6 +2285,103 @@ mod tests {
         assert_eq!(loaded.score, 0.9);
         assert_eq!(loaded.cot_json.as_deref(), Some(cot));
         assert_eq!(loaded.confidence, Some(EvaluationConfidence::High));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_metric_is_recorded_with_the_reason_it_dropped() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t1")).await.unwrap();
+
+        for (id, metric, outcome, reason) in [
+            ("a1", "faithfulness", AttemptOutcome::Scored, None),
+            (
+                "a2",
+                "hallucination_detection",
+                AttemptOutcome::NoVerdict,
+                Some("timed out after 900s"),
+            ),
+            (
+                "a3",
+                "tool_selection",
+                AttemptOutcome::HalfPair,
+                Some("connection refused"),
+            ),
+        ] {
+            store
+                .save_judge_attempt(JudgeAttempt {
+                    id: id.into(),
+                    trace_id: "t1".to_string(),
+                    metric: metric.to_string(),
+                    outcome,
+                    reason: reason.map(str::to_string),
+                    attempted_at: 10,
+                    judge_model_version: Some("phi4-mini".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+
+        let loaded = store
+            .list_judge_attempts_for_trace(&TraceId::from("t1"))
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 3);
+        // The point of the table: the two that produced no score are
+        // still here, and each says which of the two ways it failed.
+        let dropped: Vec<_> = loaded
+            .iter()
+            .filter(|a| a.outcome != AttemptOutcome::Scored)
+            .map(|a| (a.metric.as_str(), a.outcome, a.reason.as_deref()))
+            .collect();
+        assert_eq!(
+            dropped,
+            vec![
+                (
+                    "hallucination_detection",
+                    AttemptOutcome::NoVerdict,
+                    Some("timed out after 900s")
+                ),
+                (
+                    "tool_selection",
+                    AttemptOutcome::HalfPair,
+                    Some("connection refused")
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn re_grading_a_metric_supersedes_its_earlier_attempt() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t1")).await.unwrap();
+
+        for (outcome, reason) in [
+            (AttemptOutcome::NoVerdict, Some("connection refused")),
+            (AttemptOutcome::Scored, None),
+        ] {
+            store
+                .save_judge_attempt(JudgeAttempt {
+                    id: "t1-faithfulness".into(),
+                    trace_id: "t1".to_string(),
+                    metric: "faithfulness".to_string(),
+                    outcome,
+                    reason: reason.map(str::to_string),
+                    attempted_at: 10,
+                    judge_model_version: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let loaded = store
+            .list_judge_attempts_for_trace(&TraceId::from("t1"))
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].outcome, AttemptOutcome::Scored);
+        assert_eq!(loaded[0].reason, None);
     }
 
     #[tokio::test]
