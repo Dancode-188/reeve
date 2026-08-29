@@ -15,7 +15,7 @@ use policy::dsl::PolicyContext;
 use policy::{PolicyEngine, alert_fields};
 use reeve_model::capability::AgentReach;
 use reeve_model::entity::agent::IntegrationPath;
-use reeve_model::entity::evaluation::{EvaluationResult, EvaluatorType, TargetType};
+use reeve_model::entity::evaluation::{EvaluationResult, EvaluatorType, JudgeAttempt, TargetType};
 use reeve_model::entity::intervention::{
     AppliedCommand, CommandStatus, CommandType, InterventionCommand, LiveCapabilities,
 };
@@ -1134,7 +1134,8 @@ async fn run_tier2(
     warm: Arc<WarmStore>,
     judge: Arc<LlmJudge>,
 ) {
-    let results = judge.evaluate_trace(&spans).await;
+    let run = judge.evaluate_trace(&spans).await;
+    let results = &run.results;
 
     let model_version = match &judge.backend {
         llm_judge::JudgeBackend::Local { model, .. } => Some(model.clone()),
@@ -1142,7 +1143,26 @@ async fn run_tier2(
     };
     let now = current_ms();
 
-    for (metric, score, confidence, cot_json) in &results {
+    // Written before the results, so a crash between the two leaves a
+    // dispatch with no score rather than a score with no dispatch. The
+    // first is the state this table exists to describe; the second
+    // would be a row claiming a metric was never tried when it was.
+    for (metric, outcome, reason) in &run.attempts {
+        let attempt = JudgeAttempt {
+            id: EvalId::from(format!("{}-{}", trace_id, metric)),
+            trace_id: trace_id.to_string(),
+            metric: metric.to_string(),
+            outcome: *outcome,
+            reason: reason.clone(),
+            attempted_at: now,
+            judge_model_version: model_version.clone(),
+        };
+        if let Err(e) = warm.save_judge_attempt(attempt).await {
+            tracing::warn!(error = %e, metric, "failed to persist judge attempt");
+        }
+    }
+
+    for (metric, score, confidence, cot_json) in results {
         let _ = engine_tx.send(EngineEvent::EvaluationComplete {
             trace_id: trace_id.clone(),
             span_id: None,
@@ -1173,7 +1193,7 @@ async fn run_tier2(
     // the health score value.
     let mut all_scores: HashMap<&str, f64> =
         tier1_scores.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-    for (metric, score, confidence, _) in &results {
+    for (metric, score, confidence, _) in results {
         if *confidence != EvaluationConfidence::Low {
             all_scores.insert(metric, *score);
         }

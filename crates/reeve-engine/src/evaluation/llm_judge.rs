@@ -13,6 +13,7 @@
 // Tier 1 still scores one metric of three, and now that is the tier
 // gate doing its job rather than a gap nobody had noticed.
 
+use reeve_model::entity::AttemptOutcome;
 use reeve_model::entity::span::InternalSpan;
 use reeve_model::signal::EvaluationConfidence;
 use reeve_storage::capture::CaptureReader;
@@ -132,6 +133,37 @@ pub struct JudgeResult {
     /// Both sides of the consistency pair, under keys `a` and `b`. Either
     /// may be null when that call fell through to a bare score.
     pub cot_json: Option<String>,
+}
+
+/// What one metric's dispatch produced: the verdict when there was
+/// one, and in every case the outcome and the reason behind it.
+#[derive(Debug, Clone)]
+struct MetricAttempt {
+    outcome: AttemptOutcome,
+    reason: Option<String>,
+    result: Option<JudgeResult>,
+}
+
+impl MetricAttempt {
+    fn dropped(outcome: AttemptOutcome, reason: String) -> Self {
+        Self {
+            outcome,
+            reason: Some(reason),
+            result: None,
+        }
+    }
+}
+
+/// One pass of the judge over one trace.
+///
+/// `results` is what scored. `attempts` is every metric that reached a
+/// dispatch, scored or not, and it is deliberately not derivable from
+/// `results`: a metric absent from both was never dispatched, which is
+/// a different thing from one that was dispatched and came back empty.
+#[derive(Debug, Clone, Default)]
+pub struct JudgeRun {
+    pub results: Vec<(&'static str, f64, EvaluationConfidence, Option<String>)>,
+    pub attempts: Vec<(&'static str, AttemptOutcome, Option<String>)>,
 }
 
 /// Probe for Ollama at the default endpoint. Returns the appropriate backend.
@@ -268,18 +300,21 @@ impl LlmJudge {
     }
 
     /// Run all three Tier 2 evaluators against the completed trace spans.
-    /// Returns `(metric_name, score, confidence, cot_json)` for each metric
-    /// that produced a result. The two content metrics return nothing when
-    /// neither the spans nor the capture store hold the reply, which is
-    /// every trace under privacy tier 1. `cot_json` is Some whenever either
-    /// half of the consistency pair came back with a justification.
-    pub async fn evaluate_trace(
-        &self,
-        spans: &[InternalSpan],
-    ) -> Vec<(&'static str, f64, EvaluationConfidence, Option<String>)> {
+    /// Returns the metrics that produced a result and, separately, every
+    /// metric that was dispatched at all. The two content metrics return
+    /// nothing when neither the spans nor the capture store hold the
+    /// reply, which is every trace under privacy tier 1. `cot_json` is
+    /// Some whenever either half of the consistency pair came back with
+    /// a justification.
+    ///
+    /// The attempts are the half a caller cannot reconstruct from the
+    /// results. A metric missing from `results` may have burned its
+    /// timeout, lost half its pair, or never been dispatched at all, and
+    /// only the first two leave an attempt behind.
+    pub async fn evaluate_trace(&self, spans: &[InternalSpan]) -> JudgeRun {
         let (endpoint, model) = match &self.backend {
             JudgeBackend::Local { endpoint, model } => (endpoint.as_str(), model.as_str()),
-            JudgeBackend::Disabled { .. } => return vec![],
+            JudgeBackend::Disabled { .. } => return JudgeRun::default(),
         };
 
         // Every judge call carries the trace it is grading. Without it a
@@ -296,6 +331,7 @@ impl LlmJudge {
         let cot_schema = r#"{"claims": ["<each factual claim in the response>"], "supported": [<indices of grounded claims>], "unsupported": [<indices of ungrounded claims>], "score": <0.0-1.0>, "reason": "<explanation>"}"#;
 
         let mut results = Vec::new();
+        let mut attempts = Vec::new();
 
         // Attributes first, capture second. The order matters: a span
         // that carries its own content is the SDK path describing
@@ -396,7 +432,7 @@ impl LlmJudge {
                     ),
                 ),
             };
-            if let Some(r) = self
+            let a = self
                 .run_with_consistency(
                     endpoint,
                     model,
@@ -405,8 +441,9 @@ impl LlmJudge {
                     &prompt_a,
                     &prompt_b,
                 )
-                .await
-            {
+                .await;
+            attempts.push(("tool_selection", a.outcome, a.reason));
+            if let Some(r) = a.result {
                 results.push(("tool_selection", r.score, r.confidence, r.cot_json));
             }
         }
@@ -428,7 +465,7 @@ impl LlmJudge {
                  Return JSON: {}",
                 context, content, cot_schema
             );
-            if let Some(r) = self
+            let a = self
                 .run_with_consistency(
                     endpoint,
                     model,
@@ -437,8 +474,9 @@ impl LlmJudge {
                     &faith_a,
                     &faith_b,
                 )
-                .await
-            {
+                .await;
+            attempts.push(("faithfulness", a.outcome, a.reason));
+            if let Some(r) = a.result {
                 results.push(("faithfulness", r.score, r.confidence, r.cot_json));
             }
 
@@ -456,7 +494,7 @@ impl LlmJudge {
                  Return JSON: {}",
                 context, content, cot_schema
             );
-            if let Some(r) = self
+            let a = self
                 .run_with_consistency(
                     endpoint,
                     model,
@@ -465,15 +503,23 @@ impl LlmJudge {
                     &hall_a,
                     &hall_b,
                 )
-                .await
-            {
+                .await;
+            attempts.push(("hallucination_detection", a.outcome, a.reason));
+            if let Some(r) = a.result {
                 results.push(("hallucination_detection", r.score, r.confidence, r.cot_json));
             }
         }
 
-        results
+        JudgeRun { results, attempts }
     }
 
+    /// Runs both phrasings and says what became of the pair.
+    ///
+    /// The first failure short circuits, so a backend that is down
+    /// costs one call rather than two. That is also why the two failure
+    /// outcomes are distinguishable at all: reaching `b` at all means
+    /// `a` came back, so a failure there is a completed call being
+    /// thrown away rather than a backend that never answered.
     async fn run_with_consistency(
         &self,
         endpoint: &str,
@@ -482,13 +528,21 @@ impl LlmJudge {
         metric: &'static str,
         prompt_a: &str,
         prompt_b: &str,
-    ) -> Option<JudgeResult> {
-        let (score_a, cot_a) = self
+    ) -> MetricAttempt {
+        let (score_a, cot_a) = match self
             .run_single(endpoint, model, trace_id, metric, "a", prompt_a)
-            .await?;
-        let (score_b, cot_b) = self
+            .await
+        {
+            Ok(v) => v,
+            Err(reason) => return MetricAttempt::dropped(AttemptOutcome::NoVerdict, reason),
+        };
+        let (score_b, cot_b) = match self
             .run_single(endpoint, model, trace_id, metric, "b", prompt_b)
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(reason) => return MetricAttempt::dropped(AttemptOutcome::HalfPair, reason),
+        };
         let score = (score_a + score_b) / 2.0;
         let divergence = (score_a - score_b).abs();
         let confidence = if divergence < CONFIDENCE_HIGH_THRESHOLD {
@@ -507,11 +561,15 @@ impl LlmJudge {
         } else {
             Some(serde_json::json!({ "a": embed(cot_a), "b": embed(cot_b) }).to_string())
         };
-        Some(JudgeResult {
-            score,
-            confidence,
-            cot_json,
-        })
+        MetricAttempt {
+            outcome: AttemptOutcome::Scored,
+            reason: None,
+            result: Some(JudgeResult {
+                score,
+                confidence,
+                cot_json,
+            }),
+        }
     }
 
     async fn run_single(
@@ -522,7 +580,7 @@ impl LlmJudge {
         metric: &'static str,
         phrasing: &'static str,
         prompt: &str,
-    ) -> Option<(f64, Option<String>)> {
+    ) -> Result<(f64, Option<String>), String> {
         let mut last_error = String::new();
         let mut attempts = 0;
         let started = std::time::Instant::now();
@@ -547,7 +605,7 @@ impl LlmJudge {
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "ollama eval completed"
                     );
-                    return Some(result);
+                    return Ok(result);
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -581,7 +639,7 @@ impl LlmJudge {
             error = %last_error,
             "ollama eval gave up, metric dropped"
         );
-        None
+        Err(last_error)
     }
 
     async fn call_ollama(
@@ -1082,6 +1140,52 @@ mod tests {
         );
         assert_eq!(captured.context.as_deref(), Some("user: why is CI red"));
         assert_eq!(captured.instruction.as_deref(), Some("why is CI red"));
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_never_answers_still_leaves_the_metric_a_record() {
+        // Port 1 on loopback refuses immediately, which is the
+        // unreachable-backend case without a timeout to wait out. The
+        // metric produces no score, and the whole point is that it does
+        // not therefore produce no trace of having been tried.
+        let judge = LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                model: "phi4-mini".to_string(),
+            },
+            None,
+        );
+        let span = make_span(
+            "gen_ai.chat",
+            serde_json::json!({"gen_ai.tool.name": "grep"}),
+        );
+        let run = judge.evaluate_trace(&[span]).await;
+
+        assert!(run.results.is_empty(), "a refused call cannot score");
+        assert_eq!(run.attempts.len(), 1);
+        let (metric, outcome, reason) = &run.attempts[0];
+        assert_eq!(*metric, "tool_selection");
+        assert_eq!(*outcome, AttemptOutcome::NoVerdict);
+        assert!(
+            reason.as_deref().is_some_and(|r| !r.is_empty()),
+            "a drop without a reason is the blank this replaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_judge_that_was_never_asked_records_no_attempt() {
+        // The gap this table does not close, pinned so it stays a known
+        // one. With the backend off nothing is dispatched, so there is
+        // no attempt to record, and coverage still cannot tell this
+        // apart from a trace that was never sampled.
+        let judge = disabled_judge(None);
+        let span = make_span(
+            "gen_ai.chat",
+            serde_json::json!({"gen_ai.tool.name": "grep"}),
+        );
+        let run = judge.evaluate_trace(&[span]).await;
+        assert!(run.results.is_empty());
+        assert!(run.attempts.is_empty());
     }
 
     #[tokio::test]
