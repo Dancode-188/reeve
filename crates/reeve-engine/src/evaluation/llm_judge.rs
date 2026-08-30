@@ -20,20 +20,46 @@ use reeve_storage::capture::CaptureReader;
 use reqwest::Client;
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 const OLLAMA_MODEL: &str = "phi4-mini";
 const MAX_RETRIES: u32 = 3;
 /// How long one evaluation call is given before the client hangs up.
 ///
-/// Fifteen minutes. The old thirty seconds cut faithfulness and
-/// hallucination detection off before either could answer; ADR-0049
-/// holds the measurements behind it. Two things this number is not: a
-/// limit on how much judging happens, which the Tier 2 sample rate
-/// decides, and a liveness check, which `probe` runs on its own three
-/// second deadline against `/api/tags`.
-const EVAL_TIMEOUT: Duration = Duration::from_secs(900);
+/// Ten minutes, down from fifteen. The old thirty seconds cut
+/// faithfulness and hallucination detection off before either could
+/// answer; ADR-0049 holds the measurements behind that, and ADR-0050
+/// the ones behind this. In short: with the slot below in place a call
+/// waits for nothing, so the ceiling covers inference and no longer
+/// has to allow for a queue. What it buys is a limit on how long a
+/// stuck call can occupy the only slot. What it costs is the rare
+/// healthy call that was merely slow.
+///
+/// A prompt heavy enough to run past this would run past a larger
+/// number too. Making those cheaper is a separate job.
+///
+/// Two things this number is not: a limit on how much judging happens,
+/// which the Tier 2 sample rate decides, and a liveness check, which
+/// `probe` runs on its own three second deadline against `/api/tags`.
+const EVAL_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a call will wait for the one dispatch slot before giving up
+/// without being sent.
+///
+/// Only one request is served at a time here, so a concurrent call
+/// occupies a socket without making progress. Queueing is therefore
+/// the honest behaviour, and the queue needs a ceiling or the cap
+/// merely relocates the stall.
+///
+/// Five minutes is a little more than one uncontended call takes, so
+/// whoever is next in line is usually served and whoever is behind
+/// them usually is not. ADR-0050 carries the distribution that number
+/// came from. A call that misses out is dropped as never dispatched,
+/// which the attempts table records, rather than left queued behind
+/// work it cannot outlast.
+const DISPATCH_WAIT: Duration = Duration::from_secs(300);
 /// How long the backend should hold the model between calls.
 ///
 /// One dispatch is six calls and traces arrive in bursts, so on the
@@ -100,6 +126,10 @@ pub enum JudgeBackend {
 pub struct LlmJudge {
     pub backend: JudgeBackend,
     client: Client,
+    /// The one dispatch slot. Held across the HTTP call so that at most
+    /// one request is ever at the backend, matching what the backend
+    /// itself is configured to serve.
+    dispatch: Arc<Semaphore>,
     /// The capture directory, when the operator consented to tier 2.
     /// `None` leaves the judge exactly as it behaved before it had a
     /// reader, which is also what a missing round degrades to.
@@ -124,6 +154,30 @@ struct Captured {
 #[derive(Deserialize)]
 struct OllamaGenerateResponse {
     response: String,
+    /// Tokens the backend actually read from the prompt. The context
+    /// budgets in this file are set in characters against an assumed
+    /// four characters to a token, and that assumption has never been
+    /// checked against the tokenizer doing the reading. Logged so it
+    /// can be.
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    /// Tokens the backend generated. Read alongside the prompt count
+    /// because the two answer different questions: the prompt count
+    /// says whether a budget written in characters bought what it
+    /// meant to, and this says where the time went. Calls of the same
+    /// prompt size have come back a third apart, which the prompt
+    /// count alone cannot explain and a deadline scaled on it alone
+    /// would be scaled on the weaker term.
+    #[serde(default)]
+    eval_count: Option<u64>,
+}
+
+/// What one call cost in the backend's own tokens, read off its
+/// response rather than assumed from the prompt.
+#[derive(Debug, Clone, Copy, Default)]
+struct TokenCost {
+    prompt: Option<u64>,
+    output: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +317,7 @@ impl LlmJudge {
         Self {
             backend,
             client,
+            dispatch: Arc::new(Semaphore::new(1)),
             capture_root,
         }
     }
@@ -610,7 +665,7 @@ impl LlmJudge {
             }
             attempts = attempt + 1;
             match self.call_ollama(endpoint, model, prompt).await {
-                Ok(result) => {
+                Ok((score, cot, tokens)) => {
                     // Logged on the way out of every call that returned,
                     // not only the ones that failed. A give-up rate on its
                     // own cannot say whether a backend is slow for every
@@ -622,10 +677,12 @@ impl LlmJudge {
                         phrasing,
                         attempts,
                         prompt_chars = prompt.len(),
+                        prompt_tokens = tokens.prompt,
+                        output_tokens = tokens.output,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "ollama eval completed"
                     );
-                    return Ok(result);
+                    return Ok((score, cot));
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -674,7 +731,34 @@ impl LlmJudge {
         endpoint: &str,
         model: &str,
         prompt: &str,
-    ) -> Result<(f64, Option<String>), CallError> {
+    ) -> Result<(f64, Option<String>, TokenCost), CallError> {
+        // Taken before the request and held until the response is
+        // parsed. The client timeout starts when the request is issued,
+        // so waiting here spends none of it, and a wait that runs long
+        // ends the call without sending it rather than adding another
+        // socket to a queue of one.
+        let _slot = match tokio::time::timeout(DISPATCH_WAIT, self.dispatch.acquire()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(CallError {
+                    detail: "dispatch slot closed".to_string(),
+                    outcome: AttemptOutcome::NoVerdict,
+                    retryable: false,
+                });
+            }
+            Err(_) => {
+                // Not retried. The queue that turned this away is the
+                // same queue a retry would rejoin.
+                return Err(CallError {
+                    detail: format!(
+                        "not dispatched, waited {}s for the one dispatch slot",
+                        DISPATCH_WAIT.as_secs()
+                    ),
+                    outcome: AttemptOutcome::NoVerdict,
+                    retryable: false,
+                });
+            }
+        };
         let body = serde_json::json!({
             "model": model,
             "prompt": prompt,
@@ -690,9 +774,13 @@ impl LlmJudge {
             .await
             .map_err(describe)?;
         let ollama_resp: OllamaGenerateResponse = resp.json().await.map_err(describe)?;
+        let tokens = TokenCost {
+            prompt: ollama_resp.prompt_eval_count,
+            output: ollama_resp.eval_count,
+        };
         let text = &ollama_resp.response;
         match parse_cot(text) {
-            Verdict::Reasoned(score, cot) => Ok((score, Some(cot))),
+            Verdict::Reasoned(score, cot) => Ok((score, Some(cot), tokens)),
             // Not retried. The backend answered, and it will answer the
             // same way, so a second ask pays for the same nothing. This
             // is also why the drop cannot go through `parse_score`:
@@ -706,7 +794,7 @@ impl LlmJudge {
             }),
             Verdict::Unstructured => {
                 parse_score(text)
-                    .map(|s| (s, None))
+                    .map(|s| (s, None, tokens))
                     .map_err(|detail| CallError {
                         detail,
                         outcome: AttemptOutcome::NoVerdict,
@@ -1456,6 +1544,74 @@ mod tests {
         assert!(
             reason.as_deref().is_some_and(|r| !r.is_empty()),
             "a drop without a reason is the blank this replaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_backend_never_sees_two_calls_at_once() {
+        // The backend serves one request at a time by configuration, so
+        // a second call in flight is not work, it is a socket waiting.
+        // A stub listener counts how many requests overlap: with the
+        // dispatch slot doing its job the answer is one, and without it
+        // this test sees three.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (l, p) = (live.clone(), peak.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let (l, p) = (l.clone(), p.clone());
+                tokio::spawn(async move {
+                    let n = l.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(n, Ordering::SeqCst);
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    let body = r#"{"response":"{\"score\":0.5}"}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    l.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        let judge = Arc::new(LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint: format!("http://{addr}"),
+                model: "stub".to_string(),
+            },
+            None,
+        ));
+        let endpoint = format!("http://{addr}");
+        let mut running = Vec::new();
+        for _ in 0..3 {
+            let judge = judge.clone();
+            let endpoint = endpoint.clone();
+            running.push(tokio::spawn(async move {
+                judge.call_ollama(&endpoint, "stub", "prompt").await.is_ok()
+            }));
+        }
+        for task in running {
+            assert!(task.await.expect("join"), "the stub answered a score");
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "two calls reached the backend at once"
         );
     }
 

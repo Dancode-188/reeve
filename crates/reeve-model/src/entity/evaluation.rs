@@ -55,8 +55,9 @@ pub enum AttemptOutcome {
     /// The metric produced a number and a result row.
     Scored,
     /// A call ended without a verdict: the timeout expired, the backend
-    /// was unreachable, the retries ran out, or the response did not
-    /// parse.
+    /// was unreachable, the retries ran out, the response did not
+    /// parse, or the one dispatch slot never came free and the call was
+    /// dropped rather than sent into a queue it could not survive.
     NoVerdict,
     /// One phrasing came back and the other did not, so the side that
     /// completed was discarded with the side that failed.
@@ -77,10 +78,13 @@ pub enum AttemptOutcome {
 /// over a blank that carries at least five meanings. This records the
 /// dispatch, so coverage becomes attempted against succeeded.
 ///
-/// It covers only the causes that reach a dispatch. A metric that was
-/// never sampled, or that had no input, or that was skipped because the
-/// backend was off, has no row here either, and that is a known gap
-/// rather than an oversight.
+/// It covers the causes that reach a dispatch, and one that stops just
+/// short of it: a metric turned away by a full dispatch slot is
+/// recorded, because that is a decision this crate made about a metric
+/// it meant to send, which is exactly the blank this table exists to
+/// remove. A metric that was never sampled, or that had no input, or
+/// that was skipped because the backend was off, has no row here, and
+/// that is a known gap rather than an oversight.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JudgeAttempt {
     pub id: EvalId,
