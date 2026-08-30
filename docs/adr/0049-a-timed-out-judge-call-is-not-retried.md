@@ -3,6 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-08-25
 **Amends:** [0021](./0021-tier2-llm-judge.md)
+**Amended by:** [0050](./0050-the-judge-dispatches-one-call-at-a-time.md)
 
 ## Context
 
