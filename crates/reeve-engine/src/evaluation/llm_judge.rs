@@ -137,6 +137,13 @@ pub struct JudgeResult {
 
 /// What one metric's dispatch produced: the verdict when there was
 /// one, and in every case the outcome and the reason behind it.
+/// A single phrasing that ended without a score, and what to record
+/// about it.
+struct Dropped {
+    outcome: AttemptOutcome,
+    reason: String,
+}
+
 #[derive(Debug, Clone)]
 struct MetricAttempt {
     outcome: AttemptOutcome,
@@ -229,19 +236,22 @@ fn describe(e: reqwest::Error) -> CallError {
     }
     CallError {
         detail: out,
-        timed_out,
+        outcome: AttemptOutcome::NoVerdict,
+        retryable: !timed_out,
     }
 }
 
-/// Why one call failed, and whether asking again could change the
-/// answer.
+/// Why one call failed, what a give up here would be recorded as, and
+/// whether asking again could change the answer.
 struct CallError {
     detail: String,
-    /// The client gave up on work the backend had not finished.
-    /// Sending the same prompt again buys nothing: whatever made it
-    /// slow is still in the prompt, and a second ask pays for it
-    /// twice.
-    timed_out: bool,
+    outcome: AttemptOutcome,
+    /// False for a timeout, because the client gave up on work the
+    /// backend had not finished and whatever made it slow is still in
+    /// the prompt, so a second ask pays for it twice. False too for an
+    /// answer that arrived and named nothing, because there it is not
+    /// the backend that failed.
+    retryable: bool,
 }
 
 impl LlmJudge {
@@ -534,14 +544,21 @@ impl LlmJudge {
             .await
         {
             Ok(v) => v,
-            Err(reason) => return MetricAttempt::dropped(AttemptOutcome::NoVerdict, reason),
+            Err(d) => return MetricAttempt::dropped(d.outcome, d.reason),
         };
         let (score_b, cot_b) = match self
             .run_single(endpoint, model, trace_id, metric, "b", prompt_b)
             .await
         {
             Ok(v) => v,
-            Err(reason) => return MetricAttempt::dropped(AttemptOutcome::HalfPair, reason),
+            // A failure here threw away a completed call, which is what
+            // makes it a half pair. Unless the second side had a reason
+            // of its own to be dropped, and then that reason is the
+            // truer one: nothing was thrown away that was worth keeping.
+            Err(d) if d.outcome == AttemptOutcome::NoVerdict => {
+                return MetricAttempt::dropped(AttemptOutcome::HalfPair, d.reason);
+            }
+            Err(d) => return MetricAttempt::dropped(d.outcome, d.reason),
         };
         let score = (score_a + score_b) / 2.0;
         let divergence = (score_a - score_b).abs();
@@ -580,8 +597,11 @@ impl LlmJudge {
         metric: &'static str,
         phrasing: &'static str,
         prompt: &str,
-    ) -> Result<(f64, Option<String>), String> {
-        let mut last_error = String::new();
+    ) -> Result<(f64, Option<String>), Dropped> {
+        let mut last = Dropped {
+            outcome: AttemptOutcome::NoVerdict,
+            reason: String::new(),
+        };
         let mut attempts = 0;
         let started = std::time::Instant::now();
         for attempt in 0..MAX_RETRIES {
@@ -612,15 +632,21 @@ impl LlmJudge {
                         attempt,
                         metric,
                         phrasing,
-                        timed_out = e.timed_out,
+                        retryable = e.retryable,
                         error = %e.detail,
                         "ollama call failed"
                     );
-                    last_error = e.detail;
+                    let retryable = e.retryable;
+                    last = Dropped {
+                        outcome: e.outcome,
+                        reason: e.detail,
+                    };
                     // A prompt that ran past the ceiling will run past
-                    // it again. The retries are there for a backend
-                    // that flaked, not for one that is thinking.
-                    if e.timed_out {
+                    // it again, and a backend that answered has already
+                    // said what it has to say. The retries are there
+                    // for a backend that flaked, not for one that is
+                    // thinking or one that is sure.
+                    if !retryable {
                         break;
                     }
                 }
@@ -634,12 +660,13 @@ impl LlmJudge {
             metric,
             phrasing,
             attempts,
+            outcome = ?last.outcome,
             prompt_chars = prompt.len(),
             elapsed_ms = started.elapsed().as_millis() as u64,
-            error = %last_error,
+            error = %last.reason,
             "ollama eval gave up, metric dropped"
         );
-        Err(last_error)
+        Err(last)
     }
 
     async fn call_ollama(
@@ -664,15 +691,29 @@ impl LlmJudge {
             .map_err(describe)?;
         let ollama_resp: OllamaGenerateResponse = resp.json().await.map_err(describe)?;
         let text = &ollama_resp.response;
-        if let Some((score, cot)) = parse_cot(text) {
-            return Ok((score, Some(cot)));
+        match parse_cot(text) {
+            Verdict::Reasoned(score, cot) => Ok((score, Some(cot))),
+            // Not retried. The backend answered, and it will answer the
+            // same way, so a second ask pays for the same nothing. This
+            // is also why the drop cannot go through `parse_score`:
+            // that reads the same payload and hands back the very
+            // `score` field this is refusing, shedding the empty claim
+            // list that is the evidence it should be refused.
+            Verdict::Groundless => Err(CallError {
+                detail: "verdict named no claim to check".to_string(),
+                outcome: AttemptOutcome::NoClaims,
+                retryable: false,
+            }),
+            Verdict::Unstructured => {
+                parse_score(text)
+                    .map(|s| (s, None))
+                    .map_err(|detail| CallError {
+                        detail,
+                        outcome: AttemptOutcome::NoVerdict,
+                        retryable: true,
+                    })
+            }
         }
-        parse_score(text)
-            .map(|s| (s, None))
-            .map_err(|detail| CallError {
-                detail,
-                timed_out: false,
-            })
     }
 }
 
@@ -719,30 +760,67 @@ fn resolve(idx: Option<&serde_json::Value>, claims: &[serde_json::Value]) -> ser
     serde_json::Value::Array(picked)
 }
 
-fn parse_cot(text: &str) -> Option<(f64, String)> {
-    let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    let score = lenient_f64(v.get("score")?)?.clamp(0.0, 1.0);
+/// What a judge response turned out to be.
+enum Verdict {
+    /// A score with the work that produced it.
+    Reasoned(f64, String),
+    /// The claim schema answered without naming anything. The score is
+    /// there, and it is about nothing: the content prompts ask for the
+    /// claim list first and the score last, so a response that lists no
+    /// claim has reported that it found nothing in the reply to check
+    /// and then scored the reply anyway.
+    Groundless,
+    /// Not a verdict this can read. Left to `parse_score`, which is
+    /// looser about the shape and gives up the reasoning to get a
+    /// number out of a payload that arrived malformed.
+    Unstructured,
+}
+
+/// True for a list that named nothing. `resolve` always hands back an
+/// array, so the fallback covers only a caller that did not.
+fn named_nothing(v: &serde_json::Value) -> bool {
+    v.as_array().map(|a| a.is_empty()).unwrap_or(true)
+}
+
+fn parse_cot(text: &str) -> Verdict {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Verdict::Unstructured;
+    };
+    let Some(score) = v.get("score").and_then(lenient_f64) else {
+        return Verdict::Unstructured;
+    };
+    let score = score.clamp(0.0, 1.0);
     let reason = v.get("reason").cloned().unwrap_or(serde_json::Value::Null);
     if v.get("claims").is_none() && v.get("supported").is_none() && v.get("unsupported").is_none() {
         // The tool_selection prompts ask for score and reason only, so a
         // response with no claim arrays is well formed rather than broken.
         if reason.is_null() {
-            return None;
+            return Verdict::Unstructured;
         }
-        return Some((score, serde_json::json!({ "reason": reason }).to_string()));
+        return Verdict::Reasoned(score, serde_json::json!({ "reason": reason }).to_string());
     }
     let claims: Vec<serde_json::Value> = v
         .get("claims")
         .and_then(|c| c.as_array())
         .cloned()
         .unwrap_or_default();
+    let supported = resolve(v.get("supported"), &claims);
+    let unsupported = resolve(v.get("unsupported"), &claims);
+    // Empty claims alone is not the test. A model that ignored the
+    // schema and wrote the claim into `unsupported` as text still named
+    // it, `resolve` keeps it, and on the store those rows disagree
+    // across the two phrasings the way an honest verdict does. What has
+    // to go is the response that points at nothing anywhere.
+    if claims.is_empty() && named_nothing(&supported) && named_nothing(&unsupported) {
+        return Verdict::Groundless;
+    }
     let cot = serde_json::json!({
         "claims": claims,
-        "supported": resolve(v.get("supported"), &claims),
-        "unsupported": resolve(v.get("unsupported"), &claims),
+        "supported": supported,
+        "unsupported": unsupported,
         "reason": reason,
     });
-    Some((score, cot.to_string()))
+    Verdict::Reasoned(score, cot.to_string())
 }
 
 fn parse_score(text: &str) -> Result<f64, String> {
@@ -917,10 +995,20 @@ mod tests {
         }
     }
 
+    /// The existing cases all want the reasoned arm; the others are
+    /// asserted on by variant.
+    fn reasoned(v: Verdict) -> (f64, String) {
+        match v {
+            Verdict::Reasoned(score, cot) => (score, cot),
+            Verdict::Groundless => panic!("expected a verdict, got one naming nothing"),
+            Verdict::Unstructured => panic!("expected a verdict, got an unreadable response"),
+        }
+    }
+
     #[test]
     fn parse_cot_extracts_structured_response() {
         let json = r#"{"claims":["sky is blue"],"supported":["sky is blue"],"unsupported":[],"score":0.9,"reason":"ok"}"#;
-        let (score, cot) = parse_cot(json).unwrap();
+        let (score, cot) = reasoned(parse_cot(json));
         assert!((score - 0.9).abs() < 0.001);
         let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
         assert_eq!(v["claims"][0], "sky is blue");
@@ -930,29 +1018,66 @@ mod tests {
     #[test]
     fn parse_cot_keeps_reason_from_flat_format() {
         let json = r#"{"score": 0.8, "reason": "looks fine"}"#;
-        let (score, cot) = parse_cot(json).unwrap();
+        let (score, cot) = reasoned(parse_cot(json));
         assert!((score - 0.8).abs() < 0.001);
         let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
         assert_eq!(v["reason"], "looks fine");
     }
 
     #[test]
-    fn parse_cot_returns_none_when_nothing_to_keep() {
+    fn parse_cot_gives_up_a_score_with_nothing_to_keep() {
+        // No claim arrays and no reason either, so there is no verdict
+        // here to read. `parse_score` still salvages the number, which
+        // is what it is for.
         let json = r#"{"score": 0.8}"#;
-        assert!(parse_cot(json).is_none());
+        assert!(matches!(parse_cot(json), Verdict::Unstructured));
+    }
+
+    #[test]
+    fn a_verdict_that_names_no_claim_is_not_a_verdict() {
+        // The shape the content prompts produce when the model reports
+        // it found nothing to check and then scores the reply anyway.
+        // On the store these agree with each other and land near zero,
+        // so the pair reads as high confidence on no evidence at all.
+        let json = r#"{"claims":[],"supported":[],"unsupported":[],"score":0.0,"reason":"introduces unsupported claims"}"#;
+        assert!(matches!(parse_cot(json), Verdict::Groundless));
+    }
+
+    #[test]
+    fn a_claim_written_into_the_wrong_field_still_counts() {
+        // Empty claims alone is not the test. This one ignored the
+        // schema and put the claim in `unsupported` as text, which
+        // `resolve` keeps, so the score has something behind it.
+        let json = r#"{"claims":[],"supported":[],"unsupported":["the key lives in vault"],"score":0.0,"reason":"r"}"#;
+        let (score, cot) = reasoned(parse_cot(json));
+        assert!(score.abs() < 0.001);
+        let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
+        assert_eq!(
+            v["unsupported"],
+            serde_json::json!(["the key lives in vault"])
+        );
+    }
+
+    #[test]
+    fn the_tool_selection_shape_is_untouched_by_the_claim_rule() {
+        // That prompt never asks for claims, so a score and a reason is
+        // a complete answer and must not be caught by the rule above.
+        let json = r#"{"score": 0.4, "reason": "grep before read would have been better"}"#;
+        let (score, _) = reasoned(parse_cot(json));
+        assert!((score - 0.4).abs() < 0.001);
     }
 
     #[test]
     fn parse_cot_clamps_score() {
         let json = r#"{"claims":["x"],"supported":["x"],"unsupported":[],"score":1.5}"#;
-        let (score, _) = parse_cot(json).unwrap();
+        let (score, _) = reasoned(parse_cot(json));
         assert!((score - 1.0).abs() < 0.001);
     }
 
     #[test]
     fn parse_cot_strips_extra_fields() {
         let json = r#"{"claims":["a"],"supported":["a"],"unsupported":[],"score":0.7,"reason":"r","extra":"ignored"}"#;
-        let (_, cot) = parse_cot(json).unwrap();
+        let (_, cot) = reasoned(parse_cot(json));
         let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
         assert!(v.get("extra").is_none());
         assert_eq!(v["reason"], "r");
@@ -971,7 +1096,7 @@ mod tests {
         // The schema asks for positions now. What gets stored is still
         // the claim itself, so nothing downstream sees the change.
         let json = r#"{"claims":["sky is blue","grass is purple"],"supported":[0],"unsupported":[1],"score":0.5,"reason":"half"}"#;
-        let (score, cot) = parse_cot(json).unwrap();
+        let (score, cot) = reasoned(parse_cot(json));
         assert!((score - 0.5).abs() < 0.001);
         let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
         assert_eq!(v["supported"], serde_json::json!(["sky is blue"]));
@@ -981,7 +1106,7 @@ mod tests {
     #[test]
     fn parse_cot_takes_a_number_spelled_as_a_string() {
         let json = r#"{"claims":["a","b"],"supported":["1"],"unsupported":[],"score":"0.75","reason":"r"}"#;
-        let (score, cot) = parse_cot(json).unwrap();
+        let (score, cot) = reasoned(parse_cot(json));
         assert!((score - 0.75).abs() < 0.001);
         let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
         assert_eq!(v["supported"], serde_json::json!(["b"]));
@@ -991,7 +1116,7 @@ mod tests {
     fn parse_cot_keeps_a_claim_answered_as_text() {
         // The old shape, and what the model still does sometimes.
         let json = r#"{"claims":["sky is blue"],"supported":["sky is blue"],"unsupported":[],"score":1.0,"reason":"r"}"#;
-        let (_, cot) = parse_cot(json).unwrap();
+        let (_, cot) = reasoned(parse_cot(json));
         let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
         assert_eq!(v["supported"], serde_json::json!(["sky is blue"]));
     }
@@ -999,7 +1124,7 @@ mod tests {
     #[test]
     fn parse_cot_drops_an_index_that_lands_nowhere() {
         let json = r#"{"claims":["only one"],"supported":[0,7],"unsupported":[],"score":1.0,"reason":"r"}"#;
-        let (_, cot) = parse_cot(json).unwrap();
+        let (_, cot) = reasoned(parse_cot(json));
         let v: serde_json::Value = serde_json::from_str(&cot).unwrap();
         assert_eq!(v["supported"], serde_json::json!(["only one"]));
     }
@@ -1217,6 +1342,91 @@ mod tests {
         );
         assert_eq!(captured.context.as_deref(), Some("user: why is CI red"));
         assert_eq!(captured.instruction.as_deref(), Some("why is CI red"));
+    }
+
+    /// A backend that answers every call with one canned body.
+    ///
+    /// Small enough to hand roll: the judge speaks one endpoint and
+    /// reads one field out of the reply, so a real mock server would be
+    /// a dependency bought to serve a fixed string.
+    async fn ollama_saying(model_text: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut scratch = [0u8; 8192];
+                    let _ = sock.read(&mut scratch).await;
+                    let body = serde_json::json!({ "response": model_text }).to_string();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn judge_talking_to(endpoint: String) -> LlmJudge {
+        LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint,
+                model: "phi4-mini".to_string(),
+            },
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_groundless_verdict_is_recorded_instead_of_scored() {
+        // End to end, because the seam is the whole fix: returning
+        // nothing from `parse_cot` used to fall through to
+        // `parse_score`, which reads the same payload and hands back
+        // the same score with the empty claim list shed on the way.
+        let endpoint = ollama_saying(
+            r#"{"claims":[],"supported":[],"unsupported":[],"score":0.0,"reason":"not grounded"}"#,
+        )
+        .await;
+        let span = make_span(
+            "gen_ai.chat",
+            serde_json::json!({"gen_ai.tool.name": "grep"}),
+        );
+        let run = judge_talking_to(endpoint).evaluate_trace(&[span]).await;
+
+        assert!(run.results.is_empty(), "0.0 on no claims is not a score");
+        assert_eq!(run.attempts.len(), 1);
+        assert_eq!(run.attempts[0].1, AttemptOutcome::NoClaims);
+    }
+
+    #[tokio::test]
+    async fn a_verdict_with_claims_in_it_still_scores() {
+        // The negative control for the test above. Same path, same
+        // backend, one populated claim list, and the metric survives.
+        let endpoint = ollama_saying(
+            r#"{"claims":["it ran grep"],"supported":[0],"unsupported":[],"score":0.8,"reason":"fine"}"#,
+        )
+        .await;
+        let span = make_span(
+            "gen_ai.chat",
+            serde_json::json!({"gen_ai.tool.name": "grep"}),
+        );
+        let run = judge_talking_to(endpoint).evaluate_trace(&[span]).await;
+
+        assert_eq!(run.attempts.len(), 1);
+        assert_eq!(run.attempts[0].1, AttemptOutcome::Scored);
+        assert_eq!(run.results.len(), 1);
+        assert!((run.results[0].1 - 0.8).abs() < 0.001);
     }
 
     #[tokio::test]
