@@ -180,6 +180,29 @@ struct TokenCost {
     output: Option<u64>,
 }
 
+/// Where a call's time went, split at the dispatch permit and summed
+/// over retries.
+///
+/// `elapsed_ms` could not answer the question it was being asked. It
+/// runs from before the retry loop, so it adds the wait for the one
+/// slot, the backend's own work, and the backoff between attempts into
+/// a single number, and a busy queue and a slow backend come out
+/// looking identical. A deadline scaled on prompt size has to be fitted
+/// against the backend's work alone, and nothing else here separates
+/// it. `elapsed_ms` is still logged beside these two: what it holds
+/// that they do not is the backoff, which is the difference.
+///
+/// Both are monotonic and so exclude time the machine spent suspended.
+#[derive(Debug, Clone, Copy, Default)]
+struct CallTiming {
+    /// Waiting for the one dispatch permit. Charged to the queue.
+    wait_ms: u64,
+    /// From holding the permit to a parsed response, whether or not it
+    /// parsed. Charged to the backend, and the only term a size-scaled
+    /// deadline may be fitted against.
+    service_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct JudgeResult {
     pub score: f64,
@@ -658,13 +681,14 @@ impl LlmJudge {
             reason: String::new(),
         };
         let mut attempts = 0;
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
+        let mut timing = CallTiming::default();
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(2u64.pow(attempt - 1))).await;
             }
             attempts = attempt + 1;
-            match self.call_ollama(endpoint, model, prompt).await {
+            match self.call_ollama(endpoint, model, prompt, &mut timing).await {
                 Ok((score, cot, tokens)) => {
                     // Logged on the way out of every call that returned,
                     // not only the ones that failed. A give-up rate on its
@@ -679,6 +703,8 @@ impl LlmJudge {
                         prompt_chars = prompt.len(),
                         prompt_tokens = tokens.prompt,
                         output_tokens = tokens.output,
+                        wait_ms = timing.wait_ms,
+                        service_ms = timing.service_ms,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "ollama eval completed"
                     );
@@ -719,6 +745,8 @@ impl LlmJudge {
             attempts,
             outcome = ?last.outcome,
             prompt_chars = prompt.len(),
+            wait_ms = timing.wait_ms,
+            service_ms = timing.service_ms,
             elapsed_ms = started.elapsed().as_millis() as u64,
             error = %last.reason,
             "ollama eval gave up, metric dropped"
@@ -726,18 +754,28 @@ impl LlmJudge {
         Err(last)
     }
 
+    /// `timing` is accumulated across every attempt the caller makes,
+    /// including the ones that fail, because a call that gave up after
+    /// three tries spent its time somewhere and that is the call whose
+    /// spending most needs explaining.
     async fn call_ollama(
         &self,
         endpoint: &str,
         model: &str,
         prompt: &str,
+        timing: &mut CallTiming,
     ) -> Result<(f64, Option<String>, TokenCost), CallError> {
         // Taken before the request and held until the response is
         // parsed. The client timeout starts when the request is issued,
         // so waiting here spends none of it, and a wait that runs long
         // ends the call without sending it rather than adding another
         // socket to a queue of one.
-        let _slot = match tokio::time::timeout(DISPATCH_WAIT, self.dispatch.acquire()).await {
+        let waited = tokio::time::Instant::now();
+        let slot = tokio::time::timeout(DISPATCH_WAIT, self.dispatch.acquire()).await;
+        // Recorded before the result is matched on, so a call turned
+        // away by a full slot still reports what the wait cost it.
+        timing.wait_ms += waited.elapsed().as_millis() as u64;
+        let _slot = match slot {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
                 return Err(CallError {
@@ -766,10 +804,28 @@ impl LlmJudge {
             "format": "json",
             "keep_alive": MODEL_KEEP_ALIVE
         });
+        // Wrapped so the clock is read on the way out of every path,
+        // not only the one that returns a score. A call that timed out
+        // is the one whose service time the deadline is fitted against,
+        // so losing it would leave the fit to the calls that never had
+        // trouble.
+        let served = tokio::time::Instant::now();
+        let outcome = self.generate(endpoint, &body).await;
+        timing.service_ms += served.elapsed().as_millis() as u64;
+        outcome
+    }
+
+    /// The request itself, held apart only so its caller can time it as
+    /// one unit. Everything here happens with the dispatch permit held.
+    async fn generate(
+        &self,
+        endpoint: &str,
+        body: &serde_json::Value,
+    ) -> Result<(f64, Option<String>, TokenCost), CallError> {
         let resp = self
             .client
             .post(format!("{}/api/generate", endpoint))
-            .json(&body)
+            .json(body)
             .send()
             .await
             .map_err(describe)?;
@@ -1602,16 +1658,92 @@ mod tests {
             let judge = judge.clone();
             let endpoint = endpoint.clone();
             running.push(tokio::spawn(async move {
-                judge.call_ollama(&endpoint, "stub", "prompt").await.is_ok()
+                let mut timing = CallTiming::default();
+                let ok = judge
+                    .call_ollama(&endpoint, "stub", "prompt", &mut timing)
+                    .await
+                    .is_ok();
+                (ok, timing)
             }));
         }
+        let mut timings = Vec::new();
         for task in running {
-            assert!(task.await.expect("join"), "the stub answered a score");
+            let (ok, timing) = task.await.expect("join");
+            assert!(ok, "the stub answered a score");
+            timings.push(timing);
         }
         assert_eq!(
             peak.load(Ordering::SeqCst),
             1,
             "two calls reached the backend at once"
+        );
+
+        // The same serialisation, read off the split clock rather than
+        // off the listener. Each call is served on its own for the
+        // stub's 120ms, so no single call may charge the backend for
+        // the whole run, and the two that arrived behind one must show
+        // their turn in the queue as wait rather than as service. That
+        // is the distinction the old single `elapsed_ms` could not
+        // make: it would have reported all three as slow.
+        for t in &timings {
+            assert!(
+                t.service_ms >= 100,
+                "a served call spent no time being served: {t:?}"
+            );
+            assert!(
+                t.service_ms < 300,
+                "one call was charged for another's turn: {t:?}"
+            );
+        }
+        assert!(
+            timings.iter().filter(|t| t.wait_ms >= 100).count() >= 2,
+            "queueing behind the one slot did not land on wait: {timings:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_never_got_the_slot_charges_the_queue_not_the_backend() {
+        // The drop that ADR-0050 introduced, seen from the clock. It
+        // costs a full `DISPATCH_WAIT` of waiting and no backend work
+        // at all, which is the whole point of dropping it, and a
+        // deadline fitted against prompt size must not be shown this
+        // time as though the backend had spent it. The endpoint is a
+        // closed port, so anything that reached it would fail loudly
+        // rather than quietly counting.
+        let judge = LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                model: "stub".to_string(),
+            },
+            None,
+        );
+        let held = judge
+            .dispatch
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the only slot");
+
+        let mut timing = CallTiming::default();
+        let err = judge
+            .call_ollama("http://127.0.0.1:1", "stub", "prompt", &mut timing)
+            .await
+            .expect_err("a call with no slot cannot have scored");
+        drop(held);
+
+        assert!(
+            err.detail.contains("dispatch slot"),
+            "the drop did not say what stopped it: {}",
+            err.detail
+        );
+        assert!(!err.retryable, "a retry rejoins the queue that refused it");
+        assert!(
+            timing.wait_ms >= DISPATCH_WAIT.as_millis() as u64,
+            "the wait was not charged: {timing:?}"
+        );
+        assert_eq!(
+            timing.service_ms, 0,
+            "the backend was charged for a call it never saw"
         );
     }
 
