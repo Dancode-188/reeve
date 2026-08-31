@@ -26,3 +26,7 @@ rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` only, for the paused clock. The dispatch wait is five
+# minutes, so a test of what a dropped call costs has to be able to
+# reach the end of that wait without spending it.
+tokio = { workspace = true, features = ["test-util"] }
