@@ -241,16 +241,30 @@ impl EngineLoop {
             .iter()
             .map(|(k, v)| (k.to_string(), *v))
             .collect();
-        if agent_work && rand::random::<f64>() < rate {
-            tokio::spawn(run_tier2(
-                trace_id.clone(),
-                agent_id.clone(),
-                spans,
-                tier1_scores,
-                self.engine_tx.clone(),
-                self.warm.clone(),
-                self.judge.clone(),
-            ));
+        if agent_work {
+            // Written before the draw rather than inside the branch
+            // that wins it. The traces passed over are what make the
+            // survivors mean anything: a corpus holding only the
+            // admitted ones records which traces were graded, and not
+            // what they were graded out of, so nothing downstream can
+            // undo the sampler's preference for unhealthy agents. The
+            // rate exists for one coin flip and is gone after it, and
+            // it cannot be reconstructed later from the score history
+            // because that history has moved on.
+            if let Err(e) = self.warm.record_tier2_inclusion(&trace_id, rate).await {
+                tracing::warn!(error = %e, "failed to record tier 2 inclusion probability");
+            }
+            if rand::random::<f64>() < rate {
+                tokio::spawn(run_tier2(
+                    trace_id.clone(),
+                    agent_id.clone(),
+                    spans,
+                    tier1_scores,
+                    self.engine_tx.clone(),
+                    self.warm.clone(),
+                    self.judge.clone(),
+                ));
+            }
         }
 
         self.cost_accumulators.remove(&trace_id);
