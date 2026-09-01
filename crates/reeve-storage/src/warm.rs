@@ -73,6 +73,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, include_str!("../migrations/0006_indices.sql")),
     (7, include_str!("../migrations/0007_score_provenance.sql")),
     (8, include_str!("../migrations/0008_judge_attempts.sql")),
+    (
+        9,
+        include_str!("../migrations/0009_tier2_inclusion_probability.sql"),
+    ),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -497,6 +501,40 @@ impl WarmStore {
                 "UPDATE traces SET final_health_score = ?1, weight_coverage = ?2
                  WHERE id = ?3",
                 params![score, weight_coverage, trace_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Records the probability with which this trace was offered to Tier
+    /// 2, whether or not the draw went its way.
+    ///
+    /// The rate is decided from the agent's recent health and then spent
+    /// on a single coin flip, so without this the corpus records which
+    /// traces were graded but not how hard the sampler was trying to
+    /// grade them. A trace kept at `p` stands for `1 / p` traces of the
+    /// population it was drawn from, and that arithmetic needs the `p`
+    /// that was actually used, at the moment it was used. There is no
+    /// backfill: a trace that completes without this is unweightable
+    /// for good, which is the whole reason it is written on the hot
+    /// path rather than derived later.
+    ///
+    /// Take care what the weight buys. It corrects for the choice to
+    /// OFFER a trace to the judge, and not for anything that happens
+    /// afterwards; an admitted trace that scored nothing is a second
+    /// selection with an unknown probability. `judge_attempts` records
+    /// that one.
+    pub async fn record_tier2_inclusion(
+        &self,
+        trace_id: &TraceId,
+        probability: f64,
+    ) -> Result<(), StorageError> {
+        let trace_id = trace_id.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE traces SET tier2_inclusion_p = ?1 WHERE id = ?2",
+                params![probability, trace_id.as_str()],
             )?;
             Ok(())
         })
@@ -2382,6 +2420,49 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].outcome, AttemptOutcome::Scored);
         assert_eq!(loaded[0].reason, None);
+    }
+
+    #[tokio::test]
+    async fn a_trace_records_the_probability_it_was_offered_to_the_judge() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t-sampled")).await.unwrap();
+        store.save_trace(trace("t-untouched")).await.unwrap();
+
+        store
+            .record_tier2_inclusion(&TraceId::from("t-sampled"), 0.10)
+            .await
+            .unwrap();
+
+        let sampled: Option<f64> = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT tier2_inclusion_p FROM traces WHERE id = 't-sampled'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(sampled, Some(0.10));
+
+        // The distinction the weight depends on. A trace that was never
+        // in the sampling frame is not a trace that was in it with no
+        // chance of selection: the first contributes nothing to the
+        // population estimate and the second would divide by zero.
+        // Storing NULL rather than defaulting to 0.0 is what keeps
+        // those two apart.
+        let untouched: Option<f64> = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT tier2_inclusion_p FROM traces WHERE id = 't-untouched'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(untouched, None);
     }
 
     #[tokio::test]

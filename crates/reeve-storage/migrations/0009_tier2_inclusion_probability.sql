@@ -1,0 +1,35 @@
+-- Tier 2 admission is a coin flip whose bias is set by the agent's own
+-- recent health, so unhealthy traces are sampled far more often than
+-- healthy ones and the graded corpus is not a fair sample of the traffic.
+-- Every statistic drawn from it therefore describes the sampler as much
+-- as the agent, and nothing recorded says by how much: the rate is
+-- computed, used for one draw, and discarded.
+--
+-- Storing the probability that was actually used makes the correction
+-- arithmetic. A trace admitted at p contributes 1/p traces' worth of
+-- evidence about the population, which is the standard inverse-
+-- probability weight, and it can only be applied to traces whose p was
+-- written down at the time. This is why the column is worth adding
+-- before anything that changes the sampler: it cannot be backfilled,
+-- and every trace completed without it is permanently unweightable.
+--
+-- Written for every trace in the sampling frame, admitted or not, so
+-- the realized rate can be checked against the nominal one. NULL means
+-- the trace was never in the frame: helper traffic, which is not agent
+-- work and is never offered to the judge, and every trace completed
+-- before this column existed. Certainty is written out as 1.0 rather
+-- than left absent, which is the opposite of the convention a reader
+-- coming from OpenTelemetry would expect; there a sampler at
+-- probability 1 is required to leave its threshold unset. Absence has
+-- to mean out of frame here, because the frame is the thing being
+-- estimated over.
+--
+-- IT CORRECTS THE FIRST STAGE OF SELECTION ONLY. A trace that is
+-- admitted can still produce no score, because the call was dropped
+-- waiting for a dispatch slot, or timed out, or came back as half a
+-- pair, or named no claim. That second stage is not a coin flip and
+-- 1/p does not correct for it. It is observable in judge_attempts but
+-- its probability is not known, so a weight from this column buys an
+-- unbiased view of what was OFFERED to the judge, not of what the
+-- judge managed to grade.
+ALTER TABLE traces ADD COLUMN tier2_inclusion_p REAL;
