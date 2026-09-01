@@ -21,6 +21,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
@@ -130,6 +131,19 @@ pub struct LlmJudge {
     /// one request is ever at the backend, matching what the backend
     /// itself is configured to serve.
     dispatch: Arc<Semaphore>,
+    /// How many calls for score bearing metrics are queued for that
+    /// slot right now, counted while they wait and not while they are
+    /// served.
+    ///
+    /// The slot is first come first served, which is fair between
+    /// calls and not between metrics: a metric that cannot move the
+    /// score can hold the only slot there is while one that can is
+    /// queued behind it, and be charged nothing for it. That is not
+    /// hypothetical here. One `tool_selection` call, the cheapest
+    /// metric there is, spent the entire five minute wait bound behind
+    /// `hallucination_detection` and was dropped without ever being
+    /// sent.
+    queued: Arc<AtomicUsize>,
     /// The capture directory, when the operator consented to tier 2.
     /// `None` leaves the judge exactly as it behaved before it had a
     /// reader, which is also what a missing round degrades to.
@@ -331,6 +345,28 @@ struct CallError {
     retryable: bool,
 }
 
+/// Counts one queued call for a score bearing metric, and stops
+/// counting the moment it stops waiting.
+///
+/// It has to come off on every exit and not only the one that gets the
+/// slot. A call that gave up at the wait bound is no longer queued, and
+/// leaving it counted would make an unweighted metric stand aside for a
+/// call that had already stopped waiting for anything.
+struct Queued(Arc<AtomicUsize>);
+
+impl Queued {
+    fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Queued(Arc::clone(counter))
+    }
+}
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl LlmJudge {
     pub fn new(backend: JudgeBackend, capture_root: Option<PathBuf>) -> Self {
         let client = Client::builder()
@@ -341,6 +377,7 @@ impl LlmJudge {
             backend,
             client,
             dispatch: Arc::new(Semaphore::new(1)),
+            queued: Arc::new(AtomicUsize::new(0)),
             capture_root,
         }
     }
@@ -688,7 +725,10 @@ impl LlmJudge {
                 tokio::time::sleep(Duration::from_secs(2u64.pow(attempt - 1))).await;
             }
             attempts = attempt + 1;
-            match self.call_ollama(endpoint, model, prompt, &mut timing).await {
+            match self
+                .call_ollama(endpoint, model, metric, phrasing, prompt, &mut timing)
+                .await
+            {
                 Ok((score, cot, tokens)) => {
                     // Logged on the way out of every call that returned,
                     // not only the ones that failed. A give-up rate on its
@@ -762,6 +802,8 @@ impl LlmJudge {
         &self,
         endpoint: &str,
         model: &str,
+        metric: &str,
+        phrasing: &str,
         prompt: &str,
         timing: &mut CallTiming,
     ) -> Result<(f64, Option<String>, TokenCost), CallError> {
@@ -770,12 +812,55 @@ impl LlmJudge {
         // so waiting here spends none of it, and a wait that runs long
         // ends the call without sending it rather than adding another
         // socket to a queue of one.
+        //
+        // Which of those two things this call is decides whether it may
+        // compete for the slot at all. A metric that cannot move the
+        // score stands aside while one that can is queued, because the
+        // slot it would take is the slot that call is waiting for. It
+        // stands aside only for a call that is WAITING: queueing behind
+        // one that is already being served costs that call nothing,
+        // since the slot is not free for it either way. The narrower
+        // rule is what keeps the signal alive under load rather than
+        // only at idle.
+        // Standing aside is only free before anything has been spent on
+        // this metric. The two phrasings are scored as a pair and a
+        // half pair is discarded, so yielding on the second one throws
+        // away the first one's backend time as well as its own. Reaching
+        // `b` at all means `a` returned a score, which makes the
+        // phrasing an exact test for whether this pair is already
+        // half paid for. Measured once on live traffic before this
+        // guard existed: phrasing `a` was served for 213 seconds and
+        // phrasing `b` then yielded, discarding both.
+        let weighted = reeve_model::scoring::carries_weight(metric);
+        // The right of way has no aging term, so an unweighted metric
+        // is silent for as long as weighted work keeps arriving. That
+        // is the intended state rather than a starvation bug: this
+        // metric is absent from the weight table by ADR-0021 and
+        // signals an anomaly, which has no deadline, while the slot it
+        // would take is the only one a score can be computed through.
+        // An aging term was tried and removed: it won the slot for
+        // this metric in traces where both weighted metrics were
+        // dropped waiting for it. The slot is idle most of the time,
+        // and that idle time is what this metric now runs in.
+        let may_yield = !weighted && phrasing == "a";
+        let contested = self.queued.load(Ordering::SeqCst) > 0;
+        if may_yield && contested {
+            return Err(CallError {
+                detail: "not dispatched, stood aside for a metric that carries weight".to_string(),
+                outcome: AttemptOutcome::NoVerdict,
+                retryable: false,
+            });
+        }
+        // Counted for exactly as long as this call is in the queue, so
+        // an unweighted call asking the question above gets an answer
+        // about now rather than about the whole dispatch.
+        let _queued = weighted.then(|| Queued::enter(&self.queued));
         let waited = tokio::time::Instant::now();
         let slot = tokio::time::timeout(DISPATCH_WAIT, self.dispatch.acquire()).await;
         // Recorded before the result is matched on, so a call turned
         // away by a full slot still reports what the wait cost it.
         timing.wait_ms += waited.elapsed().as_millis() as u64;
-        let _slot = match slot {
+        let slot_held = match slot {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
                 return Err(CallError {
@@ -797,6 +882,25 @@ impl LlmJudge {
                 });
             }
         };
+        // Asked a second time, now that the slot is actually in hand.
+        // The check above is made before this call joins the queue and
+        // cannot see a weighted call that arrives while it is in it,
+        // which on the measured window is most of them: one
+        // unweighted call sat in the queue for 219 seconds and then
+        // took the slot, and every weighted call that queued behind it
+        // in that time was invisible to a test made on the way in.
+        // Asking again here is what makes the rule cover the moment
+        // that actually matters, which is the moment the slot changes
+        // hands.
+        let contested_at_handover = self.queued.load(Ordering::SeqCst) > 0;
+        if may_yield && contested_at_handover {
+            drop(slot_held);
+            return Err(CallError {
+                detail: "not dispatched, stood aside for a metric that carries weight".to_string(),
+                outcome: AttemptOutcome::NoVerdict,
+                retryable: false,
+            });
+        }
         let body = serde_json::json!({
             "model": model,
             "prompt": prompt,
@@ -809,6 +913,12 @@ impl LlmJudge {
         // is the one whose service time the deadline is fitted against,
         // so losing it would leave the fit to the calls that never had
         // trouble.
+        // No longer queued: from here the slot is held and the wait
+        // this call imposes on anything behind it is service, not
+        // queueing. Dropped before the request rather than at the end
+        // of the function so a long call does not read as a long queue.
+        drop(_queued);
+        let _slot = slot_held;
         let served = tokio::time::Instant::now();
         let outcome = self.generate(endpoint, &body).await;
         timing.service_ms += served.elapsed().as_millis() as u64;
@@ -1660,7 +1770,14 @@ mod tests {
             running.push(tokio::spawn(async move {
                 let mut timing = CallTiming::default();
                 let ok = judge
-                    .call_ollama(&endpoint, "stub", "prompt", &mut timing)
+                    .call_ollama(
+                        &endpoint,
+                        "stub",
+                        "faithfulness",
+                        "a",
+                        "prompt",
+                        &mut timing,
+                    )
                     .await
                     .is_ok();
                 (ok, timing)
@@ -1702,6 +1819,282 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn an_unweighted_metric_stands_aside_for_a_queued_weighted_one() {
+        // The defect this closes, at its smallest. The slot is first
+        // come first served, so a metric absent from the weight table
+        // could take it while one that carries 0.25 waited, and the
+        // waiting call was charged the full bound and dropped without
+        // ever being sent. Measured on live traffic before the change:
+        // one `tool_selection` call spent all 300 seconds of its wait
+        // inside a `hallucination_detection` service interval.
+        let judge = LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                model: "stub".to_string(),
+            },
+            None,
+        );
+        // A weighted call is in the queue. Nothing holds the slot: the
+        // point is that being QUEUED is what confers the right of way,
+        // not being served.
+        let _weighted = Queued::enter(&judge.queued);
+
+        let mut timing = CallTiming::default();
+        let err = judge
+            .call_ollama(
+                "http://127.0.0.1:1",
+                "stub",
+                "hallucination_detection",
+                "a",
+                "prompt",
+                &mut timing,
+            )
+            .await
+            .expect_err("an unweighted call must not take a queued call's slot");
+        assert_eq!(err.outcome, AttemptOutcome::NoVerdict);
+        assert!(
+            err.detail.contains("stood aside"),
+            "the reason must say it yielded, not that it failed: {}",
+            err.detail
+        );
+        assert!(
+            !err.retryable,
+            "a retry would rejoin the queue it yielded to"
+        );
+        // It stood aside instead of waiting, so it spent nothing. A
+        // yield that still burned the bound would be the same defect
+        // with a better name.
+        assert_eq!(timing.wait_ms, 0, "yielding must not cost the bound");
+        assert_eq!(timing.service_ms, 0, "nothing was sent");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unweighted_metric_yields_however_many_times_it_already_has() {
+        // The rule this replaces handed the slot back after three
+        // consecutive yields, on the reasoning that right of way with
+        // no aging term is a mute button rather than a priority rule.
+        // Live, the aging term won the one slot for a metric that
+        // cannot enter the composite while both weighted metrics died
+        // waiting for it, so the mute is now the intended state: an
+        // anomaly signal has no deadline, and the slot is idle most of
+        // the time, which is when this metric runs.
+        let judge = LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                model: "stub".to_string(),
+            },
+            None,
+        );
+        async fn call(j: &LlmJudge) -> CallError {
+            let mut timing = CallTiming::default();
+            j.call_ollama(
+                "http://127.0.0.1:1",
+                "stub",
+                "hallucination_detection",
+                "a",
+                "prompt",
+                &mut timing,
+            )
+            .await
+            .expect_err("closed endpoint")
+        }
+
+        let queued = Queued::enter(&judge.queued);
+        for attempt in 1..=6 {
+            assert!(
+                call(&judge).await.detail.contains("stood aside"),
+                "yield {attempt} took the slot, so an aging term survived"
+            );
+        }
+        // The other half of the rule: contention is the only thing that
+        // silences it, so an empty queue dispatches it however long the
+        // run of yields was.
+        drop(queued);
+        assert!(!call(&judge).await.detail.contains("stood aside"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_second_phrasing_never_yields_because_the_first_is_already_paid_for() {
+        // A pair scores or it does not count, so yielding on the second
+        // side does not save the backend anything: it spends the first
+        // side twice over, once on the call and once on the discard.
+        // The guard is worth its own test because the condition it
+        // turns on is a phrasing label rather than anything that looks
+        // like a cost, and a later reader could reasonably delete it.
+        let judge = LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                model: "stub".to_string(),
+            },
+            None,
+        );
+        // Exactly the state that makes phrasing `a` stand aside.
+        let _weighted = Queued::enter(&judge.queued);
+
+        let mut timing = CallTiming::default();
+        let err = judge
+            .call_ollama(
+                "http://127.0.0.1:1",
+                "stub",
+                "hallucination_detection",
+                "b",
+                "prompt",
+                &mut timing,
+            )
+            .await
+            .expect_err("the endpoint is closed, so nothing can succeed");
+        assert!(
+            !err.detail.contains("stood aside"),
+            "it abandoned a pair the first call had already paid for: {}",
+            err.detail
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unweighted_metric_still_runs_when_nothing_is_queued() {
+        // The other half, and the reason the rule is written against
+        // calls that are WAITING rather than calls that exist. This
+        // metric is displayed to the operator and read by the policy
+        // engine per ADR-0021, so a rule that silenced it whenever the
+        // backend was busy would trade one loss for another. On the
+        // window this was measured over, standing aside only for a
+        // queued call keeps 58% of its dispatches where standing aside
+        // for any in-flight call keeps 26%.
+        let judge = LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                model: "stub".to_string(),
+            },
+            None,
+        );
+        let mut timing = CallTiming::default();
+        let err = judge
+            .call_ollama(
+                "http://127.0.0.1:1",
+                "stub",
+                "hallucination_detection",
+                "a",
+                "prompt",
+                &mut timing,
+            )
+            .await
+            .expect_err("the endpoint is a closed port");
+        // It reached the backend and failed there, which is the proof
+        // it was allowed to try: standing aside never sends anything.
+        assert!(
+            !err.detail.contains("stood aside"),
+            "nothing was queued, so it should have been dispatched: {}",
+            err.detail
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unweighted_metric_stands_aside_when_the_slot_comes_free_late() {
+        // Asking once, on the way in, answers a question about the
+        // instant the call arrived rather than the instant it takes the
+        // slot, and on live traffic those are minutes apart: an
+        // unweighted call waited 219 seconds and was then served, with
+        // the weighted calls it delayed all having queued during the
+        // wait. Checking only on entry removes about half the wait this
+        // metric imposes; checking again at the handover removes about
+        // nine tenths of it.
+        let judge = Arc::new(LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                model: "stub".to_string(),
+            },
+            None,
+        ));
+        let held = judge
+            .dispatch
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the only slot");
+
+        // Enters while the queue is empty, so the check on the way in
+        // lets it through and it settles in to wait.
+        let waiting = Arc::clone(&judge);
+        let call = tokio::spawn(async move {
+            let mut timing = CallTiming::default();
+            let err = waiting
+                .call_ollama(
+                    "http://127.0.0.1:1",
+                    "stub",
+                    "hallucination_detection",
+                    "a",
+                    "prompt",
+                    &mut timing,
+                )
+                .await
+                .expect_err("it must not be served ahead of the queued call");
+            (err, timing)
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // The weighted call arrives late, invisible to a test already
+        // made, and the slot then comes free.
+        let _weighted = Queued::enter(&judge.queued);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(held);
+
+        let (err, timing) = call.await.expect("the call panicked");
+        assert!(
+            err.detail.contains("stood aside"),
+            "it took a slot the queued call was waiting for: {}",
+            err.detail
+        );
+        assert!(
+            timing.wait_ms > 0,
+            "this one did wait, and the wait is what it spent: {timing:?}"
+        );
+        assert_eq!(
+            timing.service_ms, 0,
+            "it yielded the slot, so nothing was sent"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_gave_up_waiting_stops_blocking_the_unweighted_one() {
+        // The counter has to come off on the path that fails, not only
+        // the one that wins the slot. A weighted call dropped at the
+        // wait bound is no longer waiting for anything, and if it were
+        // still counted it would go on holding a metric back on behalf
+        // of a call that had already gone.
+        let judge = LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                model: "stub".to_string(),
+            },
+            None,
+        );
+        let held = judge
+            .dispatch
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the only slot");
+        let mut timing = CallTiming::default();
+        let _ = judge
+            .call_ollama(
+                "http://127.0.0.1:1",
+                "stub",
+                "faithfulness",
+                "a",
+                "prompt",
+                &mut timing,
+            )
+            .await
+            .expect_err("it never got the slot");
+        drop(held);
+        assert_eq!(
+            judge.queued.load(Ordering::SeqCst),
+            0,
+            "a call that stopped waiting is still counted as queued"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_call_that_never_got_the_slot_charges_the_queue_not_the_backend() {
         // The drop that ADR-0050 introduced, seen from the clock. It
         // costs a full `DISPATCH_WAIT` of waiting and no backend work
@@ -1726,7 +2119,14 @@ mod tests {
 
         let mut timing = CallTiming::default();
         let err = judge
-            .call_ollama("http://127.0.0.1:1", "stub", "prompt", &mut timing)
+            .call_ollama(
+                "http://127.0.0.1:1",
+                "stub",
+                "faithfulness",
+                "a",
+                "prompt",
+                &mut timing,
+            )
             .await
             .expect_err("a call with no slot cannot have scored");
         drop(held);

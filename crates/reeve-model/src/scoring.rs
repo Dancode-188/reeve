@@ -14,6 +14,18 @@ const WEIGHTS: &[(&str, f64)] = &[
     ("latency_normality", 0.10),
 ];
 
+/// Whether this metric can move the composite score.
+///
+/// The judge asks this before deciding whether a metric may take the
+/// one dispatch slot ahead of another, so the answer has to come from
+/// the weight table itself rather than a list kept alongside it. A
+/// second copy of the closed set is a copy that can disagree, and the
+/// disagreement would be silent: the score would keep using this table
+/// while dispatch prioritized the other one.
+pub fn carries_weight(metric: &str) -> bool {
+    WEIGHTS.iter().any(|(name, _)| *name == metric)
+}
+
 pub struct HealthScore {
     /// Composite score on a 0.0 to 100.0 scale.
     pub value: f64,
@@ -158,6 +170,20 @@ mod tests {
         assert!((hs.value - 50.0).abs() < 0.001);
         assert!(hs.tier2_pending);
         assert!((hs.weight_coverage - 0.20).abs() < 0.001);
+    }
+
+    #[test]
+    fn carries_weight_answers_from_the_weight_table() {
+        assert!(carries_weight("faithfulness"));
+        assert!(carries_weight("tool_selection"));
+        assert!(carries_weight("loop_detection"));
+        // Scored and displayed, but absent from the table by the
+        // decision in ADR-0021, so it cannot move the number. Dispatch
+        // reads this to know it must not delay one that can.
+        assert!(!carries_weight("hallucination_detection"));
+        assert!(!carries_weight("fingerprint_deviation"));
+        assert!(!carries_weight("intent_action_divergence"));
+        assert!(!carries_weight(""));
     }
 
     #[test]
