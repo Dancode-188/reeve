@@ -3,6 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-08-31
 **Amends:** [0049](./0049-a-timed-out-judge-call-is-not-retried.md)
+**Amended by:** [0051](./0051-the-judge-refuses-work-at-admission.md)
 
 ## Context
 
