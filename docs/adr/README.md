@@ -61,6 +61,7 @@ overturned and the rest still holds, the original keeps its status and is marked
 | [0048](./0048-tier-2-is-one-permission.md) | Tier 2 Is One Permission, Not Two Stores | Accepted | 2026-08-20 |
 | [0049](./0049-a-timed-out-judge-call-is-not-retried.md) | A Judge Call That Ran Out of Time Is Not Retried | Accepted | 2026-08-25 |
 | [0050](./0050-the-judge-dispatches-one-call-at-a-time.md) | The Judge Dispatches One Call at a Time | Accepted | 2026-08-31 |
+| [0051](./0051-the-judge-refuses-work-at-admission.md) | The Judge Refuses Work at Admission, Not at a Timeout | Accepted | 2026-09-02 |
 
 ## Format
 
