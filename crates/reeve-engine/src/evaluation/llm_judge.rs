@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use tracing::Instrument;
 
 const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 const OLLAMA_MODEL: &str = "phi4-mini";
@@ -725,8 +726,20 @@ impl LlmJudge {
                 tokio::time::sleep(Duration::from_secs(2u64.pow(attempt - 1))).await;
             }
             attempts = attempt + 1;
+            // Carried on a span rather than passed down, because
+            // `call_ollama` is already at the argument count clippy
+            // draws the line at and the per-attempt lines it writes
+            // need to name the call they belong to.
+            let attempt_span = tracing::info_span!(
+                "judge_attempt",
+                trace_id,
+                metric,
+                phrasing,
+                attempt = attempts
+            );
             match self
                 .call_ollama(endpoint, model, metric, phrasing, prompt, &mut timing)
+                .instrument(attempt_span)
                 .await
             {
                 Ok((score, cot, tokens)) => {
@@ -859,7 +872,8 @@ impl LlmJudge {
         let slot = tokio::time::timeout(DISPATCH_WAIT, self.dispatch.acquire()).await;
         // Recorded before the result is matched on, so a call turned
         // away by a full slot still reports what the wait cost it.
-        timing.wait_ms += waited.elapsed().as_millis() as u64;
+        let attempt_wait_ms = waited.elapsed().as_millis() as u64;
+        timing.wait_ms += attempt_wait_ms;
         let slot_held = match slot {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
@@ -919,9 +933,33 @@ impl LlmJudge {
         // of the function so a long call does not read as a long queue.
         drop(_queued);
         let _slot = slot_held;
+        // Written when the slot is in hand and before the request goes
+        // out, so a call that is in flight says so while it is still in
+        // flight. Every other line here is written once a call has
+        // ended, which leaves a judge that is stuck and a judge with
+        // nothing to do looking identical in the log. Absence of this
+        // line over a window is the thing that separates them, and the
+        // one dispatch slot makes the lines serial, so the next
+        // `ollama attempt finished` always belongs to this one.
+        tracing::info!(
+            wait_ms = attempt_wait_ms,
+            prompt_chars = prompt.len(),
+            "ollama eval dispatched"
+        );
         let served = tokio::time::Instant::now();
         let outcome = self.generate(endpoint, &body).await;
-        timing.service_ms += served.elapsed().as_millis() as u64;
+        let attempt_service_ms = served.elapsed().as_millis() as u64;
+        timing.service_ms += attempt_service_ms;
+        // What this attempt alone spent. The totals above accumulate
+        // across retries by design, so a row for a call that retried
+        // reports a sum no reader can take apart, and a service time
+        // fitted against those sums is fitted against a number no
+        // single call ever spent.
+        tracing::info!(
+            service_ms = attempt_service_ms,
+            ok = outcome.is_ok(),
+            "ollama attempt finished"
+        );
         outcome
     }
 
