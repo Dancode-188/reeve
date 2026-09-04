@@ -68,6 +68,54 @@ pub enum AttemptOutcome {
     NoClaims,
 }
 
+/// Why a dispatched metric ended the way it did, as a value rather than
+/// a sentence.
+///
+/// `AttemptOutcome` says what was lost and this says what took it. The
+/// two are orthogonal rather than nested: the same wait bound ends one
+/// metric outright and costs another a completed first phrasing, which
+/// is one cause under two outcomes. `reason` has carried this in prose
+/// from the start, but three of those sentences interpolate a timeout,
+/// a character count or a dump of the keys that came back, so grouping
+/// by it splits a cause across as many values as there were failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptCause {
+    /// An unweighted metric released the one dispatch slot to a metric
+    /// that carries weight instead of competing for it.
+    StoodAside,
+    /// The dispatch bound expired with the slot still held, and the
+    /// call was dropped rather than queued past it.
+    WaitBound,
+    /// The dispatch slot was closed, which happens on shutdown.
+    SlotClosed,
+    /// The backend took the call and did not answer inside the
+    /// evaluation timeout.
+    BackendTimeout,
+    /// The backend refused the call, reset it, or could not be reached.
+    BackendUnreachable,
+    /// An answer came back in the claim shape naming no claim, so
+    /// nothing the model extracted constrained the score after it.
+    NoClaims,
+    /// An answer came back and no score could be read out of it.
+    Unparseable,
+}
+
+/// Which of a metric's two phrasings decided its row.
+///
+/// A row here covers a metric rather than a call, because the pair is
+/// collapsed before it is recorded. This names the side that ended it,
+/// and is `None` when both sides answered and the pair was averaged.
+/// Without it the two failures that read alike in every other column,
+/// a first phrasing that never dispatched and a second that threw away
+/// a served first, are separable only by rereading the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phrasing {
+    A,
+    B,
+}
+
 /// One metric that was dispatched to the judge, recorded whether or not
 /// it came back with a number.
 ///
@@ -94,6 +142,12 @@ pub struct JudgeAttempt {
     /// Why it ended without a score, in the words of whatever gave up.
     /// `None` when the outcome is `Scored`.
     pub reason: Option<String>,
+    /// The same ending as `reason`, as a value that groups and that a
+    /// change to a timeout cannot reword. `None` when the outcome is
+    /// `Scored`, and on every row written before it existed.
+    pub cause: Option<AttemptCause>,
+    /// Which phrasing ended the metric. `None` when both answered.
+    pub phrasing: Option<Phrasing>,
     pub attempted_at: Timestamp,
     pub judge_model_version: Option<String>,
     /// How much of the turn this dispatch was shown. `None` off the
