@@ -13,10 +13,10 @@
 // Tier 1 still scores one metric of three, and now that is the tier
 // gate doing its job rather than a gap nobody had noticed.
 
-use reeve_model::entity::AttemptOutcome;
 use reeve_model::entity::span::InternalSpan;
+use reeve_model::entity::{AttemptOutcome, ReplyProvenance};
 use reeve_model::signal::EvaluationConfidence;
-use reeve_storage::capture::CaptureReader;
+use reeve_storage::capture::{CaptureReader, ReplyMode};
 use reqwest::Client;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -99,8 +99,21 @@ const CONFIDENCE_MEDIUM_THRESHOLD: f64 = 0.30;
 /// they are short ones that waited behind long ones. Halving this puts
 /// the median call near three minutes and the queue just inside what
 /// the slot can serve.
-const CAPTURE_CONTEXT_BUDGET: usize = 4_000;
-const CAPTURE_REPLY_BUDGET: usize = 4_000;
+///
+/// The two moved apart once the split between them was measured rather
+/// than assumed. A captured conversation runs to a median of 103,959
+/// characters, so 4,000 of it was 3% and 2,000 is 1%: the context is a
+/// gesture at either size and cannot be made whole at any size this
+/// backend can read in time. A turn's replies come to a median of
+/// 2,476 characters and a 75th percentile of 4,050, which fits. So the
+/// context gives up what it was never going to deliver and the reply
+/// takes enough to arrive intact. The median prompt moves by about
+/// 1,100 characters for it, which stays in the band it already sat in:
+/// over the log, calls of 4,000 to 6,000 characters take a median of
+/// 149 seconds against 109 below that, and the cliff is at 6,000,
+/// where the median is 321 seconds and every timeout sits.
+const CAPTURE_CONTEXT_BUDGET: usize = 2_000;
+const CAPTURE_REPLY_BUDGET: usize = 6_000;
 
 /// How much of the task `tool_selection` is shown, so that it scores
 /// the calls against the work rather than against their own names.
@@ -164,6 +177,10 @@ struct Captured {
     /// thing as the end of the conversation and is usually nowhere near
     /// it.
     instruction: Option<String>,
+    /// How much of the turn `content` turned out to be. Carried through
+    /// to the dispatch row so a verdict stays readable against what was
+    /// in front of it.
+    reply: Option<ReplyProvenance>,
 }
 
 #[derive(Deserialize)]
@@ -263,6 +280,9 @@ impl MetricAttempt {
 pub struct JudgeRun {
     pub results: Vec<(&'static str, f64, EvaluationConfidence, Option<String>)>,
     pub attempts: Vec<(&'static str, AttemptOutcome, Option<String>)>,
+    /// What the run was shown, which is the same for every metric in it
+    /// because the reply is chosen once per trace.
+    pub reply: Option<ReplyProvenance>,
 }
 
 /// Probe for Ollama at the default endpoint. Returns the appropriate backend.
@@ -383,14 +403,20 @@ impl LlmJudge {
         }
     }
 
-    /// The reply and its conversation, read off disk for the first span
-    /// that has a round stored.
+    /// The turn's replies and the conversation behind them, read off
+    /// disk.
     ///
-    /// Spans are tried in order and the first hit wins, which matches
-    /// how `extract_content` already picks among them. A chat span off
-    /// the proxy addresses its own round directly, for the reason set
-    /// out in `reeve_storage::capture`; anything else finds no file and
-    /// this returns nothing.
+    /// It used to take the first span with a round stored, matching how
+    /// `extract_content` picks among them. On a turn that called tools
+    /// that is the sentence written before the work started: over the
+    /// corpus the rule showed the judge 6% of what the turn said, and
+    /// left 83% of multi reply turns graded on under a quarter of their
+    /// own text. Every reply now goes in, oldest dropped first when the
+    /// budget runs out, and the context and the instruction are read
+    /// from the round the newest reply came out of. A chat span off the
+    /// proxy addresses its own round directly, for the reason set out in
+    /// `reeve_storage::capture`; anything else finds no file and this
+    /// returns nothing.
     ///
     /// The reads go to a blocking thread. Resolving a conversation is
     /// one small file plus up to a few dozen larger ones, which is more
@@ -406,20 +432,22 @@ impl LlmJudge {
             .collect();
         tokio::task::spawn_blocking(move || {
             let reader = CaptureReader::new(root);
-            for (started_at_ms, span_id) in keys {
-                let Some(round) = reader.round(started_at_ms, &span_id) else {
-                    continue;
-                };
-                let Some(reply) = round.reply() else {
-                    continue;
-                };
-                return Captured {
-                    content: Some(truncate(&reply, CAPTURE_REPLY_BUDGET)),
-                    context: reader.context(&round, CAPTURE_CONTEXT_BUDGET),
-                    instruction: reader.instruction(&round),
-                };
+            let Some(selected) =
+                reader.select_reply(&keys, CAPTURE_REPLY_BUDGET, ReplyMode::AllJoined)
+            else {
+                return Captured::default();
+            };
+            Captured {
+                reply: Some(ReplyProvenance {
+                    chars_shown: selected.text.chars().count() as i64,
+                    chars_available: selected.chars_available as i64,
+                    anchor_index: selected.anchor_index as i64,
+                    replies_available: selected.replies_available as i64,
+                }),
+                content: Some(selected.text),
+                context: reader.context(&selected.anchor, CAPTURE_CONTEXT_BUDGET),
+                instruction: reader.instruction(&selected.anchor),
             }
-            Captured::default()
         })
         .await
         .unwrap_or_default()
@@ -475,6 +503,7 @@ impl LlmJudge {
                 content: Some(c),
                 context: extract_context(spans),
                 instruction: None,
+                reply: None,
             },
             None => self.content_from_capture(spans).await,
         };
@@ -482,6 +511,7 @@ impl LlmJudge {
             content,
             context,
             instruction,
+            reply,
         } = captured;
 
         let tool_calls = extract_tool_calls(spans);
@@ -636,7 +666,11 @@ impl LlmJudge {
             }
         }
 
-        JudgeRun { results, attempts }
+        JudgeRun {
+            results,
+            attempts,
+            reply,
+        }
     }
 
     /// Runs both phrasings and says what became of the pair.
