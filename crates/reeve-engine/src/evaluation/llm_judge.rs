@@ -55,13 +55,25 @@ const EVAL_TIMEOUT: Duration = Duration::from_secs(600);
 /// the honest behaviour, and the queue needs a ceiling or the cap
 /// merely relocates the stall.
 ///
-/// Five minutes is a little more than one uncontended call takes, so
-/// whoever is next in line is usually served and whoever is behind
-/// them usually is not. ADR-0050 carries the distribution that number
-/// came from. A call that misses out is dropped as never dispatched,
-/// which the attempts table records, rather than left queued behind
-/// work it cannot outlast.
-const DISPATCH_WAIT: Duration = Duration::from_secs(300);
+/// Equal to `EVAL_TIMEOUT`, and the assertion below holds it there.
+/// Anything shorter guarantees a refusal that nothing went wrong to
+/// cause, because a holder may legally occupy the slot for longer than
+/// a waiter is permitted to wait for it. The queue then sheds work
+/// while the backend is healthy and every call is succeeding.
+///
+/// What equality buys is narrow and worth stating exactly: the call at
+/// the head of the queue always outlives the holder, and the second
+/// call in line gets no such promise. ADR-0051 carries the measurement
+/// and the admission rule that governs the difference.
+///
+/// A call that misses out is dropped as never dispatched, which the
+/// attempts table records, rather than left queued behind work it
+/// cannot outlast.
+const DISPATCH_WAIT: Duration = Duration::from_secs(600);
+/// The inequality ADR-0051 turns on, checked where it cannot drift.
+/// These are two numbers edited separately and read in different
+/// places, and the relation between them is the whole guarantee.
+const _: () = assert!(DISPATCH_WAIT.as_secs() >= EVAL_TIMEOUT.as_secs());
 /// How long the backend should hold the model between calls.
 ///
 /// One dispatch is six calls and traces arrive in bursts, so on the
