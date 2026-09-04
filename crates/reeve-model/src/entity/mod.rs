@@ -13,7 +13,8 @@ pub mod trace;
 pub use agent::{Agent, AgentStatus, IntegrationPath};
 pub use cost::{CostEntityType, CostLedger};
 pub use evaluation::{
-    AttemptOutcome, EvaluationResult, EvaluatorType, JudgeAttempt, ReplyProvenance, TargetType,
+    AttemptCause, AttemptOutcome, EvaluationResult, EvaluatorType, JudgeAttempt, Phrasing,
+    ReplyProvenance, TargetType,
 };
 pub use intervention::{
     AckStatus, AppliedCommand, CommandStatus, CommandType, InterventionCommand, ProxyCommand,

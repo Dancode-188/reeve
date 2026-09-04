@@ -1,8 +1,8 @@
 use reeve_model::entity::policy::{PolicyRule, RuleScope};
 use reeve_model::entity::{
-    Agent, AgentStatus, AttemptOutcome, CommandStatus, CommandType, EvaluationResult,
+    Agent, AgentStatus, AttemptCause, AttemptOutcome, CommandStatus, CommandType, EvaluationResult,
     EvaluatorType, EventType, IntegrationPath, InternalSpan, InterventionCommand,
-    InterventionOutcome, JudgeAttempt, ReplyProvenance, SpanEvent, SpanNote, SpanStatus,
+    InterventionOutcome, JudgeAttempt, Phrasing, ReplyProvenance, SpanEvent, SpanNote, SpanStatus,
     TargetType, Trace, TraceStatus,
 };
 use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, SpanId, TraceId};
@@ -78,6 +78,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/0009_tier2_inclusion_probability.sql"),
     ),
     (10, include_str!("../migrations/0010_reply_provenance.sql")),
+    (11, include_str!("../migrations/0011_attempt_cause.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -210,6 +211,16 @@ fn row_to_judge_attempt(row: &Row) -> rusqlite::Result<JudgeAttempt> {
         metric: row.get("metric")?,
         outcome: text_to_enum::<AttemptOutcome>(&outcome).map_err(rusqlite_serde_err)?,
         reason: row.get("reason")?,
+        cause: row
+            .get::<_, Option<String>>("cause")?
+            .map(|c| text_to_enum::<AttemptCause>(&c))
+            .transpose()
+            .map_err(rusqlite_serde_err)?,
+        phrasing: row
+            .get::<_, Option<String>>("phrasing")?
+            .map(|p| text_to_enum::<Phrasing>(&p))
+            .transpose()
+            .map_err(rusqlite_serde_err)?,
         attempted_at: row.get("attempted_at")?,
         judge_model_version: row.get("judge_model_version")?,
         // All four are written together or not at all, so one of them
@@ -903,19 +914,25 @@ impl WarmStore {
     /// its earlier attempt rather than accumulating beside it.
     pub async fn save_judge_attempt(&self, attempt: JudgeAttempt) -> Result<(), StorageError> {
         let outcome = enum_to_text(&attempt.outcome)?;
+        // Serialised here rather than in the closure so a value that
+        // cannot be written fails the call instead of the connection.
+        let cause = attempt.cause.as_ref().map(enum_to_text).transpose()?;
+        let phrasing = attempt.phrasing.as_ref().map(enum_to_text).transpose()?;
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO judge_attempts
-                    (id, trace_id, metric, outcome, reason, attempted_at,
-                     judge_model_version, reply_chars_shown,
+                    (id, trace_id, metric, outcome, reason, cause, phrasing,
+                     attempted_at, judge_model_version, reply_chars_shown,
                      reply_chars_available, reply_index, replies_available)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     attempt.id.as_str(),
                     attempt.trace_id,
                     attempt.metric,
                     outcome,
                     attempt.reason,
+                    cause,
+                    phrasing,
                     attempt.attempted_at,
                     attempt.judge_model_version,
                     attempt.reply.map(|r| r.chars_shown),
@@ -2350,19 +2367,30 @@ mod tests {
         insert_test_agent(&store, "agent-1").await;
         store.save_trace(trace("t1")).await.unwrap();
 
-        for (id, metric, outcome, reason) in [
-            ("a1", "faithfulness", AttemptOutcome::Scored, None),
+        for (id, metric, outcome, reason, cause, phrasing) in [
+            (
+                "a1",
+                "faithfulness",
+                AttemptOutcome::Scored,
+                None,
+                None,
+                None,
+            ),
             (
                 "a2",
                 "hallucination_detection",
                 AttemptOutcome::NoVerdict,
                 Some("timed out after 900s"),
+                Some(AttemptCause::BackendTimeout),
+                Some(Phrasing::A),
             ),
             (
                 "a3",
                 "tool_selection",
                 AttemptOutcome::HalfPair,
                 Some("connection refused"),
+                Some(AttemptCause::BackendUnreachable),
+                Some(Phrasing::B),
             ),
         ] {
             store
@@ -2372,6 +2400,8 @@ mod tests {
                     metric: metric.to_string(),
                     outcome,
                     reason: reason.map(str::to_string),
+                    cause,
+                    phrasing,
                     attempted_at: 10,
                     judge_model_version: Some("phi4-mini".to_string()),
                     reply: None,
@@ -2387,10 +2417,21 @@ mod tests {
         assert_eq!(loaded.len(), 3);
         // The point of the table: the two that produced no score are
         // still here, and each says which of the two ways it failed.
+        // Cause and phrasing ride along, because a half pair that names
+        // no phrasing cannot say which of the two calls was the one
+        // thrown away, and that is the whole of what it records.
         let dropped: Vec<_> = loaded
             .iter()
             .filter(|a| a.outcome != AttemptOutcome::Scored)
-            .map(|a| (a.metric.as_str(), a.outcome, a.reason.as_deref()))
+            .map(|a| {
+                (
+                    a.metric.as_str(),
+                    a.outcome,
+                    a.reason.as_deref(),
+                    a.cause,
+                    a.phrasing,
+                )
+            })
             .collect();
         assert_eq!(
             dropped,
@@ -2398,12 +2439,16 @@ mod tests {
                 (
                     "hallucination_detection",
                     AttemptOutcome::NoVerdict,
-                    Some("timed out after 900s")
+                    Some("timed out after 900s"),
+                    Some(AttemptCause::BackendTimeout),
+                    Some(Phrasing::A),
                 ),
                 (
                     "tool_selection",
                     AttemptOutcome::HalfPair,
-                    Some("connection refused")
+                    Some("connection refused"),
+                    Some(AttemptCause::BackendUnreachable),
+                    Some(Phrasing::B),
                 ),
             ]
         );
@@ -2415,9 +2460,14 @@ mod tests {
         insert_test_agent(&store, "agent-1").await;
         store.save_trace(trace("t1")).await.unwrap();
 
-        for (outcome, reason) in [
-            (AttemptOutcome::NoVerdict, Some("connection refused")),
-            (AttemptOutcome::Scored, None),
+        for (outcome, reason, cause, phrasing) in [
+            (
+                AttemptOutcome::NoVerdict,
+                Some("connection refused"),
+                Some(AttemptCause::BackendUnreachable),
+                Some(Phrasing::A),
+            ),
+            (AttemptOutcome::Scored, None, None, None),
         ] {
             store
                 .save_judge_attempt(JudgeAttempt {
@@ -2426,6 +2476,8 @@ mod tests {
                     metric: "faithfulness".to_string(),
                     outcome,
                     reason: reason.map(str::to_string),
+                    cause,
+                    phrasing,
                     attempted_at: 10,
                     judge_model_version: None,
                     reply: None,
@@ -2441,6 +2493,11 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].outcome, AttemptOutcome::Scored);
         assert_eq!(loaded[0].reason, None);
+        // The replace has to clear these too. A scored row still
+        // carrying the cause of the attempt it superseded would read as
+        // a metric that both failed and scored.
+        assert_eq!(loaded[0].cause, None);
+        assert_eq!(loaded[0].phrasing, None);
     }
 
     #[tokio::test]
@@ -2732,6 +2789,8 @@ mod tests {
                 metric: "faithfulness".to_string(),
                 outcome: AttemptOutcome::NoClaims,
                 reason: Some("verdict named no claim to check".to_string()),
+                cause: Some(AttemptCause::NoClaims),
+                phrasing: Some(Phrasing::A),
                 attempted_at: 10,
                 judge_model_version: None,
                 reply: Some(ReplyProvenance {

@@ -1161,13 +1161,15 @@ async fn run_tier2(
     // dispatch with no score rather than a score with no dispatch. The
     // first is the state this table exists to describe; the second
     // would be a row claiming a metric was never tried when it was.
-    for (metric, outcome, reason) in &run.attempts {
+    for a in &run.attempts {
         let attempt = JudgeAttempt {
-            id: EvalId::from(format!("{}-{}", trace_id, metric)),
+            id: EvalId::from(format!("{}-{}", trace_id, a.metric)),
             trace_id: trace_id.to_string(),
-            metric: metric.to_string(),
-            outcome: *outcome,
-            reason: reason.clone(),
+            metric: a.metric.to_string(),
+            outcome: a.outcome,
+            reason: a.reason.clone(),
+            cause: a.cause,
+            phrasing: a.phrasing,
             attempted_at: now,
             judge_model_version: model_version.clone(),
             // One choice of reply per run, so every metric in it was
@@ -1175,7 +1177,7 @@ async fn run_tier2(
             reply: run.reply,
         };
         if let Err(e) = warm.save_judge_attempt(attempt).await {
-            tracing::warn!(error = %e, metric, "failed to persist judge attempt");
+            tracing::warn!(error = %e, metric = a.metric, "failed to persist judge attempt");
         }
     }
 

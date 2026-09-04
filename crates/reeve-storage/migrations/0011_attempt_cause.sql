@@ -1,0 +1,25 @@
+-- A dropped metric records why it was dropped as a sentence, and three
+-- of those sentences are not values. The wait bound writes its own
+-- timeout into the text, so raising that timeout renames every row it
+-- produces and splits one cause across two strings at the boundary
+-- where the change has to be read. The parse failure writes the
+-- response length and the keys that came back, which is the diagnostic
+-- worth keeping and is also unique per failure, so that cause can never
+-- be counted by grouping at all.
+--
+-- Cause sits beside the outcome rather than under it. The same wait
+-- bound ends one metric outright and costs another a first phrasing
+-- that was already served, so the pair of columns answers what was lost
+-- and what took it, which one column has been answering as neither.
+--
+-- Phrasing is stored for the same reason and is not derivable from the
+-- rest of the row: one row covers a metric, the pair is collapsed
+-- before it is written, and a first phrasing that never dispatched has
+-- been indistinguishable from a second that discarded a served first.
+--
+-- Reason stays. It carries the parse dump and the backend's own words,
+-- and nothing here replaces that.
+--
+-- Null on every row written before this, and on every row that scored.
+ALTER TABLE judge_attempts ADD COLUMN cause    TEXT;
+ALTER TABLE judge_attempts ADD COLUMN phrasing TEXT;

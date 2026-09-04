@@ -14,7 +14,7 @@
 // gate doing its job rather than a gap nobody had noticed.
 
 use reeve_model::entity::span::InternalSpan;
-use reeve_model::entity::{AttemptOutcome, ReplyProvenance};
+use reeve_model::entity::{AttemptCause, AttemptOutcome, Phrasing, ReplyProvenance};
 use reeve_model::signal::EvaluationConfidence;
 use reeve_storage::capture::{CaptureReader, ReplyMode};
 use reqwest::Client;
@@ -251,23 +251,47 @@ pub struct JudgeResult {
 struct Dropped {
     outcome: AttemptOutcome,
     reason: String,
+    cause: AttemptCause,
 }
 
 #[derive(Debug, Clone)]
 struct MetricAttempt {
     outcome: AttemptOutcome,
     reason: Option<String>,
+    cause: Option<AttemptCause>,
+    phrasing: Option<Phrasing>,
     result: Option<JudgeResult>,
 }
 
 impl MetricAttempt {
-    fn dropped(outcome: AttemptOutcome, reason: String) -> Self {
+    /// `phrasing` is the side that ended the metric, which only the
+    /// caller running the pair knows: the call itself is handed its own
+    /// phrasing and cannot tell whether the other one already answered.
+    fn dropped(
+        outcome: AttemptOutcome,
+        reason: String,
+        cause: AttemptCause,
+        phrasing: Phrasing,
+    ) -> Self {
         Self {
             outcome,
             reason: Some(reason),
+            cause: Some(cause),
+            phrasing: Some(phrasing),
             result: None,
         }
     }
+}
+
+/// What became of one metric in a run, before it is joined to the trace
+/// that produced it and written down.
+#[derive(Debug, Clone)]
+pub struct AttemptRecord {
+    pub metric: &'static str,
+    pub outcome: AttemptOutcome,
+    pub reason: Option<String>,
+    pub cause: Option<AttemptCause>,
+    pub phrasing: Option<Phrasing>,
 }
 
 /// One pass of the judge over one trace.
@@ -279,7 +303,7 @@ impl MetricAttempt {
 #[derive(Debug, Clone, Default)]
 pub struct JudgeRun {
     pub results: Vec<(&'static str, f64, EvaluationConfidence, Option<String>)>,
-    pub attempts: Vec<(&'static str, AttemptOutcome, Option<String>)>,
+    pub attempts: Vec<AttemptRecord>,
     /// What the run was shown, which is the same for every metric in it
     /// because the reply is chosen once per trace.
     pub reply: Option<ReplyProvenance>,
@@ -349,6 +373,15 @@ fn describe(e: reqwest::Error) -> CallError {
     CallError {
         detail: out,
         outcome: AttemptOutcome::NoVerdict,
+        // `is_timeout` was already being read for the retry decision and
+        // then thrown away into the string. A backend that took the call
+        // and never answered and one that refused it are the same row
+        // otherwise, and they call for opposite responses.
+        cause: if timed_out {
+            AttemptCause::BackendTimeout
+        } else {
+            AttemptCause::BackendUnreachable
+        },
         retryable: !timed_out,
     }
 }
@@ -358,6 +391,10 @@ fn describe(e: reqwest::Error) -> CallError {
 struct CallError {
     detail: String,
     outcome: AttemptOutcome,
+    /// The same ending as `detail`, as one of a closed set. `detail`
+    /// stays because it carries the backend's own words and the parse
+    /// dump, neither of which a value can hold.
+    cause: AttemptCause,
     /// False for a timeout, because the client gave up on work the
     /// backend had not finished and whatever made it slow is still in
     /// the prompt, so a second ask pays for it twice. False too for an
@@ -598,7 +635,13 @@ impl LlmJudge {
                     &prompt_b,
                 )
                 .await;
-            attempts.push(("tool_selection", a.outcome, a.reason));
+            attempts.push(AttemptRecord {
+                metric: "tool_selection",
+                outcome: a.outcome,
+                reason: a.reason,
+                cause: a.cause,
+                phrasing: a.phrasing,
+            });
             if let Some(r) = a.result {
                 results.push(("tool_selection", r.score, r.confidence, r.cot_json));
             }
@@ -631,7 +674,13 @@ impl LlmJudge {
                     &faith_b,
                 )
                 .await;
-            attempts.push(("faithfulness", a.outcome, a.reason));
+            attempts.push(AttemptRecord {
+                metric: "faithfulness",
+                outcome: a.outcome,
+                reason: a.reason,
+                cause: a.cause,
+                phrasing: a.phrasing,
+            });
             if let Some(r) = a.result {
                 results.push(("faithfulness", r.score, r.confidence, r.cot_json));
             }
@@ -660,7 +709,13 @@ impl LlmJudge {
                     &hall_b,
                 )
                 .await;
-            attempts.push(("hallucination_detection", a.outcome, a.reason));
+            attempts.push(AttemptRecord {
+                metric: "hallucination_detection",
+                outcome: a.outcome,
+                reason: a.reason,
+                cause: a.cause,
+                phrasing: a.phrasing,
+            });
             if let Some(r) = a.result {
                 results.push(("hallucination_detection", r.score, r.confidence, r.cot_json));
             }
@@ -694,7 +749,7 @@ impl LlmJudge {
             .await
         {
             Ok(v) => v,
-            Err(d) => return MetricAttempt::dropped(d.outcome, d.reason),
+            Err(d) => return MetricAttempt::dropped(d.outcome, d.reason, d.cause, Phrasing::A),
         };
         let (score_b, cot_b) = match self
             .run_single(endpoint, model, trace_id, metric, "b", prompt_b)
@@ -706,9 +761,14 @@ impl LlmJudge {
             // of its own to be dropped, and then that reason is the
             // truer one: nothing was thrown away that was worth keeping.
             Err(d) if d.outcome == AttemptOutcome::NoVerdict => {
-                return MetricAttempt::dropped(AttemptOutcome::HalfPair, d.reason);
+                return MetricAttempt::dropped(
+                    AttemptOutcome::HalfPair,
+                    d.reason,
+                    d.cause,
+                    Phrasing::B,
+                );
             }
-            Err(d) => return MetricAttempt::dropped(d.outcome, d.reason),
+            Err(d) => return MetricAttempt::dropped(d.outcome, d.reason, d.cause, Phrasing::B),
         };
         let score = (score_a + score_b) / 2.0;
         let divergence = (score_a - score_b).abs();
@@ -731,6 +791,10 @@ impl LlmJudge {
         MetricAttempt {
             outcome: AttemptOutcome::Scored,
             reason: None,
+            // Both sides answered, so no single phrasing ended this and
+            // there is nothing for a cause to name.
+            cause: None,
+            phrasing: None,
             result: Some(JudgeResult {
                 score,
                 confidence,
@@ -751,6 +815,7 @@ impl LlmJudge {
         let mut last = Dropped {
             outcome: AttemptOutcome::NoVerdict,
             reason: String::new(),
+            cause: AttemptCause::BackendUnreachable,
         };
         let mut attempts = 0;
         let started = tokio::time::Instant::now();
@@ -810,6 +875,7 @@ impl LlmJudge {
                     last = Dropped {
                         outcome: e.outcome,
                         reason: e.detail,
+                        cause: e.cause,
                     };
                     // A prompt that ran past the ceiling will run past
                     // it again, and a backend that answered has already
@@ -831,6 +897,7 @@ impl LlmJudge {
             phrasing,
             attempts,
             outcome = ?last.outcome,
+            cause = ?last.cause,
             prompt_chars = prompt.len(),
             wait_ms = timing.wait_ms,
             service_ms = timing.service_ms,
@@ -895,6 +962,7 @@ impl LlmJudge {
             return Err(CallError {
                 detail: "not dispatched, stood aside for a metric that carries weight".to_string(),
                 outcome: AttemptOutcome::NoVerdict,
+                cause: AttemptCause::StoodAside,
                 retryable: false,
             });
         }
@@ -914,6 +982,7 @@ impl LlmJudge {
                 return Err(CallError {
                     detail: "dispatch slot closed".to_string(),
                     outcome: AttemptOutcome::NoVerdict,
+                    cause: AttemptCause::SlotClosed,
                     retryable: false,
                 });
             }
@@ -926,6 +995,7 @@ impl LlmJudge {
                         DISPATCH_WAIT.as_secs()
                     ),
                     outcome: AttemptOutcome::NoVerdict,
+                    cause: AttemptCause::WaitBound,
                     retryable: false,
                 });
             }
@@ -946,6 +1016,7 @@ impl LlmJudge {
             return Err(CallError {
                 detail: "not dispatched, stood aside for a metric that carries weight".to_string(),
                 outcome: AttemptOutcome::NoVerdict,
+                cause: AttemptCause::StoodAside,
                 retryable: false,
             });
         }
@@ -1028,6 +1099,7 @@ impl LlmJudge {
             Verdict::Groundless => Err(CallError {
                 detail: "verdict named no claim to check".to_string(),
                 outcome: AttemptOutcome::NoClaims,
+                cause: AttemptCause::NoClaims,
                 retryable: false,
             }),
             Verdict::Unstructured => {
@@ -1036,6 +1108,7 @@ impl LlmJudge {
                     .map_err(|detail| CallError {
                         detail,
                         outcome: AttemptOutcome::NoVerdict,
+                        cause: AttemptCause::Unparseable,
                         retryable: true,
                     })
             }
@@ -1732,7 +1805,12 @@ mod tests {
 
         assert!(run.results.is_empty(), "0.0 on no claims is not a score");
         assert_eq!(run.attempts.len(), 1);
-        assert_eq!(run.attempts[0].1, AttemptOutcome::NoClaims);
+        assert_eq!(run.attempts[0].outcome, AttemptOutcome::NoClaims);
+        assert_eq!(run.attempts[0].cause, Some(AttemptCause::NoClaims));
+        // The first phrasing refused, so the second never ran and the
+        // row is about `a`. This is the column that separates a refusal
+        // on the way in from one that discarded a served call.
+        assert_eq!(run.attempts[0].phrasing, Some(Phrasing::A));
     }
 
     #[tokio::test]
@@ -1750,7 +1828,10 @@ mod tests {
         let run = judge_talking_to(endpoint).evaluate_trace(&[span]).await;
 
         assert_eq!(run.attempts.len(), 1);
-        assert_eq!(run.attempts[0].1, AttemptOutcome::Scored);
+        assert_eq!(run.attempts[0].outcome, AttemptOutcome::Scored);
+        // Nothing ended this one, so there is nothing to name.
+        assert_eq!(run.attempts[0].cause, None);
+        assert_eq!(run.attempts[0].phrasing, None);
         assert_eq!(run.results.len(), 1);
         assert!((run.results[0].1 - 0.8).abs() < 0.001);
     }
@@ -1776,13 +1857,17 @@ mod tests {
 
         assert!(run.results.is_empty(), "a refused call cannot score");
         assert_eq!(run.attempts.len(), 1);
-        let (metric, outcome, reason) = &run.attempts[0];
-        assert_eq!(*metric, "tool_selection");
-        assert_eq!(*outcome, AttemptOutcome::NoVerdict);
+        let a = &run.attempts[0];
+        assert_eq!(a.metric, "tool_selection");
+        assert_eq!(a.outcome, AttemptOutcome::NoVerdict);
         assert!(
-            reason.as_deref().is_some_and(|r| !r.is_empty()),
+            a.reason.as_deref().is_some_and(|r| !r.is_empty()),
             "a drop without a reason is the blank this replaces"
         );
+        // A refused connection, not a backend that took the call and
+        // went quiet. The retry decision already turned on that
+        // difference and now the row says which one happened.
+        assert_eq!(a.cause, Some(AttemptCause::BackendUnreachable));
     }
 
     #[tokio::test]
