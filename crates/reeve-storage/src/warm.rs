@@ -2,8 +2,8 @@ use reeve_model::entity::policy::{PolicyRule, RuleScope};
 use reeve_model::entity::{
     Agent, AgentStatus, AttemptOutcome, CommandStatus, CommandType, EvaluationResult,
     EvaluatorType, EventType, IntegrationPath, InternalSpan, InterventionCommand,
-    InterventionOutcome, JudgeAttempt, SpanEvent, SpanNote, SpanStatus, TargetType, Trace,
-    TraceStatus,
+    InterventionOutcome, JudgeAttempt, ReplyProvenance, SpanEvent, SpanNote, SpanStatus,
+    TargetType, Trace, TraceStatus,
 };
 use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, SpanId, TraceId};
 use reeve_model::signal::EvaluationConfidence;
@@ -77,6 +77,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         9,
         include_str!("../migrations/0009_tier2_inclusion_probability.sql"),
     ),
+    (10, include_str!("../migrations/0010_reply_provenance.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -211,6 +212,18 @@ fn row_to_judge_attempt(row: &Row) -> rusqlite::Result<JudgeAttempt> {
         reason: row.get("reason")?,
         attempted_at: row.get("attempted_at")?,
         judge_model_version: row.get("judge_model_version")?,
+        // All four are written together or not at all, so one of them
+        // standing in for the group keeps a half written row from
+        // reading as a real measurement of zero.
+        reply: match row.get::<_, Option<i64>>("reply_chars_shown")? {
+            Some(chars_shown) => Some(ReplyProvenance {
+                chars_shown,
+                chars_available: row.get("reply_chars_available")?,
+                anchor_index: row.get("reply_index")?,
+                replies_available: row.get("replies_available")?,
+            }),
+            None => None,
+        },
     })
 }
 
@@ -893,8 +906,10 @@ impl WarmStore {
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO judge_attempts
-                    (id, trace_id, metric, outcome, reason, attempted_at, judge_model_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (id, trace_id, metric, outcome, reason, attempted_at,
+                     judge_model_version, reply_chars_shown,
+                     reply_chars_available, reply_index, replies_available)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     attempt.id.as_str(),
                     attempt.trace_id,
@@ -903,6 +918,10 @@ impl WarmStore {
                     attempt.reason,
                     attempt.attempted_at,
                     attempt.judge_model_version,
+                    attempt.reply.map(|r| r.chars_shown),
+                    attempt.reply.map(|r| r.chars_available),
+                    attempt.reply.map(|r| r.anchor_index),
+                    attempt.reply.map(|r| r.replies_available),
                 ],
             )?;
             Ok(())
@@ -2355,6 +2374,7 @@ mod tests {
                     reason: reason.map(str::to_string),
                     attempted_at: 10,
                     judge_model_version: Some("phi4-mini".to_string()),
+                    reply: None,
                 })
                 .await
                 .unwrap();
@@ -2408,6 +2428,7 @@ mod tests {
                     reason: reason.map(str::to_string),
                     attempted_at: 10,
                     judge_model_version: None,
+                    reply: None,
                 })
                 .await
                 .unwrap();
@@ -2694,6 +2715,47 @@ mod tests {
         assert_eq!(rows[0].0, agent_id);
         assert_eq!(rows[0].1, rule_id);
         assert_eq!(rows[0].2, now_ms);
+    }
+
+    /// The four provenance columns are written and read as a group, so
+    /// a row either says how much of the turn was graded or says
+    /// nothing. A partial read would report a real measurement of zero.
+    #[tokio::test]
+    async fn a_dispatch_records_how_much_of_the_turn_it_saw() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t1")).await.unwrap();
+        store
+            .save_judge_attempt(JudgeAttempt {
+                id: "t1-faithfulness".into(),
+                trace_id: "t1".to_string(),
+                metric: "faithfulness".to_string(),
+                outcome: AttemptOutcome::NoClaims,
+                reason: Some("verdict named no claim to check".to_string()),
+                attempted_at: 10,
+                judge_model_version: None,
+                reply: Some(ReplyProvenance {
+                    chars_shown: 147,
+                    chars_available: 8_542,
+                    anchor_index: 0,
+                    replies_available: 14,
+                }),
+            })
+            .await
+            .unwrap();
+        let back = store
+            .list_judge_attempts_for_trace(&TraceId::from("t1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            back[0].reply,
+            Some(ReplyProvenance {
+                chars_shown: 147,
+                chars_available: 8_542,
+                anchor_index: 0,
+                replies_available: 14,
+            })
+        );
     }
 
     #[tokio::test]

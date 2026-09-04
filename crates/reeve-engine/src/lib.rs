@@ -1170,6 +1170,9 @@ async fn run_tier2(
             reason: reason.clone(),
             attempted_at: now,
             judge_model_version: model_version.clone(),
+            // One choice of reply per run, so every metric in it was
+            // shown the same thing and each row says so on its own.
+            reply: run.reply,
         };
         if let Err(e) = warm.save_judge_attempt(attempt).await {
             tracing::warn!(error = %e, metric, "failed to persist judge attempt");

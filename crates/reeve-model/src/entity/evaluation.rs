@@ -96,4 +96,32 @@ pub struct JudgeAttempt {
     pub reason: Option<String>,
     pub attempted_at: Timestamp,
     pub judge_model_version: Option<String>,
+    /// How much of the turn this dispatch was shown. `None` off the
+    /// capture path, where the reply rides on the span and there are no
+    /// rounds to choose between.
+    pub reply: Option<ReplyProvenance>,
+}
+
+/// How much of a turn the judge read before it answered.
+///
+/// A turn that called tools produces a reply per round, and which of
+/// them gets graded is a rule rather than a given. Without these the
+/// rule is invisible after the fact: a metric that refused to find a
+/// claim in four words of acknowledgement and a metric that refused to
+/// find one in a turn full of assertions write the same row.
+///
+/// Recorded on the dispatch rather than the result because the outcomes
+/// worth explaining are the ones that never produce a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyProvenance {
+    /// Characters of reply text handed to the judge, after the budget.
+    pub chars_shown: i64,
+    /// Characters of reply text the turn held, before the budget. The
+    /// denominator, and the only field that says what was left out.
+    pub chars_available: i64,
+    /// Which reply carrying round the context and instruction were read
+    /// from, counting from zero in trace order.
+    pub anchor_index: i64,
+    /// How many rounds in the turn carried a reply at all.
+    pub replies_available: i64,
 }
