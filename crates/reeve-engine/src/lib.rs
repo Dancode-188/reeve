@@ -27,7 +27,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
 
 pub type DispatchSender = mpsc::Sender<(AgentId, InterventionCommand)>;
 
@@ -57,6 +57,16 @@ const AUTO_PROBE_MIN_BACKOFF: std::time::Duration = std::time::Duration::from_se
 /// and long enough that a machine which will never have it is not
 /// making a request every two seconds for the life of the process.
 const AUTO_PROBE_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many traces may be grading at once. A trace attempts at most
+/// three metrics and awaits them in turn, so it never queues against
+/// itself, and two traces therefore put at most two calls at the judge
+/// together. That is the depth the admission rule accepts, which is
+/// why the bound lands on traces rather than on the sample rate: the
+/// rate is a per trace coin flip and says nothing about two draws
+/// landing close together, which is the only thing that builds a queue.
+/// ADR-0051 carries the measurement.
+const MAX_GRADING_TRACES: usize = 2;
 
 /// Doubling backoff for the automatic re-probe, reset by any success.
 /// Split out from the loop because the loop it lives in cannot be
@@ -105,6 +115,11 @@ struct EngineLoop {
     /// Where each agent last sat against its cap, so only a crossing warns
     /// or kills rather than every tick.
     budget_states: HashMap<AgentId, budget::BudgetState>,
+
+    /// One permit per trace that may grade at once. Held by the Tier 2
+    /// task for its whole run, so the slot frees when the last metric
+    /// has been written rather than when the last call returns.
+    tier2_slots: Arc<Semaphore>,
 }
 
 impl EngineLoop {
@@ -255,15 +270,48 @@ impl EngineLoop {
                 tracing::warn!(error = %e, "failed to record tier 2 inclusion probability");
             }
             if rand::random::<f64>() < rate {
-                tokio::spawn(run_tier2(
-                    trace_id.clone(),
-                    agent_id.clone(),
-                    spans,
-                    tier1_scores,
-                    self.engine_tx.clone(),
-                    self.warm.clone(),
-                    self.judge.clone(),
-                ));
+                // Taken before the task exists, so a trace turned away
+                // for load never builds a call. The cost of refusing
+                // here is a moment. The cost of refusing the same work
+                // at the wait bound is the whole bound first, paid by a
+                // trace that is discarded either way.
+                let slot = Arc::clone(&self.tier2_slots).try_acquire_owned().ok();
+                // Written while the permit is held and before grading
+                // starts, for the reason the inclusion probability is
+                // written before the draw: the record of what was
+                // decided has to survive the thing it decided about.
+                if let Err(e) = self
+                    .warm
+                    .record_tier2_load_decline(&trace_id, slot.is_none())
+                    .await
+                {
+                    tracing::warn!(
+                        trace_id = %trace_id,
+                        error = %e,
+                        "failed to record tier 2 load decline"
+                    );
+                }
+                match slot {
+                    Some(slot) => {
+                        tokio::spawn(run_tier2(
+                            trace_id.clone(),
+                            agent_id.clone(),
+                            spans,
+                            tier1_scores,
+                            self.engine_tx.clone(),
+                            self.warm.clone(),
+                            self.judge.clone(),
+                            slot,
+                        ));
+                    }
+                    None => {
+                        tracing::info!(
+                            trace_id = %trace_id,
+                            grading = MAX_GRADING_TRACES,
+                            "tier 2 declined, the grading slots are full"
+                        );
+                    }
+                }
             }
         }
 
@@ -670,6 +718,7 @@ pub async fn run(config: EngineConfig) {
         outcome_tracker: OutcomeTracker::default(),
         budget_tracker: budget::BudgetTracker::default(),
         budget_states: HashMap::new(),
+        tier2_slots: Arc::new(Semaphore::new(MAX_GRADING_TRACES)),
     };
 
     {
@@ -1139,6 +1188,9 @@ fn is_score_stable(history: &VecDeque<f64>) -> bool {
         .all(|(prev, curr)| prev - curr <= 5.0)
 }
 
+// Everything the run touches has to be cloned in by value, because it
+// is spawned and outlives the engine loop's borrow of itself.
+#[allow(clippy::too_many_arguments)]
 async fn run_tier2(
     trace_id: reeve_model::ids::TraceId,
     agent_id: AgentId,
@@ -1147,6 +1199,10 @@ async fn run_tier2(
     engine_tx: broadcast::Sender<EngineEvent>,
     warm: Arc<WarmStore>,
     judge: Arc<LlmJudge>,
+    // Held for the life of the run and released by dropping it here,
+    // which is after the last row is written rather than after the last
+    // call returns.
+    _slot: OwnedSemaphorePermit,
 ) {
     let run = judge.evaluate_trace(&spans).await;
     let results = &run.results;
