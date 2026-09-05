@@ -105,6 +105,44 @@ pub enum AttemptCause {
     Unparseable,
 }
 
+impl AttemptCause {
+    /// Whether the judge issued this call to the backend, as opposed to
+    /// turning it away under its own admission rules.
+    ///
+    /// The match is exhaustive on purpose. A new cause cannot be added
+    /// without deciding which side of this line it falls on, and that
+    /// decision is what every rate measured per phrasing divides by:
+    /// a side the judge never sent had no chance to score, and counting
+    /// it against the backend makes a busy queue look like a bad prompt.
+    pub fn dispatched(&self) -> bool {
+        match self {
+            Self::StoodAside | Self::WaitBound | Self::QueueFull | Self::SlotClosed => false,
+            Self::BackendTimeout
+            | Self::BackendUnreachable
+            | Self::NoClaims
+            | Self::Unparseable => true,
+        }
+    }
+}
+
+/// What became of one side of the consistency pair.
+///
+/// `phrasing` beside this says which side ENDED the metric, so it is
+/// written only when a side failed and is absent from every row that
+/// scored. That leaves no population to divide by, and a phrasing rate
+/// needs both the sides that worked and the sides that did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SideOutcome {
+    /// Sent to the backend and a score came back.
+    Scored,
+    /// Sent to the backend and no score came back.
+    Failed,
+    /// Turned away by the judge before it was sent, so the backend
+    /// never saw it and it says nothing about the prompt.
+    Refused,
+}
+
 /// Which of a metric's two phrasings decided its row.
 ///
 /// A row here covers a metric rather than a call, because the pair is
@@ -158,6 +196,11 @@ pub struct JudgeAttempt {
     /// capture path, where the reply rides on the span and there are no
     /// rounds to choose between.
     pub reply: Option<ReplyProvenance>,
+    /// What each side of the pair did. `None` on a side the run never
+    /// reached, which is the first phrasing failing and short circuiting
+    /// the second, and on every row written before these existed.
+    pub side_a: Option<SideOutcome>,
+    pub side_b: Option<SideOutcome>,
 }
 
 /// How much of a turn the judge read before it answered.
@@ -182,4 +225,32 @@ pub struct ReplyProvenance {
     pub anchor_index: i64,
     /// How many rounds in the turn carried a reply at all.
     pub replies_available: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_cause_says_whether_the_call_was_sent() {
+        // The exhaustive match inside `dispatched` is what forces a new
+        // cause to pick a side. This table is what pins which side it
+        // picked, because the two halves are not interchangeable: the
+        // first four are the judge refusing to send, so they say
+        // nothing about the prompt or the backend, and folding them in
+        // makes a busy queue read as a bad phrasing.
+        let cases = [
+            (AttemptCause::StoodAside, false),
+            (AttemptCause::WaitBound, false),
+            (AttemptCause::QueueFull, false),
+            (AttemptCause::SlotClosed, false),
+            (AttemptCause::BackendTimeout, true),
+            (AttemptCause::BackendUnreachable, true),
+            (AttemptCause::NoClaims, true),
+            (AttemptCause::Unparseable, true),
+        ];
+        for (cause, sent) in cases {
+            assert_eq!(cause.dispatched(), sent, "{cause:?}");
+        }
+    }
 }

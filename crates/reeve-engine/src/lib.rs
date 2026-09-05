@@ -1236,6 +1236,8 @@ async fn run_tier2(
                     attempted_at: current_ms(),
                     judge_model_version: model_version.clone(),
                     reply: a.reply,
+                    side_a: a.side_a,
+                    side_b: a.side_b,
                 };
                 if let Err(e) = warm.save_judge_attempt(attempt).await {
                     tracing::warn!(error = %e, metric = a.metric, "failed to persist judge attempt");
