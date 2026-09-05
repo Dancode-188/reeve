@@ -1204,38 +1204,59 @@ async fn run_tier2(
     // call returns.
     _slot: OwnedSemaphorePermit,
 ) {
-    let run = judge.evaluate_trace(&spans).await;
-    let results = &run.results;
-
     let model_version = match &judge.backend {
         llm_judge::JudgeBackend::Local { model, .. } => Some(model.clone()),
         llm_judge::JudgeBackend::Disabled { .. } => None,
     };
-    let now = current_ms();
 
-    // Written before the results, so a crash between the two leaves a
-    // dispatch with no score rather than a score with no dispatch. The
-    // first is the state this table exists to describe; the second
-    // would be a row claiming a metric was never tried when it was.
-    for a in &run.attempts {
-        let attempt = JudgeAttempt {
-            id: EvalId::from(format!("{}-{}", trace_id, a.metric)),
-            trace_id: trace_id.to_string(),
-            metric: a.metric.to_string(),
-            outcome: a.outcome,
-            reason: a.reason.clone(),
-            cause: a.cause,
-            phrasing: a.phrasing,
-            attempted_at: now,
-            judge_model_version: model_version.clone(),
-            // One choice of reply per run, so every metric in it was
-            // shown the same thing and each row says so on its own.
-            reply: run.reply,
-        };
-        if let Err(e) = warm.save_judge_attempt(attempt).await {
-            tracing::warn!(error = %e, metric = a.metric, "failed to persist judge attempt");
+    // A metric that has concluded is written now, not when the run
+    // ends. A run holds the backend for as long as its slowest metric,
+    // and anything still unwritten when the process stops is gone: the
+    // trace that exposed this had a finished drop waiting behind a
+    // metric that was still out at the judge, and the restart took
+    // both.
+    let (attempt_tx, mut attempt_rx) = mpsc::channel::<llm_judge::AttemptRecord>(4);
+    let writer = tokio::spawn({
+        let warm = Arc::clone(&warm);
+        let trace = trace_id.to_string();
+        let model_version = model_version.clone();
+        async move {
+            while let Some(a) = attempt_rx.recv().await {
+                let attempt = JudgeAttempt {
+                    id: EvalId::from(format!("{}-{}", trace, a.metric)),
+                    trace_id: trace.clone(),
+                    metric: a.metric.to_string(),
+                    outcome: a.outcome,
+                    reason: a.reason,
+                    cause: a.cause,
+                    phrasing: a.phrasing,
+                    // When this metric concluded rather than when the
+                    // run did, which is what a per dispatch row was
+                    // always supposed to be saying.
+                    attempted_at: current_ms(),
+                    judge_model_version: model_version.clone(),
+                    reply: a.reply,
+                };
+                if let Err(e) = warm.save_judge_attempt(attempt).await {
+                    tracing::warn!(error = %e, metric = a.metric, "failed to persist judge attempt");
+                }
+            }
         }
+    });
+
+    let run = judge.evaluate_trace(&spans, &attempt_tx).await;
+    // Closed and drained before the first score is written, which keeps
+    // the ordering the table depends on: a crash between the two leaves
+    // a dispatch with no score rather than a score with no dispatch.
+    // The first is the state this table exists to describe; the second
+    // would be a row claiming a metric was never tried when it was.
+    drop(attempt_tx);
+    if let Err(e) = writer.await {
+        tracing::warn!(error = %e, "the dispatch record writer did not finish");
     }
+
+    let results = &run.results;
+    let now = current_ms();
 
     for (metric, score, confidence, cot_json) in results {
         let _ = engine_tx.send(EngineEvent::EvaluationComplete {

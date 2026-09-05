@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::Instrument;
 
 const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
@@ -345,21 +345,37 @@ pub struct AttemptRecord {
     pub reason: Option<String>,
     pub cause: Option<AttemptCause>,
     pub phrasing: Option<Phrasing>,
+    /// What this metric was shown. Chosen once for the whole run and
+    /// copied onto every record anyway, so that a record is complete on
+    /// its own. A record needing something from the end of the run is a
+    /// record that has to wait for the end of the run.
+    pub reply: Option<ReplyProvenance>,
 }
 
-/// One pass of the judge over one trace.
+/// What one pass of the judge over one trace managed to score.
 ///
-/// `results` is what scored. `attempts` is every metric that reached a
-/// dispatch, scored or not, and it is deliberately not derivable from
-/// `results`: a metric absent from both was never dispatched, which is
-/// a different thing from one that was dispatched and came back empty.
+/// The dispatches are not here. They leave through the sender given to
+/// `evaluate_trace`, one at a time, because a metric that has concluded
+/// is a fact and holding it until its neighbours finish is how that
+/// fact gets lost. A metric absent from `results` and from the sender
+/// was never dispatched, which is a different thing from one that was
+/// dispatched and came back empty.
 #[derive(Debug, Clone, Default)]
 pub struct JudgeRun {
     pub results: Vec<(&'static str, f64, EvaluationConfidence, Option<String>)>,
-    pub attempts: Vec<AttemptRecord>,
-    /// What the run was shown, which is the same for every metric in it
-    /// because the reply is chosen once per trace.
-    pub reply: Option<ReplyProvenance>,
+}
+
+/// Hands one dispatch record to whoever is storing them.
+///
+/// A closed channel is logged and swallowed rather than ending the run.
+/// The remaining metrics can still score, and a score with no dispatch
+/// row beside it is a smaller loss than a trace abandoned halfway for a
+/// bookkeeping failure.
+async fn emit(tx: &mpsc::Sender<AttemptRecord>, record: AttemptRecord) {
+    let metric = record.metric;
+    if tx.send(record).await.is_err() {
+        tracing::warn!(metric, "nothing is listening for dispatch records");
+    }
 }
 
 /// Probe for Ollama at the default endpoint. Returns the appropriate backend.
@@ -562,7 +578,19 @@ impl LlmJudge {
     /// results. A metric missing from `results` may have burned its
     /// timeout, lost half its pair, or never been dispatched at all, and
     /// only the first two leave an attempt behind.
-    pub async fn evaluate_trace(&self, spans: &[InternalSpan]) -> JudgeRun {
+    /// Grades one trace, sending each metric's dispatch record down
+    /// `attempts` the moment that metric concludes.
+    ///
+    /// The sender is a parameter rather than a field because the judge
+    /// has no business knowing where a record is written. What it does
+    /// have to guarantee is that it never holds one, and taking the
+    /// channel here rather than returning a vector is what makes that
+    /// structural instead of remembered.
+    pub async fn evaluate_trace(
+        &self,
+        spans: &[InternalSpan],
+        attempts: &mpsc::Sender<AttemptRecord>,
+    ) -> JudgeRun {
         let (endpoint, model) = match &self.backend {
             JudgeBackend::Local { endpoint, model } => (endpoint.as_str(), model.as_str()),
             JudgeBackend::Disabled { .. } => return JudgeRun::default(),
@@ -582,7 +610,6 @@ impl LlmJudge {
         let cot_schema = r#"{"claims": ["<each factual claim in the response>"], "supported": [<indices of grounded claims>], "unsupported": [<indices of ungrounded claims>], "score": <0.0-1.0>, "reason": "<explanation>"}"#;
 
         let mut results = Vec::new();
-        let mut attempts = Vec::new();
 
         // Attributes first, capture second. The order matters: a span
         // that carries its own content is the SDK path describing
@@ -695,13 +722,18 @@ impl LlmJudge {
                     &prompt_b,
                 )
                 .await;
-            attempts.push(AttemptRecord {
-                metric: "tool_selection",
-                outcome: a.outcome,
-                reason: a.reason,
-                cause: a.cause,
-                phrasing: a.phrasing,
-            });
+            emit(
+                attempts,
+                AttemptRecord {
+                    metric: "tool_selection",
+                    outcome: a.outcome,
+                    reason: a.reason,
+                    cause: a.cause,
+                    phrasing: a.phrasing,
+                    reply,
+                },
+            )
+            .await;
             if let Some(r) = a.result {
                 results.push(("tool_selection", r.score, r.confidence, r.cot_json));
             }
@@ -734,13 +766,18 @@ impl LlmJudge {
                     &faith_b,
                 )
                 .await;
-            attempts.push(AttemptRecord {
-                metric: "faithfulness",
-                outcome: a.outcome,
-                reason: a.reason,
-                cause: a.cause,
-                phrasing: a.phrasing,
-            });
+            emit(
+                attempts,
+                AttemptRecord {
+                    metric: "faithfulness",
+                    outcome: a.outcome,
+                    reason: a.reason,
+                    cause: a.cause,
+                    phrasing: a.phrasing,
+                    reply,
+                },
+            )
+            .await;
             if let Some(r) = a.result {
                 results.push(("faithfulness", r.score, r.confidence, r.cot_json));
             }
@@ -769,23 +806,24 @@ impl LlmJudge {
                     &hall_b,
                 )
                 .await;
-            attempts.push(AttemptRecord {
-                metric: "hallucination_detection",
-                outcome: a.outcome,
-                reason: a.reason,
-                cause: a.cause,
-                phrasing: a.phrasing,
-            });
+            emit(
+                attempts,
+                AttemptRecord {
+                    metric: "hallucination_detection",
+                    outcome: a.outcome,
+                    reason: a.reason,
+                    cause: a.cause,
+                    phrasing: a.phrasing,
+                    reply,
+                },
+            )
+            .await;
             if let Some(r) = a.result {
                 results.push(("hallucination_detection", r.score, r.confidence, r.cot_json));
             }
         }
 
-        JudgeRun {
-            results,
-            attempts,
-            reply,
-        }
+        JudgeRun { results }
     }
 
     /// Runs both phrasings and says what became of the pair.
@@ -1872,6 +1910,74 @@ mod tests {
         )
     }
 
+    /// Runs a trace and gathers what it emitted. Every test that used
+    /// to read `run.attempts` goes through here, because a run no
+    /// longer keeps its dispatch records long enough to be asked.
+    async fn run_collecting(
+        judge: &LlmJudge,
+        spans: &[InternalSpan],
+    ) -> (JudgeRun, Vec<AttemptRecord>) {
+        let (tx, mut rx) = mpsc::channel(8);
+        let run = judge.evaluate_trace(spans, &tx).await;
+        drop(tx);
+        let mut records = Vec::new();
+        while let Some(a) = rx.recv().await {
+            records.push(a);
+        }
+        (run, records)
+    }
+
+    #[tokio::test]
+    async fn a_finished_metric_is_handed_over_before_the_run_ends() {
+        // The property the batch could not have: a metric that has
+        // concluded leaves the run immediately, so a process that stops
+        // mid run costs the metrics still out at the backend and not
+        // the ones already done with it.
+        //
+        // A capacity of one is what makes the assertion below exact.
+        // The run has three metrics to hand over and room to park one,
+        // so it cannot possibly have finished at the moment the first
+        // arrives.
+        let judge = Arc::new(LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                model: "stub".to_string(),
+            },
+            None,
+        ));
+        let span = make_span(
+            "gen_ai.chat",
+            serde_json::json!({
+                "gen_ai.tool.name": "grep",
+                "gen_ai.assistant.message.content": "it ran grep",
+            }),
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        let running = tokio::spawn({
+            let judge = Arc::clone(&judge);
+            async move { judge.evaluate_trace(&[span], &tx).await }
+        });
+
+        let first = rx.recv().await.expect("the first metric to conclude");
+        assert!(
+            !running.is_finished(),
+            "the record arrived no earlier than the run it belongs to, which is the defect"
+        );
+        assert_eq!(first.metric, "tool_selection");
+
+        let mut rest = vec![first];
+        while let Some(a) = rx.recv().await {
+            rest.push(a);
+        }
+        let run = running.await.expect("the run to end");
+        assert!(run.results.is_empty(), "a refused backend cannot score");
+        assert_eq!(
+            rest.len(),
+            3,
+            "every metric that reached a dispatch is handed over, not only the last"
+        );
+    }
+
     #[tokio::test]
     async fn a_groundless_verdict_is_recorded_instead_of_scored() {
         // End to end, because the seam is the whole fix: returning
@@ -1886,16 +1992,16 @@ mod tests {
             "gen_ai.chat",
             serde_json::json!({"gen_ai.tool.name": "grep"}),
         );
-        let run = judge_talking_to(endpoint).evaluate_trace(&[span]).await;
+        let (run, attempts) = run_collecting(&judge_talking_to(endpoint), &[span]).await;
 
         assert!(run.results.is_empty(), "0.0 on no claims is not a score");
-        assert_eq!(run.attempts.len(), 1);
-        assert_eq!(run.attempts[0].outcome, AttemptOutcome::NoClaims);
-        assert_eq!(run.attempts[0].cause, Some(AttemptCause::NoClaims));
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, AttemptOutcome::NoClaims);
+        assert_eq!(attempts[0].cause, Some(AttemptCause::NoClaims));
         // The first phrasing refused, so the second never ran and the
         // row is about `a`. This is the column that separates a refusal
         // on the way in from one that discarded a served call.
-        assert_eq!(run.attempts[0].phrasing, Some(Phrasing::A));
+        assert_eq!(attempts[0].phrasing, Some(Phrasing::A));
     }
 
     #[tokio::test]
@@ -1910,13 +2016,13 @@ mod tests {
             "gen_ai.chat",
             serde_json::json!({"gen_ai.tool.name": "grep"}),
         );
-        let run = judge_talking_to(endpoint).evaluate_trace(&[span]).await;
+        let (run, attempts) = run_collecting(&judge_talking_to(endpoint), &[span]).await;
 
-        assert_eq!(run.attempts.len(), 1);
-        assert_eq!(run.attempts[0].outcome, AttemptOutcome::Scored);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, AttemptOutcome::Scored);
         // Nothing ended this one, so there is nothing to name.
-        assert_eq!(run.attempts[0].cause, None);
-        assert_eq!(run.attempts[0].phrasing, None);
+        assert_eq!(attempts[0].cause, None);
+        assert_eq!(attempts[0].phrasing, None);
         assert_eq!(run.results.len(), 1);
         assert!((run.results[0].1 - 0.8).abs() < 0.001);
     }
@@ -1938,11 +2044,11 @@ mod tests {
             "gen_ai.chat",
             serde_json::json!({"gen_ai.tool.name": "grep"}),
         );
-        let run = judge.evaluate_trace(&[span]).await;
+        let (run, attempts) = run_collecting(&judge, &[span]).await;
 
         assert!(run.results.is_empty(), "a refused call cannot score");
-        assert_eq!(run.attempts.len(), 1);
-        let a = &run.attempts[0];
+        assert_eq!(attempts.len(), 1);
+        let a = &attempts[0];
         assert_eq!(a.metric, "tool_selection");
         assert_eq!(a.outcome, AttemptOutcome::NoVerdict);
         assert!(
@@ -2523,9 +2629,9 @@ mod tests {
             "gen_ai.chat",
             serde_json::json!({"gen_ai.tool.name": "grep"}),
         );
-        let run = judge.evaluate_trace(&[span]).await;
+        let (run, attempts) = run_collecting(&judge, &[span]).await;
         assert!(run.results.is_empty());
-        assert!(run.attempts.is_empty());
+        assert!(attempts.is_empty());
     }
 
     #[tokio::test]
