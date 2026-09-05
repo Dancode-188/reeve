@@ -2,8 +2,8 @@ use reeve_model::entity::policy::{PolicyRule, RuleScope};
 use reeve_model::entity::{
     Agent, AgentStatus, AttemptCause, AttemptOutcome, CommandStatus, CommandType, EvaluationResult,
     EvaluatorType, EventType, IntegrationPath, InternalSpan, InterventionCommand,
-    InterventionOutcome, JudgeAttempt, Phrasing, ReplyProvenance, SpanEvent, SpanNote, SpanStatus,
-    TargetType, Trace, TraceStatus,
+    InterventionOutcome, JudgeAttempt, Phrasing, ReplyProvenance, SideOutcome, SpanEvent, SpanNote,
+    SpanStatus, TargetType, Trace, TraceStatus,
 };
 use reeve_model::ids::{AgentId, CommandId, EvalId, RuleId, SpanId, TraceId};
 use reeve_model::signal::EvaluationConfidence;
@@ -83,6 +83,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         12,
         include_str!("../migrations/0012_tier2_load_decline.sql"),
     ),
+    (13, include_str!("../migrations/0013_phrasing_sides.sql")),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -239,7 +240,19 @@ fn row_to_judge_attempt(row: &Row) -> rusqlite::Result<JudgeAttempt> {
             }),
             None => None,
         },
+        side_a: read_side(row, "side_a")?,
+        side_b: read_side(row, "side_b")?,
     })
+}
+
+/// One side of the consistency pair, absent when the run never reached
+/// it. Pulled out because both columns read identically and a column
+/// name is the only thing that differs.
+fn read_side(row: &Row, column: &str) -> rusqlite::Result<Option<SideOutcome>> {
+    row.get::<_, Option<String>>(column)?
+        .map(|s| text_to_enum::<SideOutcome>(&s))
+        .transpose()
+        .map_err(rusqlite_serde_err)
 }
 
 fn row_to_intervention_command(row: &Row) -> rusqlite::Result<InterventionCommand> {
@@ -942,13 +955,17 @@ impl WarmStore {
         // cannot be written fails the call instead of the connection.
         let cause = attempt.cause.as_ref().map(enum_to_text).transpose()?;
         let phrasing = attempt.phrasing.as_ref().map(enum_to_text).transpose()?;
+        let side_a = attempt.side_a.as_ref().map(enum_to_text).transpose()?;
+        let side_b = attempt.side_b.as_ref().map(enum_to_text).transpose()?;
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO judge_attempts
                     (id, trace_id, metric, outcome, reason, cause, phrasing,
                      attempted_at, judge_model_version, reply_chars_shown,
-                     reply_chars_available, reply_index, replies_available)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     reply_chars_available, reply_index, replies_available,
+                     side_a, side_b)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                         ?14, ?15)",
                 params![
                     attempt.id.as_str(),
                     attempt.trace_id,
@@ -963,6 +980,8 @@ impl WarmStore {
                     attempt.reply.map(|r| r.chars_available),
                     attempt.reply.map(|r| r.anchor_index),
                     attempt.reply.map(|r| r.replies_available),
+                    side_a,
+                    side_b,
                 ],
             )?;
             Ok(())
@@ -2429,6 +2448,8 @@ mod tests {
                     attempted_at: 10,
                     judge_model_version: Some("phi4-mini".to_string()),
                     reply: None,
+                    side_a: None,
+                    side_b: None,
                 })
                 .await
                 .unwrap();
@@ -2484,14 +2505,23 @@ mod tests {
         insert_test_agent(&store, "agent-1").await;
         store.save_trace(trace("t1")).await.unwrap();
 
-        for (outcome, reason, cause, phrasing) in [
+        for (outcome, reason, cause, phrasing, side_a, side_b) in [
             (
                 AttemptOutcome::NoVerdict,
                 Some("connection refused"),
                 Some(AttemptCause::BackendUnreachable),
                 Some(Phrasing::A),
+                Some(SideOutcome::Failed),
+                None,
             ),
-            (AttemptOutcome::Scored, None, None, None),
+            (
+                AttemptOutcome::Scored,
+                None,
+                None,
+                None,
+                Some(SideOutcome::Scored),
+                Some(SideOutcome::Scored),
+            ),
         ] {
             store
                 .save_judge_attempt(JudgeAttempt {
@@ -2505,6 +2535,8 @@ mod tests {
                     attempted_at: 10,
                     judge_model_version: None,
                     reply: None,
+                    side_a,
+                    side_b,
                 })
                 .await
                 .unwrap();
@@ -2522,6 +2554,12 @@ mod tests {
         // a metric that both failed and scored.
         assert_eq!(loaded[0].cause, None);
         assert_eq!(loaded[0].phrasing, None);
+        // Both directions of the overwrite. The first row left `side_b`
+        // null because the pair never reached it, so a replace that
+        // only wrote non null values would leave a scored metric
+        // claiming its second side never ran.
+        assert_eq!(loaded[0].side_a, Some(SideOutcome::Scored));
+        assert_eq!(loaded[0].side_b, Some(SideOutcome::Scored));
     }
 
     #[tokio::test]
@@ -2865,6 +2903,8 @@ mod tests {
                     anchor_index: 0,
                     replies_available: 14,
                 }),
+                side_a: None,
+                side_b: None,
             })
             .await
             .unwrap();

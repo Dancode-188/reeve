@@ -14,7 +14,7 @@
 // gate doing its job rather than a gap nobody had noticed.
 
 use reeve_model::entity::span::InternalSpan;
-use reeve_model::entity::{AttemptCause, AttemptOutcome, Phrasing, ReplyProvenance};
+use reeve_model::entity::{AttemptCause, AttemptOutcome, Phrasing, ReplyProvenance, SideOutcome};
 use reeve_model::signal::EvaluationConfidence;
 use reeve_storage::capture::{CaptureReader, ReplyMode};
 use reqwest::Client;
@@ -313,6 +313,8 @@ struct MetricAttempt {
     reason: Option<String>,
     cause: Option<AttemptCause>,
     phrasing: Option<Phrasing>,
+    side_a: Option<SideOutcome>,
+    side_b: Option<SideOutcome>,
     result: Option<JudgeResult>,
 }
 
@@ -326,11 +328,27 @@ impl MetricAttempt {
         cause: AttemptCause,
         phrasing: Phrasing,
     ) -> Self {
+        // Both sides are recoverable from the one that ended the
+        // metric, because the pair runs in order and short circuits.
+        // `a` failing means `b` never ran, and reaching `b` at all
+        // means `a` returned a score, which is the same invariant the
+        // yield rule in `call_ollama` already turns on.
+        let ended = if cause.dispatched() {
+            SideOutcome::Failed
+        } else {
+            SideOutcome::Refused
+        };
+        let (side_a, side_b) = match phrasing {
+            Phrasing::A => (Some(ended), None),
+            Phrasing::B => (Some(SideOutcome::Scored), Some(ended)),
+        };
         Self {
             outcome,
             reason: Some(reason),
             cause: Some(cause),
             phrasing: Some(phrasing),
+            side_a,
+            side_b,
             result: None,
         }
     }
@@ -350,6 +368,12 @@ pub struct AttemptRecord {
     /// its own. A record needing something from the end of the run is a
     /// record that has to wait for the end of the run.
     pub reply: Option<ReplyProvenance>,
+    /// What each side of the pair did, which `phrasing` above cannot
+    /// say: that names the side which ENDED the metric and is absent
+    /// whenever both answered, so it has no population of working sides
+    /// to be divided by. These have one.
+    pub side_a: Option<SideOutcome>,
+    pub side_b: Option<SideOutcome>,
 }
 
 /// What one pass of the judge over one trace managed to score.
@@ -730,6 +754,8 @@ impl LlmJudge {
                     reason: a.reason,
                     cause: a.cause,
                     phrasing: a.phrasing,
+                    side_a: a.side_a,
+                    side_b: a.side_b,
                     reply,
                 },
             )
@@ -774,6 +800,8 @@ impl LlmJudge {
                     reason: a.reason,
                     cause: a.cause,
                     phrasing: a.phrasing,
+                    side_a: a.side_a,
+                    side_b: a.side_b,
                     reply,
                 },
             )
@@ -814,6 +842,8 @@ impl LlmJudge {
                     reason: a.reason,
                     cause: a.cause,
                     phrasing: a.phrasing,
+                    side_a: a.side_a,
+                    side_b: a.side_b,
                     reply,
                 },
             )
@@ -893,6 +923,8 @@ impl LlmJudge {
             // there is nothing for a cause to name.
             cause: None,
             phrasing: None,
+            side_a: Some(SideOutcome::Scored),
+            side_b: Some(SideOutcome::Scored),
             result: Some(JudgeResult {
                 score,
                 confidence,
@@ -2002,6 +2034,11 @@ mod tests {
         // row is about `a`. This is the column that separates a refusal
         // on the way in from one that discarded a served call.
         assert_eq!(attempts[0].phrasing, Some(Phrasing::A));
+        // `NoClaims` means the backend answered, so `a` is a side that
+        // was sent and did not score. `b` is absent rather than failed
+        // because the pair short circuited before reaching it.
+        assert_eq!(attempts[0].side_a, Some(SideOutcome::Failed));
+        assert_eq!(attempts[0].side_b, None);
     }
 
     #[tokio::test]
@@ -2023,8 +2060,62 @@ mod tests {
         // Nothing ended this one, so there is nothing to name.
         assert_eq!(attempts[0].cause, None);
         assert_eq!(attempts[0].phrasing, None);
+        // And this is the population `phrasing` alone could never
+        // supply. Both sides answered, so a rate per side has a
+        // denominator on rows that worked and not only on rows that
+        // died.
+        assert_eq!(attempts[0].side_a, Some(SideOutcome::Scored));
+        assert_eq!(attempts[0].side_b, Some(SideOutcome::Scored));
         assert_eq!(run.results.len(), 1);
         assert!((run.results[0].1 - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_side_the_judge_never_sent_is_not_a_side_that_failed() {
+        // The pair runs in order and short circuits, so the side that
+        // ended the metric fixes what the other one did. Reaching `b`
+        // at all means `a` came back with a score, and `a` ending it
+        // means `b` never ran, which is an absence and not a failure.
+        //
+        // The row that matters most here is the third. Live, a wait
+        // bound on `b` is the commonest way a metric dies with a score
+        // already in hand, and reading it as two dead sides would put
+        // a working phrasing in the failure column.
+        let cases = [
+            (
+                Phrasing::A,
+                AttemptCause::StoodAside,
+                AttemptOutcome::NoVerdict,
+                Some(SideOutcome::Refused),
+                None,
+            ),
+            (
+                Phrasing::A,
+                AttemptCause::BackendTimeout,
+                AttemptOutcome::NoVerdict,
+                Some(SideOutcome::Failed),
+                None,
+            ),
+            (
+                Phrasing::B,
+                AttemptCause::WaitBound,
+                AttemptOutcome::HalfPair,
+                Some(SideOutcome::Scored),
+                Some(SideOutcome::Refused),
+            ),
+            (
+                Phrasing::B,
+                AttemptCause::Unparseable,
+                AttemptOutcome::HalfPair,
+                Some(SideOutcome::Scored),
+                Some(SideOutcome::Failed),
+            ),
+        ];
+        for (phrasing, cause, outcome, side_a, side_b) in cases {
+            let attempt = MetricAttempt::dropped(outcome, "why".to_string(), cause, phrasing);
+            assert_eq!(attempt.side_a, side_a, "side a of {phrasing:?} {cause:?}");
+            assert_eq!(attempt.side_b, side_b, "side b of {phrasing:?} {cause:?}");
+        }
     }
 
     #[tokio::test]

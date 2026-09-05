@@ -1,0 +1,22 @@
+-- `phrasing` says which side of the consistency pair ENDED the metric.
+-- It is written only when a side failed, and the both-sides-answered
+-- path writes NULL because no single phrasing ended anything. So every
+-- row carrying a phrasing is a row that did not score, which leaves no
+-- population of working sides to divide by and makes a phrasing rate
+-- uncomputable from this table rather than merely unmeasured.
+--
+-- The log does not close the gap either. It records a give up per
+-- attempt and a completion per metric conclusion, two different units,
+-- and the same trace, metric and phrasing appears in both sets.
+--
+-- These two columns say what each side did, which is the denominator.
+-- Refused is kept apart from failed on purpose: a side the judge turned
+-- away under its own admission rules never reached the backend and says
+-- nothing about the prompt, and folding it in makes a busy queue look
+-- like a bad phrasing.
+--
+-- NULL means the run never reached that side. The pair short circuits,
+-- so a first phrasing that failed leaves the second with no outcome
+-- rather than a failed one. NULL is also every row written before this.
+ALTER TABLE judge_attempts ADD COLUMN side_a TEXT;
+ALTER TABLE judge_attempts ADD COLUMN side_b TEXT;
