@@ -87,6 +87,10 @@ pub enum AttemptCause {
     /// The dispatch bound expired with the slot still held, and the
     /// call was dropped rather than queued past it.
     WaitBound,
+    /// Enough calls were already waiting that this one could not have
+    /// been served inside the bound it would have been held to, so it
+    /// was refused on arrival instead of at the end of that wait.
+    QueueFull,
     /// The dispatch slot was closed, which happens on shutdown.
     SlotClosed,
     /// The backend took the call and did not answer inside the
