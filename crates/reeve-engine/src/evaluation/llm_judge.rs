@@ -74,6 +74,37 @@ const DISPATCH_WAIT: Duration = Duration::from_secs(600);
 /// These are two numbers edited separately and read in different
 /// places, and the relation between them is the whole guarantee.
 const _: () = assert!(DISPATCH_WAIT.as_secs() >= EVAL_TIMEOUT.as_secs());
+
+/// What one attempt can be expected to spend at the backend, taken as
+/// the ninety fifth percentile of the attempts instrumented on the
+/// pilot when this landed: 180 of them over 41 hours, median 98
+/// seconds, p95 340.
+///
+/// Fitted over every attempt rather than over the ones that answered.
+/// A call holds the slot for its whole service whether or not it comes
+/// back with anything, and the two longest holds ever recorded are
+/// deadline hits that returned nothing, so the successes alone describe
+/// a faster backend than the one anything actually queues behind. That
+/// is not a small distinction here: it is the only cut of this
+/// measurement that changes the number below.
+const EXPECTED_SERVICE: Duration = Duration::from_secs(340);
+
+/// How many calls may already be waiting when another one arrives.
+///
+/// Derived rather than chosen, because the number moves with the
+/// backend and the relation it comes from does not. Behind `n` waiters
+/// a call projects to `n` services, and it is admissible only while
+/// that projection still fits the wait it will be held to. ADR-0051
+/// fixes the inequality and leaves the number to whatever the pilot
+/// measures.
+const MAX_WAITERS: usize = (DISPATCH_WAIT.as_secs() / EXPECTED_SERVICE.as_secs()) as usize;
+
+/// A service estimate that reaches the wait bound admits nobody, which
+/// stops the judge silently rather than loudly: every call is refused
+/// on arrival, no call is ever slow, and nothing in the logs says why.
+/// Caught here, where the estimate is edited, instead of in the corpus
+/// a week later.
+const _: () = assert!(MAX_WAITERS >= 1);
 /// How long the backend should hold the model between calls.
 ///
 /// One dispatch is six calls and traces arrive in bursts, so on the
@@ -170,6 +201,16 @@ pub struct LlmJudge {
     /// `hallucination_detection` and was dropped without ever being
     /// sent.
     queued: Arc<AtomicUsize>,
+    /// How many calls are waiting for that slot right now, every metric
+    /// counted.
+    ///
+    /// Deliberately not `queued`, which answers a question about
+    /// fairness between metric classes and is blind to unweighted
+    /// waiters by design. Reading that one as a depth would size the
+    /// queue against a fraction of itself, and an earlier attempt at
+    /// this rule did exactly that and produced a flag describing calls
+    /// the rule had never applied to.
+    waiting: Arc<AtomicUsize>,
     /// The capture directory, when the operator consented to tier 2.
     /// `None` leaves the judge exactly as it behaved before it had a
     /// reader, which is also what a missing round degrades to.
@@ -415,8 +456,14 @@ struct CallError {
     retryable: bool,
 }
 
-/// Counts one queued call for a score bearing metric, and stops
-/// counting the moment it stops waiting.
+/// Counts one waiting call against whichever counter it is given, and
+/// stops counting the moment that call stops waiting.
+///
+/// Two counters use it and they are not interchangeable. One counts
+/// every waiter and is the queue depth the admission rule reads. The
+/// other counts only waiters for score bearing metrics and exists for
+/// the yield rule, which asks whether standing aside would hand the
+/// slot to work that can move a score.
 ///
 /// It has to come off on every exit and not only the one that gets the
 /// slot. A call that gave up at the wait bound is no longer queued, and
@@ -448,6 +495,7 @@ impl LlmJudge {
             client,
             dispatch: Arc::new(Semaphore::new(1)),
             queued: Arc::new(AtomicUsize::new(0)),
+            waiting: Arc::new(AtomicUsize::new(0)),
             capture_root,
         }
     }
@@ -978,6 +1026,30 @@ impl LlmJudge {
                 retryable: false,
             });
         }
+        // Asked after the yield rule, so a metric that would have stood
+        // aside is still recorded as having stood aside. Both are
+        // arrival tests and either could refuse this call; the yield is
+        // the more specific answer and costs nothing to prefer.
+        //
+        // Refusing here is the whole point. The queue charges for the
+        // expensive part before it decides, so a call turned away at
+        // the wait bound has already spent that bound, and the trace it
+        // belongs to has held an outstanding verdict for the length of
+        // it. A call turned away on arrival has spent nothing and its
+        // trace learns immediately.
+        let ahead = self.waiting.load(Ordering::SeqCst);
+        if ahead > MAX_WAITERS {
+            return Err(CallError {
+                detail: format!("not dispatched, {ahead} already waiting for the one slot"),
+                outcome: AttemptOutcome::NoVerdict,
+                cause: AttemptCause::QueueFull,
+                retryable: false,
+            });
+        }
+        // Every waiter counted, which is what makes the load above a
+        // depth. Entered after the test so a call is never measured
+        // against itself.
+        let _waiting = Queued::enter(&self.waiting);
         // Counted for exactly as long as this call is in the queue, so
         // an unweighted call asking the question above gets an answer
         // about now rather than about the whole dispatch.
@@ -1049,6 +1121,7 @@ impl LlmJudge {
         // queueing. Dropped before the request rather than at the end
         // of the function so a long call does not read as a long queue.
         drop(_queued);
+        drop(_waiting);
         let _slot = slot_held;
         // Written when the slot is in hand and before the request goes
         // out, so a call that is in flight says so while it is still in
@@ -2220,6 +2293,129 @@ mod tests {
         assert_eq!(
             timing.service_ms, 0,
             "it yielded the slot, so nothing was sent"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_is_refused_on_arrival_once_the_queue_is_full() {
+        // The refusal this rule exists to make: taken before the call
+        // waits, so the trace learns straight away instead of after a
+        // bound it was never going to survive.
+        let judge = LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                model: "stub".to_string(),
+            },
+            None,
+        );
+        let _held = judge
+            .dispatch
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the only slot");
+        let _waiters: Vec<Queued> = (0..=MAX_WAITERS)
+            .map(|_| Queued::enter(&judge.waiting))
+            .collect();
+
+        let mut timing = CallTiming::default();
+        let err = judge
+            .call_ollama(
+                "http://127.0.0.1:1",
+                "stub",
+                "faithfulness",
+                "a",
+                "prompt",
+                &mut timing,
+            )
+            .await
+            .expect_err("the queue was full when it arrived");
+
+        assert_eq!(err.cause, AttemptCause::QueueFull);
+        assert!(
+            !err.retryable,
+            "a retry would rejoin the queue that refused it"
+        );
+        assert_eq!(
+            timing.wait_ms, 0,
+            "the point of refusing here is that it costs no wait: {timing:?}"
+        );
+        assert_eq!(timing.service_ms, 0, "nothing was sent: {timing:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_is_admitted_while_the_queue_is_within_the_threshold() {
+        // The control for the test above. A rule that refuses at a
+        // depth of MAX_WAITERS as well would refuse everything and
+        // still pass a test that only ever checks the refusal.
+        let judge = LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                model: "stub".to_string(),
+            },
+            None,
+        );
+        let _waiters: Vec<Queued> = (0..MAX_WAITERS)
+            .map(|_| Queued::enter(&judge.waiting))
+            .collect();
+
+        let mut timing = CallTiming::default();
+        let err = judge
+            .call_ollama(
+                "http://127.0.0.1:1",
+                "stub",
+                "faithfulness",
+                "a",
+                "prompt",
+                &mut timing,
+            )
+            .await
+            .expect_err("the endpoint refuses connections");
+
+        assert_ne!(
+            err.cause,
+            AttemptCause::QueueFull,
+            "it was inside the threshold and should have been let through: {}",
+            err.detail
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_call_is_not_left_counted_as_waiting() {
+        // Every exit has to give the depth back. A call still counted
+        // after it has gone would refuse the calls behind it on behalf
+        // of nothing, and the rule would tighten by one for good.
+        let judge = LlmJudge::new(
+            JudgeBackend::Local {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                model: "stub".to_string(),
+            },
+            None,
+        );
+        let held = judge
+            .dispatch
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the only slot");
+        let mut timing = CallTiming::default();
+        let _ = judge
+            .call_ollama(
+                "http://127.0.0.1:1",
+                "stub",
+                "faithfulness",
+                "a",
+                "prompt",
+                &mut timing,
+            )
+            .await
+            .expect_err("it never got the slot");
+        drop(held);
+
+        assert_eq!(
+            judge.waiting.load(Ordering::SeqCst),
+            0,
+            "a call that stopped waiting is still counted in the depth"
         );
     }
 
