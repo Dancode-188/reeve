@@ -79,6 +79,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (10, include_str!("../migrations/0010_reply_provenance.sql")),
     (11, include_str!("../migrations/0011_attempt_cause.sql")),
+    (
+        12,
+        include_str!("../migrations/0012_tier2_load_decline.sql"),
+    ),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -559,6 +563,26 @@ impl WarmStore {
             conn.execute(
                 "UPDATE traces SET tier2_inclusion_p = ?1 WHERE id = ?2",
                 params![probability, trace_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Records what the concurrency door did with a trace that had
+    /// already won its sampling draw. Written for both answers, because
+    /// a column that marks only the refusals cannot say what they were
+    /// refused out of.
+    pub async fn record_tier2_load_decline(
+        &self,
+        trace_id: &TraceId,
+        declined: bool,
+    ) -> Result<(), StorageError> {
+        let trace_id = trace_id.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE traces SET tier2_declined_for_load = ?1 WHERE id = ?2",
+                params![declined as i64, trace_id.as_str()],
             )?;
             Ok(())
         })
@@ -2541,6 +2565,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(untouched, None);
+    }
+
+    #[tokio::test]
+    async fn the_door_records_what_it_did_with_a_trace_that_won_its_draw() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t-declined")).await.unwrap();
+        store.save_trace(trace("t-admitted")).await.unwrap();
+        store.save_trace(trace("t-never-drawn")).await.unwrap();
+
+        store
+            .record_tier2_load_decline(&TraceId::from("t-declined"), true)
+            .await
+            .unwrap();
+        store
+            .record_tier2_load_decline(&TraceId::from("t-admitted"), false)
+            .await
+            .unwrap();
+
+        let door = |id: &'static str| {
+            let store = &store;
+            async move {
+                store
+                    .with_conn(move |conn| {
+                        conn.query_row(
+                            "SELECT tier2_declined_for_load FROM traces WHERE id = ?1",
+                            params![id],
+                            |row| row.get::<_, Option<i64>>(0),
+                        )
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Three answers, not two. Marking only the refusals would leave
+        // a trace that graded and a trace the draw passed over sharing
+        // one row shape, and the refusals would then have no denominator
+        // anywhere in the store.
+        assert_eq!(door("t-declined").await, Some(1));
+        assert_eq!(door("t-admitted").await, Some(0));
+        assert_eq!(door("t-never-drawn").await, None);
     }
 
     #[tokio::test]
