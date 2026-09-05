@@ -1,0 +1,35 @@
+-- A judged trace has no Tier 1 number left. The Tier 2 merge recomputes
+-- health over the heuristics plus whatever the judge returned and writes
+-- the result back to final_health_score, so the column holds a blended
+-- value for exactly the traces the judge reached and the Tier 1 value
+-- for every trace it did not. The one population where both numbers
+-- exist is the one population where only one of them survives.
+--
+-- Nothing else kept a copy. The log carries no health lines, span_events
+-- is empty, and evaluation_results stores the judge's per metric scores
+-- and not the composite either tier arrived at. So this cannot be
+-- backfilled, and every judged trace completed without it is
+-- permanently uncomparable. That is the same reason tier2_inclusion_p is
+-- written on the hot path rather than derived later.
+--
+-- What it buys is the question a two tier design exists to answer: does
+-- the expensive tier agree with the cheap one. Not whether the judge
+-- scores high, and not whether the two track each other across the
+-- corpus. Two scores can rise and fall together and still sit far apart
+-- on any single trace, so the quantity of interest is the spread of the
+-- per trace difference rather than the association between the columns,
+-- and that difference needs both numbers on the same row.
+--
+-- Written for every trace and not only the judged ones, so the judged
+-- subset has an ungraded population to be read against. Where the judge
+-- never ran this repeats final_health_score, and a duplicated column
+-- costs less than making every reader work out which traces were merged
+-- before it can trust either value. NULL means the trace completed
+-- before this column existed.
+ALTER TABLE traces ADD COLUMN tier1_health_score REAL;
+
+-- Coverage moves with the merge for the same reason the score does, and
+-- a difference read across two different weight bases is not a
+-- disagreement between the tiers. It is the tiers having graded
+-- different things.
+ALTER TABLE traces ADD COLUMN tier1_weight_coverage REAL;

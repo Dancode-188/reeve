@@ -203,9 +203,13 @@ impl EngineLoop {
                 tracing::debug!("no engine event subscribers");
             }
 
+            // Writes the live score and a frozen Tier 1 copy in one
+            // statement. Tier 2 overwrites the live one, and the copy is
+            // what makes the judged traces comparable against the tier
+            // that screened them.
             if let Err(e) = self
                 .warm
-                .update_trace_health_score(&trace_id, hs.value, hs.weight_coverage)
+                .record_tier1_health_score(&trace_id, hs.value, hs.weight_coverage)
                 .await
             {
                 tracing::warn!(

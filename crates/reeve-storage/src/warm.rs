@@ -84,6 +84,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/0012_tier2_load_decline.sql"),
     ),
     (13, include_str!("../migrations/0013_phrasing_sides.sql")),
+    (
+        14,
+        include_str!("../migrations/0014_tier1_health_score.sql"),
+    ),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -541,6 +545,45 @@ impl WarmStore {
             conn.execute(
                 "UPDATE traces SET final_health_score = ?1, weight_coverage = ?2
                  WHERE id = ?3",
+                params![score, weight_coverage, trace_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Writes the Tier 1 result to both the live score and a frozen copy
+    /// of its own.
+    ///
+    /// Tier 2 recomputes health over the merged metric set and writes it
+    /// back through `update_trace_health_score`, which lands on the same
+    /// column. Without a second copy the Tier 1 number survives only for
+    /// traces the judge never reached, so the traces that could say
+    /// whether the two tiers agree are exactly the ones that cannot. The
+    /// copy is taken here rather than inside the Tier 2 path because
+    /// every trace needs it, including the ones the sampler passes over:
+    /// a judged subset with no ungraded population beside it says
+    /// nothing about how far apart the tiers are.
+    ///
+    /// Both columns are written in one statement, so a trace can never
+    /// hold a score against another run's coverage. There is no
+    /// backfill. A trace that completes without this and is later judged
+    /// has lost its Tier 1 number for good.
+    pub async fn record_tier1_health_score(
+        &self,
+        trace_id: &TraceId,
+        score: f64,
+        weight_coverage: f64,
+    ) -> Result<(), StorageError> {
+        let trace_id = trace_id.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE traces
+                    SET final_health_score = ?1,
+                        weight_coverage = ?2,
+                        tier1_health_score = ?1,
+                        tier1_weight_coverage = ?2
+                  WHERE id = ?3",
                 params![score, weight_coverage, trace_id.as_str()],
             )?;
             Ok(())
@@ -2676,6 +2719,67 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded.final_health_score, Some(44.4444));
+    }
+
+    #[tokio::test]
+    async fn the_merge_overwrites_the_live_score_and_not_the_tier_1_copy() {
+        let store = WarmStore::open_in_memory().unwrap();
+        insert_test_agent(&store, "agent-1").await;
+        store.save_trace(trace("t1")).await.unwrap();
+        store.save_trace(trace("t2")).await.unwrap();
+
+        // Tier 1 concludes on both traces.
+        for id in ["t1", "t2"] {
+            store
+                .record_tier1_health_score(&TraceId::from(id), 61.0, 0.45)
+                .await
+                .unwrap();
+        }
+        // The judge reaches only one of them and the merge lands on the
+        // same column Tier 1 wrote.
+        store
+            .update_trace_health_score(&TraceId::from("t1"), 88.0, 1.0)
+            .await
+            .unwrap();
+
+        let row = |id: &'static str| {
+            let store = &store;
+            async move {
+                store
+                    .with_conn(move |conn| {
+                        conn.query_row(
+                            "SELECT final_health_score, weight_coverage,
+                                    tier1_health_score, tier1_weight_coverage
+                               FROM traces WHERE id = ?1",
+                            params![id],
+                            |r| {
+                                Ok((
+                                    r.get::<_, Option<f64>>(0)?,
+                                    r.get::<_, Option<f64>>(1)?,
+                                    r.get::<_, Option<f64>>(2)?,
+                                    r.get::<_, Option<f64>>(3)?,
+                                ))
+                            },
+                        )
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // The judged trace keeps both numbers, which is the whole point:
+        // this row is the only kind that can say whether the tiers agree.
+        assert_eq!(
+            row("t1").await,
+            (Some(88.0), Some(1.0), Some(61.0), Some(0.45))
+        );
+        // The ungraded trace repeats itself rather than leaving the copy
+        // null, so a reader can take the column without first working out
+        // which traces were merged.
+        assert_eq!(
+            row("t2").await,
+            (Some(61.0), Some(0.45), Some(61.0), Some(0.45))
+        );
     }
 
     #[tokio::test]
