@@ -1,0 +1,23 @@
+-- A trace can now be turned away after it wins the sampling draw,
+-- because only two may grade at once. That is a second stage of
+-- selection sitting between the coin flip and the judge, and unlike the
+-- judge's own second stage it is a decision this process makes and can
+-- therefore write down at the moment it makes it.
+--
+-- The column exists to stop the probability beside it from quietly
+-- changing meaning. Migration 0009 says the inverse-probability weight
+-- buys an unbiased view of what was OFFERED to the judge. Once a draw
+-- can be overruled at the door, drawn and offered are no longer the
+-- same set, and they come apart precisely under load, which is the
+-- condition anything read off this corpus most needs to survive.
+--
+-- Zero is written on admission rather than left absent, which is why
+-- this is not simply a flag on the refusals. With only the refusals
+-- marked, a trace that lost the draw and a trace that graded to
+-- completion are the same row, and the size of what the door removed
+-- cannot be recovered from the store at all.
+--
+-- NULL means the trace never reached the door: it was out of the
+-- sampling frame, or it was in the frame and the draw went against it,
+-- or it completed before this column existed.
+ALTER TABLE traces ADD COLUMN tier2_declined_for_load INTEGER;
