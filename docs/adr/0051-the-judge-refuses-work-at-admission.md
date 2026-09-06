@@ -3,6 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-09-02
 **Amends:** [0050](./0050-the-judge-dispatches-one-call-at-a-time.md)
+**Amended by:** [0052](./0052-the-wait-bound-held-and-the-deadline-is-next.md)
 
 ## Context
 
@@ -194,9 +195,11 @@ say whether this record helped.
   wrong one, and the flag it produced described calls the rule had
   never applied to.
 - Nothing here makes a slow call faster. The ten minute deadline is now
-  the only bound a call can hit, and no served call has ever reached it.
-  Whether it is the right number is a question this record does not
-  answer.
+  the only bound a call can hit. This bullet went on to claim no served
+  call had ever reached it, which was false when it was written and is
+  struck by [0052](./0052-the-wait-bound-held-and-the-deadline-is-next.md).
+  Whether ten minutes is the right number is a question this record does
+  not answer.
 
 ## Alternatives considered
 
