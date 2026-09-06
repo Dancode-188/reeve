@@ -177,8 +177,45 @@ const TOOL_CONTEXT_BUDGET: usize = 1_500;
 
 #[derive(Debug, Clone)]
 pub enum JudgeBackend {
-    Local { endpoint: String, model: String },
-    Disabled { reason: String },
+    Local {
+        endpoint: String,
+        model: String,
+        /// The manifest digest the tag resolved to when the backend was
+        /// probed, `None` when the probe could not read one.
+        ///
+        /// An ollama tag is mutable. A pull moves `phi4-mini:latest` to
+        /// different weights under a name that every stored row would
+        /// still agree with, so a score recorded against the tag alone
+        /// names a model nobody can recover afterwards. The digest rides
+        /// on the backend because the probe already has it: the same
+        /// `/api/tags` response that decides whether the model is present
+        /// carries the digest beside the name.
+        digest: Option<String>,
+    },
+    Disabled {
+        reason: String,
+    },
+}
+
+impl JudgeBackend {
+    /// What to record as the judge that produced a score.
+    ///
+    /// The tag on its own does not identify a model, so it is qualified
+    /// with the digest wherever the probe resolved one. A backend that
+    /// answered without one still records the tag: a version that is
+    /// merely imprecise is worth more to a later reader than no version
+    /// at all, and the two are told apart by whether the `@` is there.
+    pub fn model_version(&self) -> Option<String> {
+        match self {
+            JudgeBackend::Local {
+                model,
+                digest: Some(d),
+                ..
+            } => Some(format!("{model}@{d}")),
+            JudgeBackend::Local { model, .. } => Some(model.clone()),
+            JudgeBackend::Disabled { .. } => None,
+        }
+    }
 }
 
 pub struct LlmJudge {
@@ -425,28 +462,39 @@ pub async fn probe() -> JudgeBackend {
             };
         }
     };
-    let has_model = body
+    let found = body
         .get("models")
         .and_then(|m| m.as_array())
-        .map(|arr| {
-            arr.iter().any(|m| {
+        .and_then(|arr| {
+            arr.iter().find(|m| {
                 m.get("name")
                     .and_then(|n| n.as_str())
                     .map(|n| n == OLLAMA_MODEL || n.starts_with(&format!("{}:", OLLAMA_MODEL)))
                     .unwrap_or(false)
             })
-        })
-        .unwrap_or(false);
-    if has_model {
+        });
+    if let Some(entry) = found {
         JudgeBackend::Local {
             endpoint: OLLAMA_ENDPOINT.to_string(),
             model: OLLAMA_MODEL.to_string(),
+            digest: entry
+                .get("digest")
+                .and_then(|d| d.as_str())
+                .filter(|d| !d.is_empty())
+                .map(normalize_digest),
         }
     } else {
         JudgeBackend::Disabled {
             reason: format!("run: ollama pull {}", OLLAMA_MODEL),
         }
     }
+}
+
+/// Ollama has returned the manifest digest both bare and `sha256:`
+/// prefixed depending on version. Store one shape, so a row written
+/// before an upgrade compares equal to one written after it.
+fn normalize_digest(raw: &str) -> String {
+    format!("sha256:{}", raw.trim_start_matches("sha256:"))
 }
 
 /// `reqwest::Error` renders the same string whether the request was
@@ -616,7 +664,9 @@ impl LlmJudge {
         attempts: &mpsc::Sender<AttemptRecord>,
     ) -> JudgeRun {
         let (endpoint, model) = match &self.backend {
-            JudgeBackend::Local { endpoint, model } => (endpoint.as_str(), model.as_str()),
+            JudgeBackend::Local {
+                endpoint, model, ..
+            } => (endpoint.as_str(), model.as_str()),
             JudgeBackend::Disabled { .. } => return JudgeRun::default(),
         };
 
@@ -1530,6 +1580,52 @@ fn extract_context(spans: &[InternalSpan]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_stored_version_names_the_weights_and_not_just_the_tag() {
+        let backend = JudgeBackend::Local {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "phi4-mini".to_string(),
+            digest: Some("sha256:78fad5d1".to_string()),
+        };
+        assert_eq!(
+            backend.model_version().as_deref(),
+            Some("phi4-mini@sha256:78fad5d1")
+        );
+    }
+
+    #[test]
+    fn a_backend_that_gave_no_digest_still_records_the_tag() {
+        // Worse than a digest, better than a null: a reader can at least
+        // tell these rows from the qualified ones by the missing `@`.
+        let backend = JudgeBackend::Local {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "phi4-mini".to_string(),
+            digest: None,
+        };
+        assert_eq!(backend.model_version().as_deref(), Some("phi4-mini"));
+        assert_eq!(
+            JudgeBackend::Disabled {
+                reason: "ollama not found".to_string()
+            }
+            .model_version(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_same_model_compares_equal_across_an_ollama_that_changed_shape() {
+        // The two spellings are the same digest. Recording them as
+        // written would split one model into two versions at whatever
+        // upgrade changed the shape, which is the confound this whole
+        // field exists to remove.
+        assert_eq!(
+            normalize_digest("78fad5d1"),
+            normalize_digest("sha256:78fad5d1")
+        );
+        assert_eq!(normalize_digest("78fad5d1"), "sha256:78fad5d1");
+    }
+
     use super::*;
     use reeve_model::entity::span::SpanStatus;
     use std::collections::HashMap;
@@ -1937,6 +2033,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint,
                 model: "phi4-mini".to_string(),
+                digest: None,
             },
             None,
         )
@@ -1974,6 +2071,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 model: "stub".to_string(),
+                digest: None,
             },
             None,
         ));
@@ -2128,6 +2226,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 model: "phi4-mini".to_string(),
+                digest: None,
             },
             None,
         );
@@ -2198,6 +2297,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint: format!("http://{addr}"),
                 model: "stub".to_string(),
+                digest: None,
             },
             None,
         ));
@@ -2270,6 +2370,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 model: "stub".to_string(),
+                digest: None,
             },
             None,
         );
@@ -2321,6 +2422,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 model: "stub".to_string(),
+                digest: None,
             },
             None,
         );
@@ -2364,6 +2466,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 model: "stub".to_string(),
+                digest: None,
             },
             None,
         );
@@ -2403,6 +2506,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 model: "stub".to_string(),
+                digest: None,
             },
             None,
         );
@@ -2441,6 +2545,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 model: "stub".to_string(),
+                digest: None,
             },
             None,
         ));
@@ -2502,6 +2607,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 model: "stub".to_string(),
+                digest: None,
             },
             None,
         );
@@ -2549,6 +2655,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 model: "stub".to_string(),
+                digest: None,
             },
             None,
         );
@@ -2586,6 +2693,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 model: "stub".to_string(),
+                digest: None,
             },
             None,
         );
@@ -2627,6 +2735,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 model: "stub".to_string(),
+                digest: None,
             },
             None,
         );
@@ -2669,6 +2778,7 @@ mod tests {
             JudgeBackend::Local {
                 endpoint: "http://127.0.0.1:1".to_string(),
                 model: "stub".to_string(),
+                digest: None,
             },
             None,
         );
