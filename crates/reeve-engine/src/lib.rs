@@ -1208,10 +1208,10 @@ async fn run_tier2(
     // call returns.
     _slot: OwnedSemaphorePermit,
 ) {
-    let model_version = match &judge.backend {
-        llm_judge::JudgeBackend::Local { model, .. } => Some(model.clone()),
-        llm_judge::JudgeBackend::Disabled { .. } => None,
-    };
+    // The tag alone does not name a model. It is mutable, and every row
+    // written so far records it bare, so nothing in the store separates a
+    // score graded before a pull from one graded after.
+    let model_version = judge.backend.model_version();
 
     // A metric that has concluded is written now, not when the run
     // ends. A run holds the backend for as long as its slowest metric,
