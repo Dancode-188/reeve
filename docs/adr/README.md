@@ -62,6 +62,7 @@ overturned and the rest still holds, the original keeps its status and is marked
 | [0049](./0049-a-timed-out-judge-call-is-not-retried.md) | A Judge Call That Ran Out of Time Is Not Retried | Accepted | 2026-08-25 |
 | [0050](./0050-the-judge-dispatches-one-call-at-a-time.md) | The Judge Dispatches One Call at a Time | Accepted | 2026-08-31 |
 | [0051](./0051-the-judge-refuses-work-at-admission.md) | The Judge Refuses Work at Admission, Not at a Timeout | Accepted | 2026-09-02 |
+| [0052](./0052-the-wait-bound-held-and-the-deadline-is-next.md) | The Wait Bound Held, and the Deadline Is the Next Bound | Accepted | 2026-09-06 |
 
 ## Format
 
